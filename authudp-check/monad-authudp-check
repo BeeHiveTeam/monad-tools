@@ -71,10 +71,16 @@ emit() {
   fi
 }
 
-# ===== Check 1: monad version =====
+# ===== Check 1: monad version (two-tier) =====
 # Per docs (https://docs.monad.xyz/node-ops/upgrade-instructions/auth-udp):
-#   Auth UDP support requires monad ≥ 0.12.6. Upcoming release drops Clear UDP.
+#   Auth UDP support requires monad ≥ 0.12.6 (capability available).
+# Per Foundation announcement (Discord, mainnet-fullnode-announcements):
+#   "Running 0.14.x or later? You're all set — Authenticated UDP is already
+#    enforced and active on your node. Running before 0.14.0? Suggestion to
+#    upgrade as soon as possible."
+# So 0.14.0 is the operational cutoff for the upcoming 0.14.3 enforcement.
 MONAD_AUTHUDP_VERSION_MIN="${MONAD_AUTHUDP_VERSION_MIN:-0.12.6}"
+MONAD_AUTHUDP_VERSION_REC="${MONAD_AUTHUDP_VERSION_REC:-0.14.0}"
 MONAD_NODE_TOML="${MONAD_NODE_TOML:-/home/monad/monad-bft/config/node.toml}"
 
 check_version() {
@@ -89,10 +95,12 @@ check_version() {
     return
   fi
 
-  if printf '%s\n%s\n' "$MONAD_AUTHUDP_VERSION_MIN" "$v" | sort -V -C 2>/dev/null; then
-    emit "version" "pass" "monad $v (Auth UDP available, need ≥${MONAD_AUTHUDP_VERSION_MIN})"
+  if printf '%s\n%s\n' "$MONAD_AUTHUDP_VERSION_REC" "$v" | sort -V -C 2>/dev/null; then
+    emit "version" "pass" "monad $v — fully compliant (≥${MONAD_AUTHUDP_VERSION_REC}, Auth UDP enforced)"
+  elif printf '%s\n%s\n' "$MONAD_AUTHUDP_VERSION_MIN" "$v" | sort -V -C 2>/dev/null; then
+    emit "version" "warn" "monad $v — Auth UDP capable but pre-${MONAD_AUTHUDP_VERSION_REC} (upgrade recommended before 0.14.3 enforcement)"
   else
-    emit "version" "fail" "monad $v — UPGRADE REQUIRED (need ≥${MONAD_AUTHUDP_VERSION_MIN})"
+    emit "version" "fail" "monad $v — UPGRADE REQUIRED (need ≥${MONAD_AUTHUDP_VERSION_MIN}, recommend ≥${MONAD_AUTHUDP_VERSION_REC})"
   fi
 
   # Check for available upgrade
@@ -145,10 +153,11 @@ check_peer_keepalive() {
   if ! command -v journalctl >/dev/null; then return; fi
   if [[ $EUID -ne 0 ]] && ! groups | grep -q '\(systemd-journal\|adm\)'; then return; fi
 
+  # remote_addr can be IPv4 (1.2.3.4:port) or IPv6 ([::1]:port). Match both.
   local recent_peers
   recent_peers=$(journalctl -u monad-bft -n 2000 --no-pager 2>/dev/null \
     | grep 'sending keepalive packet' \
-    | grep -oE 'remote_addr":"[0-9.]+' \
+    | grep -oE 'remote_addr":"[^"]+' \
     | sort -u | wc -l)
   if (( recent_peers >= 5 )); then
     emit "wireauth.peers" "pass" "$recent_peers unique peers seen in keepalives"
@@ -177,25 +186,46 @@ check_udp_ports() {
   fi
 }
 
-# ===== Check 6: node.toml config =====
+# ===== Check 6: node.toml config (section-aware) =====
+# Per docs:
+#   [peer_discovery] → self_auth_port, self_record_seq_num, self_name_record_sig
+#   [network]        → authenticated_bind_address_port
 check_node_toml() {
   if [[ ! -r "$MONAD_NODE_TOML" ]]; then
     emit "config.toml" "info" "node.toml not readable at $MONAD_NODE_TOML"
     return
   fi
+
+  toml_has_key_in_section() {
+    local section="$1" key="$2"
+    awk -v sec="[$section]" -v key="$key" '
+      /^[[:space:]]*\[/ { current=$0; sub(/^[[:space:]]+/,"",current); sub(/[[:space:]]+$/,"",current) }
+      $0 ~ "^[[:space:]]*"key"[[:space:]]*=" { if (current==sec) {found=1; exit} }
+      END { exit !found }
+    ' "$MONAD_NODE_TOML"
+  }
+
   local missing=""
-  for key in self_auth_port self_record_seq_num self_name_record_sig authenticated_bind_address_port; do
-    grep -qE "^[[:space:]]*${key}[[:space:]]*=" "$MONAD_NODE_TOML" || missing+="$key "
+  for key in self_auth_port self_record_seq_num self_name_record_sig; do
+    toml_has_key_in_section peer_discovery "$key" || missing+="[peer_discovery].$key "
   done
+  toml_has_key_in_section network authenticated_bind_address_port \
+    || missing+="[network].authenticated_bind_address_port "
+
   if [[ -z "$missing" ]]; then
-    emit "config.toml" "pass" "all Auth UDP keys present in node.toml"
+    emit "config.toml" "pass" "all Auth UDP keys present in correct sections"
   else
-    emit "config.toml" "fail" "node.toml missing keys: $missing"
+    emit "config.toml" "fail" "node.toml missing: $missing"
   fi
 
-  # Verify the auth port matches the official 8001
+  # Auth port should be 8001 per docs (also verify it's inside [peer_discovery])
   local self_auth
-  self_auth=$(awk -F= '/^[[:space:]]*self_auth_port[[:space:]]*=/ {gsub(/[ "]/,"",$2); print $2; exit}' "$MONAD_NODE_TOML" 2>/dev/null)
+  self_auth=$(awk '
+    /^[[:space:]]*\[/ { current=$0; sub(/^[[:space:]]+/,"",current); sub(/[[:space:]]+$/,"",current) }
+    /^[[:space:]]*self_auth_port[[:space:]]*=/ {
+      if (current=="[peer_discovery]") { gsub(/.*=[[:space:]]*/,""); gsub(/[ "]/,""); print; exit }
+    }
+  ' "$MONAD_NODE_TOML" 2>/dev/null)
   if [[ -n "$self_auth" && "$self_auth" != "8001" ]]; then
     emit "config.port" "warn" "self_auth_port=$self_auth (docs default: 8001)"
   fi
@@ -276,6 +306,21 @@ post_result() {
 main() {
   print_header
   check_version
+
+  # Early exit when monad is not installed: the rest of the checks would all
+  # FAIL with misleading messages ("service not active", "0 wireauth entries",
+  # "UDP NOT listening") even though the real issue is just "no node here".
+  if [[ "${R[version.status]:-}" == "info" && "${R[version.detail]:-}" == *"not installed"* ]]; then
+    if [[ $JSON_OUTPUT -eq 0 && $QUIET -eq 0 ]]; then
+      echo
+      echo "${C_BLUE}ℹ Monad not installed on this host — Auth UDP check is for running nodes only.${C_RESET}"
+      echo "  Install Monad first (see https://docs.monad.xyz/node-ops/full-node-installation)"
+    elif [[ $JSON_OUTPUT -eq 1 ]]; then
+      print_json
+    fi
+    exit 0
+  fi
+
   check_service
   check_wireauth_logs
   check_peer_keepalive

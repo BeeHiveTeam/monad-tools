@@ -337,10 +337,16 @@ step_io_scheduler() {
     fi
   fi
 
-  # Persist via udev rule
+  # Persist via udev rule.
+  # NOTE: match by attribute (rotational=0 → SSD), not by exact device name.
+  # Hardcoding KERNEL=="nvme1n1" silently breaks if the operator swaps the
+  # disk (RMA, upgrade) — udev no longer applies the scheduler.
   local rule=/etc/udev/rules.d/60-monad-triedb-scheduler.rules
   local rule_content="# monad-validator-setup ${TS}
-ACTION==\"add|change\", KERNEL==\"${target}\", ATTR{queue/scheduler}=\"mq-deadline\"
+# Apply mq-deadline to all NVMe SSDs (matches by attribute, not name).
+# Required for triedb performance per Monad operator feedback.
+ACTION==\"add|change\", SUBSYSTEM==\"block\", KERNEL==\"nvme*\", \\
+  ATTR{queue/rotational}==\"0\", ATTR{queue/scheduler}=\"mq-deadline\"
 "
   if [[ -f "$rule" ]] && [[ "$(cat "$rule")" == "$rule_content" ]]; then
     ok "udev rule already in place"
@@ -606,15 +612,27 @@ EOF
   (( DRY_RUN )) && warn "DRY-RUN MODE: no changes will be made"
   echo
 
-  step_preflight
-  step_sysctl
-  step_ulimits
-  step_io_scheduler
-  step_chrony
-  step_monad_install
-  step_firewall
-  step_monitoring
+  local failed=()
+  step_preflight       || failed+=("preflight")
+  step_sysctl          || failed+=("sysctl")
+  step_ulimits         || failed+=("ulimits")
+  step_io_scheduler    || failed+=("io-scheduler")
+  step_chrony          || failed+=("chrony")
+  step_monad_install   || failed+=("monad-install")
+  step_firewall        || failed+=("firewall")
+  step_monitoring      || failed+=("monitoring")
   step_report
+
+  if (( ${#failed[@]} > 0 )); then
+    echo
+    err "═══════════════════════════════════════════════════"
+    err "  Setup INCOMPLETE — failed steps: ${failed[*]}"
+    err "═══════════════════════════════════════════════════"
+    err "  See log for details: $LOG_FILE"
+    err "  Re-run after fixing, or open an issue:"
+    err "    https://github.com/BeeHiveTeam/monad-tools/issues"
+    exit 1
+  fi
 
   print_next_steps
 }

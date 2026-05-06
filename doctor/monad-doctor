@@ -37,7 +37,15 @@ DISK_GB_TRIEDB_MIN=${DISK_GB_TRIEDB_MIN:-1700}  # docs: "2TB dedicated disk" (re
 NVME_IOPS_MIN=${NVME_IOPS_MIN:-200000}  # not in docs — heuristic from operators
 NVME_IOPS_REC=${NVME_IOPS_REC:-500000}
 ULIMIT_MIN=${ULIMIT_MIN:-1000000}
-KERNEL_MIN=${KERNEL_MIN:-5.15}
+# Per docs.monad.xyz/node-ops/full-node-installation:
+#   "Linux Kernel >= 6.8.0.60"
+#   "There is a known bug affecting Linux kernel versions v6.8.0.56-generic
+#    – v6.8.0.59-generic (inclusive) that causes Monad clients to hang."
+KERNEL_MIN=${KERNEL_MIN:-6.8.0}
+KERNEL_MIN_PATCH=${KERNEL_MIN_PATCH:-60}      # apt name: 6.8.0-60-generic
+KERNEL_BUGGY_PATCHES=${KERNEL_BUGGY_PATCHES:-"56 57 58 59"}
+# Ubuntu 24.04+ required (apt repo only ships 'noble' suite per docs).
+UBUNTU_VERSION_MIN=${UBUNTU_VERSION_MIN:-24.04}
 # 8000 = TCP+UDP P2P, 8001 = UDP-only Auth UDP per docs.
 # Format: "port/proto" pairs.
 NET_PORTS_REQUIRED=${NET_PORTS_REQUIRED:-"8000/tcp 8000/udp 8001/udp"}
@@ -48,6 +56,9 @@ JSON_OUTPUT=0
 QUICK_MODE=0
 SECTION=""
 USE_COLOR=1
+
+# Valid sections — keep in sync with run_section calls in main()
+VALID_SECTIONS=("hardware" "os" "network" "security" "monad")
 
 # ===== Argument parsing =====
 while [[ $# -gt 0 ]]; do
@@ -64,6 +75,16 @@ while [[ $# -gt 0 ]]; do
   esac
   shift
 done
+
+# Validate --section if provided (catches typos like 'hardwear')
+if [[ -n "$SECTION" ]]; then
+  found=0
+  for v in "${VALID_SECTIONS[@]}"; do [[ "$v" == "$SECTION" ]] && found=1; done
+  if (( found == 0 )); then
+    echo "Unknown section '$SECTION'. Valid: ${VALID_SECTIONS[*]}" >&2
+    exit 64
+  fi
+fi
 
 # ===== Colors =====
 if [[ $USE_COLOR -eq 1 && -t 1 && $JSON_OUTPUT -eq 0 ]]; then
@@ -214,18 +235,35 @@ disk_topology() {
 
 # ===== Section: HARDWARE =====
 check_cpu() {
-  local cores model
-  cores=$(nproc)
+  local model phys_cores logical
   model=$(awk -F: '/model name/ {print $2; exit}' /proc/cpuinfo | sed 's/^ *//')
+  # Physical cores per docs: nproc returns logical (with SMT), but docs
+  # require SMT off, so we should count physical cores.
+  phys_cores=$(lscpu 2>/dev/null \
+    | awk -F: '/^Core\(s\) per socket/ {gsub(/ /,"",$2); c=$2} /^Socket\(s\)/ {gsub(/ /,"",$2); s=$2} END {if (c && s) print c*s; else print 0}')
+  logical=$(nproc)
+  [[ -z "$phys_cores" || "$phys_cores" == "0" ]] && phys_cores="$logical"
 
-  if (( cores >= CPU_CORES_REC )); then
-    emit hardware "cpu.cores"   PASS "$cores cores ($model)"
-  elif (( cores >= CPU_CORES_MIN )); then
-    emit hardware "cpu.cores"   WARN "$cores cores — meets min ($CPU_CORES_MIN), recommend $CPU_CORES_REC+ ($model)"
+  if (( phys_cores >= CPU_CORES_REC )); then
+    emit hardware "cpu.cores"   PASS "$phys_cores physical cores ($model)"
+  elif (( phys_cores >= CPU_CORES_MIN )); then
+    emit hardware "cpu.cores"   WARN "$phys_cores physical cores — meets min ($CPU_CORES_MIN), recommend $CPU_CORES_REC+ ($model)"
   else
-    emit hardware "cpu.cores"   FAIL "$cores cores — below minimum $CPU_CORES_MIN ($model)" \
+    emit hardware "cpu.cores"   FAIL "$phys_cores physical cores — below minimum $CPU_CORES_MIN ($model)" \
          "Validator needs ≥$CPU_CORES_MIN physical cores; current hardware insufficient"
   fi
+
+  # SMT/HyperThreading per docs: "Disabled HyperThreading (HT) or
+  # Simultaneous MultiThreading (SMT) via BIOS settings — these features
+  # degrade the node performance."
+  local smt_active
+  smt_active=$(cat /sys/devices/system/cpu/smt/active 2>/dev/null || echo unknown)
+  case "$smt_active" in
+    0)     emit hardware "cpu.smt"  PASS "SMT/HyperThreading disabled (per docs)" ;;
+    1)     emit hardware "cpu.smt"  FAIL "SMT/HyperThreading active — must be disabled in BIOS per docs" \
+                "Reboot into BIOS/UEFI and disable SMT (AMD) / HyperThreading (Intel)" ;;
+    *)     emit hardware "cpu.smt"  INFO "SMT state unknown — verify in BIOS (must be off)" ;;
+  esac
 
   # CPU base clock — docs require 4.5 GHz+. Read from cpuinfo "MHz" field if available,
   # otherwise from lscpu "CPU max MHz". Some servers report governed (current) clock not max.
@@ -309,6 +347,34 @@ check_disks() {
     esac
   done <<<"$topo"
 
+  # NVMe LBA format per docs:
+  # "Data Size should be set to 512 bytes and marked as (in use). If that
+  #  is not the case, then you will need to set the TRIEDB_DRIVE to use
+  #  512 byte LBA." → only enforce on the actual triedb device.
+  local triedb_disk_for_lba=""
+  if [[ -L /dev/triedb ]]; then
+    triedb_disk_for_lba=$(lsblk -no PKNAME "$(readlink -f /dev/triedb)" 2>/dev/null | head -1)
+  fi
+  while IFS=$'\t' read -r dev _ role _; do
+    [[ -z "$dev" ]] && continue
+    local lba
+    lba=$(lsblk -dn -o LOG-SEC "/dev/$dev" 2>/dev/null | tr -d ' ')
+    [[ -z "$lba" ]] && continue
+    if [[ "$dev" == "$triedb_disk_for_lba" ]]; then
+      if [[ "$lba" == "512" ]]; then
+        emit hardware "disk.lba.$dev" PASS "triedb device $dev: 512-byte LBA (per docs)"
+      else
+        emit hardware "disk.lba.$dev" FAIL "triedb device $dev: ${lba}-byte LBA — docs require 512" \
+             "Reformat (DESTROYS DATA — backup keys first): nvme format /dev/$dev --lbaf=0 --force"
+      fi
+    elif [[ "$role" == "unused" ]]; then
+      # Unused disk — could become triedb. Inform if it would need reformat.
+      if [[ "$lba" != "512" ]]; then
+        emit hardware "disk.lba.$dev" INFO "$dev (unused): ${lba}-byte LBA — must be reformatted to 512 if used as triedb"
+      fi
+    fi
+  done <<<"$topo"
+
   # Sanity: triedb on RAID is wasteful (extra writes, slower)
   if [[ -L /dev/triedb ]]; then
     local triedb_part triedb_disk
@@ -387,10 +453,24 @@ check_iops() {
     return
   fi
 
-  local target_dev
-  target_dev=$(lsblk -d -o NAME,TYPE 2>/dev/null | awk '/disk/ && /^nvme/ {print "/dev/"$1; exit}')
+  # Safety: do not run fio on a disk where monad-execution is hammering triedb —
+  # would compete with real IO and could spike vote_delay.
+  if systemctl is-active --quiet monad-bft 2>/dev/null \
+     || systemctl is-active --quiet monad-execution 2>/dev/null; then
+    emit hardware "disk.iops"   INFO "skipped — monad services active, fio would compete with triedb IO" \
+         "Run on a non-triedb disk separately, or stop monad-execution briefly: 'systemctl stop monad-execution && fio ... && systemctl start monad-execution'"
+    return
+  fi
+
+  # Pick a non-triedb NVMe to avoid stomping on production data.
+  local target_dev triedb_disk=""
+  if [[ -L /dev/triedb ]]; then
+    triedb_disk=$(lsblk -no PKNAME "$(readlink -f /dev/triedb)" 2>/dev/null | head -1)
+  fi
+  target_dev=$(lsblk -d -o NAME,TYPE 2>/dev/null \
+    | awk -v skip="$triedb_disk" '/disk/ && /^nvme/ && $1 != skip {print "/dev/"$1; exit}')
   if [[ -z "$target_dev" ]]; then
-    emit hardware "disk.iops"   INFO "skipped (no NVMe found)"
+    emit hardware "disk.iops"   INFO "skipped (no non-triedb NVMe found)"
     return
   fi
 
@@ -426,18 +506,21 @@ check_os() {
   case "$ID" in
     ubuntu)
       local ver_id="${VERSION_ID:-0}"
-      if ver_ge "$ver_id" "22.04"; then
+      if ver_ge "$ver_id" "$UBUNTU_VERSION_MIN"; then
         emit os "os.distro"     PASS "$PRETTY_NAME"
       else
-        emit os "os.distro"     FAIL "$PRETTY_NAME — Ubuntu 22.04+ required" \
-             "Reinstall with Ubuntu 22.04 LTS or 24.04 LTS"
+        # apt repo pkg.category.xyz only ships 'noble' (24.04). On 22.04 jammy
+        # the install will fail with "Unable to find package" anyway.
+        emit os "os.distro"     FAIL "$PRETTY_NAME — Ubuntu ${UBUNTU_VERSION_MIN}+ required (apt repo ships noble only)" \
+             "Reinstall with Ubuntu 24.04 LTS or newer"
       fi ;;
     debian)
-      emit os "os.distro"       WARN "$PRETTY_NAME — Debian works but Ubuntu 22.04+ is officially supported"
+      emit os "os.distro"       FAIL "$PRETTY_NAME — Debian not supported by docs (only Ubuntu ${UBUNTU_VERSION_MIN}+)" \
+           "Reinstall with Ubuntu 24.04 LTS"
       ;;
     *)
-      emit os "os.distro"       FAIL "$PRETTY_NAME — only Ubuntu (Debian) supported" \
-           "Use Ubuntu 22.04 or 24.04 LTS"
+      emit os "os.distro"       FAIL "$PRETTY_NAME — only Ubuntu ${UBUNTU_VERSION_MIN}+ supported per docs" \
+           "Reinstall with Ubuntu 24.04 LTS"
       ;;
   esac
 
@@ -453,13 +536,33 @@ check_os() {
 }
 
 check_kernel() {
-  local k
-  k=$(uname -r | cut -d- -f1)
-  if ver_ge "$k" "$KERNEL_MIN"; then
-    emit os "kernel.version"    PASS "$(uname -r)"
+  local full base patch
+  full=$(uname -r)              # e.g. "6.8.0-60-generic"
+  base=$(echo "$full" | cut -d- -f1)
+  patch=$(echo "$full" | sed -nE 's/^[0-9]+\.[0-9]+\.[0-9]+-([0-9]+).*/\1/p')
+
+  # Reject buggy 6.8.0-{56..59} range explicitly (docs cite this hang bug)
+  if [[ "$base" == "6.8.0" && -n "$patch" ]]; then
+    for bad in $KERNEL_BUGGY_PATCHES; do
+      if [[ "$patch" == "$bad" ]]; then
+        emit os "kernel.version"  FAIL "kernel $full — known buggy range 6.8.0-${KERNEL_BUGGY_PATCHES// /,} (causes Monad client hangs)" \
+             "Upgrade: apt install --install-recommends linux-generic-hwe-24.04"
+        return
+      fi
+    done
+  fi
+
+  # Compare base version + patch number against minimum (6.8.0 + patch 60)
+  if ver_ge "$base" "$KERNEL_MIN"; then
+    if [[ "$base" == "$KERNEL_MIN" && -n "$patch" && "$patch" -lt "$KERNEL_MIN_PATCH" ]]; then
+      emit os "kernel.version"  FAIL "kernel $full — need ≥${KERNEL_MIN}-${KERNEL_MIN_PATCH}" \
+           "Upgrade: apt install --install-recommends linux-generic-hwe-24.04"
+    else
+      emit os "kernel.version"  PASS "$full"
+    fi
   else
-    emit os "kernel.version"    FAIL "kernel $k — need $KERNEL_MIN+" \
-         "Upgrade kernel: apt install linux-generic-hwe-22.04"
+    emit os "kernel.version"    FAIL "kernel $base — need ≥${KERNEL_MIN}-${KERNEL_MIN_PATCH}" \
+         "Upgrade: apt install --install-recommends linux-generic-hwe-24.04"
   fi
 }
 
@@ -480,7 +583,9 @@ check_ulimits() {
     # No service yet — fall back to /etc/security/limits.conf
     local conf_limit
     conf_limit=$(awk '$1=="*" && $2=="hard" && $3=="nofile" {print $4}' /etc/security/limits.conf 2>/dev/null | tail -1)
-    if [[ -n "$conf_limit" && "$conf_limit" -ge "$ULIMIT_MIN" ]]; then
+    if [[ "$conf_limit" == "unlimited" ]]; then
+      emit os "ulimit.limits-conf" PASS "limits.conf hard nofile=unlimited"
+    elif [[ -n "$conf_limit" && "$conf_limit" =~ ^[0-9]+$ ]] && (( conf_limit >= ULIMIT_MIN )); then
       emit os "ulimit.limits-conf" PASS "limits.conf hard nofile=$conf_limit"
     else
       emit os "ulimit.limits-conf" WARN "no high nofile limit set in /etc/security/limits.conf" \
@@ -653,16 +758,25 @@ check_ssh_hardening() {
 }
 
 check_unattended_upgrades() {
-  if dpkg -l unattended-upgrades 2>/dev/null | grep -q '^ii'; then
-    if [[ -f /etc/apt/apt.conf.d/20auto-upgrades ]] \
-       && grep -q '^APT::Periodic::Unattended-Upgrade "1"' /etc/apt/apt.conf.d/20auto-upgrades 2>/dev/null; then
-      emit security "auto-upgrades" WARN "unattended-upgrades enabled — may auto-restart node mid-epoch" \
-           "Disable for validator: systemctl disable --now unattended-upgrades"
+  # Goal: keep security patches flowing, but prevent automatic reboots
+  # mid-epoch. Disabling unattended-upgrades entirely is dangerous (CVE
+  # exposure). Instead check for Automatic-Reboot=false setting.
+  if ! dpkg -l unattended-upgrades 2>/dev/null | grep -qE '^.i  unattended-upgrades'; then
+    emit security "auto-upgrades" INFO "unattended-upgrades not installed — security patches not auto-applied" \
+         "Recommended: apt install -y unattended-upgrades and configure Automatic-Reboot=false"
+    return
+  fi
+  if [[ -f /etc/apt/apt.conf.d/20auto-upgrades ]] \
+     && grep -q '^APT::Periodic::Unattended-Upgrade "1"' /etc/apt/apt.conf.d/20auto-upgrades 2>/dev/null; then
+    # Check whether automatic reboot is disabled
+    if grep -rqE '^[[:space:]]*Unattended-Upgrade::Automatic-Reboot[[:space:]]+"?false"?' /etc/apt/apt.conf.d/ 2>/dev/null; then
+      emit security "auto-upgrades" PASS "unattended-upgrades active, Automatic-Reboot=false (safe for validator)"
     else
-      emit security "auto-upgrades" PASS "unattended-upgrades installed but not active"
+      emit security "auto-upgrades" WARN "unattended-upgrades active but may auto-reboot mid-epoch" \
+           "Configure no-reboot: echo 'Unattended-Upgrade::Automatic-Reboot \"false\";' | sudo tee /etc/apt/apt.conf.d/52monad-no-reboot"
     fi
   else
-    emit security "auto-upgrades" PASS "unattended-upgrades not installed"
+    emit security "auto-upgrades" INFO "unattended-upgrades installed but disabled — security patches not auto-applied"
   fi
 }
 
@@ -701,22 +815,35 @@ check_triedb_device() {
 }
 
 check_authudp_config() {
-  # Verify Auth UDP keys in node.toml. Per docs:
+  # Verify Auth UDP keys in correct TOML sections per docs.
   # https://docs.monad.xyz/node-ops/upgrade-instructions/auth-udp
+  #   [peer_discovery] → self_auth_port, self_record_seq_num, self_name_record_sig
+  #   [network]        → authenticated_bind_address_port
   if [[ ! -r "$MONAD_NODE_TOML" ]]; then
     emit monad "monad.authudp-cfg" INFO "node.toml not readable at $MONAD_NODE_TOML (skipped)"
     return
   fi
 
+  # Helper: check if KEY appears under [SECTION] in $MONAD_NODE_TOML.
+  # Uses awk to track current section header [..] and matches key only inside.
+  toml_has_key_in_section() {
+    local section="$1" key="$2"
+    awk -v sec="[$section]" -v key="$key" '
+      /^[[:space:]]*\[/ { current=$0; sub(/^[[:space:]]+/,"",current); sub(/[[:space:]]+$/,"",current) }
+      $0 ~ "^[[:space:]]*"key"[[:space:]]*=" { if (current==sec) {found=1; exit} }
+      END { exit !found }
+    ' "$MONAD_NODE_TOML"
+  }
+
   local missing=""
-  for key in self_auth_port self_record_seq_num self_name_record_sig authenticated_bind_address_port; do
-    if ! grep -qE "^[[:space:]]*${key}[[:space:]]*=" "$MONAD_NODE_TOML"; then
-      missing+="$key "
-    fi
+  for key in self_auth_port self_record_seq_num self_name_record_sig; do
+    toml_has_key_in_section peer_discovery "$key" || missing+="[peer_discovery].$key "
   done
+  toml_has_key_in_section network authenticated_bind_address_port \
+    || missing+="[network].authenticated_bind_address_port "
 
   if [[ -z "$missing" ]]; then
-    emit monad "monad.authudp-cfg" PASS "node.toml has all Auth UDP keys"
+    emit monad "monad.authudp-cfg" PASS "node.toml has all Auth UDP keys in correct sections"
   else
     emit monad "monad.authudp-cfg" FAIL "node.toml missing Auth UDP keys: $missing" \
          "Add to [peer_discovery] and [network] per docs: https://docs.monad.xyz/node-ops/upgrade-instructions/auth-udp"
@@ -826,6 +953,18 @@ print_summary() {
   echo
 }
 
+json_escape() {
+  # Properly escape a string for JSON: backslash, quote, control chars, newlines.
+  # Uses python3 if available (most reliable), else minimal fallback.
+  if command -v python3 >/dev/null; then
+    python3 -c 'import json,sys; sys.stdout.write(json.dumps(sys.argv[1])[1:-1])' "$1"
+  else
+    # Fallback: handle backslash, quote, tab, newline, CR.
+    printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' \
+                          -e ':a;N;$!ba;s/\n/\\n/g' -e 's/\r/\\r/g' -e 's/\t/\\t/g'
+  fi
+}
+
 print_json() {
   printf '{\n'
   printf '  "host": "%s",\n' "$(hostname)"
@@ -841,9 +980,11 @@ print_json() {
     local sep=","
     (( i == n-1 )) && sep=""
     printf '    {"section": "%s", "name": "%s", "status": "%s", "message": "%s", "fix": "%s"}%s\n' \
-      "${RESULTS_SECTION[i]}" "${RESULTS_NAME[i]}" "${RESULTS_STATUS[i]}" \
-      "$(echo "${RESULTS_MSG[i]}" | sed 's/"/\\"/g')" \
-      "$(echo "${RESULTS_FIX[i]}" | sed 's/"/\\"/g')" \
+      "$(json_escape "${RESULTS_SECTION[i]}")" \
+      "$(json_escape "${RESULTS_NAME[i]}")" \
+      "$(json_escape "${RESULTS_STATUS[i]}")" \
+      "$(json_escape "${RESULTS_MSG[i]}")" \
+      "$(json_escape "${RESULTS_FIX[i]}")" \
       "$sep"
   done
   printf '  ]\n'
