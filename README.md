@@ -1,6 +1,6 @@
 # monad-tools
 
-Operator tooling for Monad validator nodes, by [BeeHive](https://monad-tech.com). Three single-file bash scripts, zero external dependencies for the diagnostic ones, opinionated defaults that match what we run in production.
+Operator tooling for Monad validator nodes, by [BeeHive](https://bee-hive.work). Three single-file bash scripts, zero external dependencies for the diagnostic ones, opinionated defaults that match what we run in production.
 
 | Tool | What | Lines |
 |---|---|---|
@@ -99,7 +99,7 @@ contact:
 
 ## Authors
 
-- BeeHive team — operators of [monad-tech.com](https://monad-tech.com)
+- BeeHive team — [bee-hive.work](https://bee-hive.work) · operators of [monad-tech.com](https://monad-tech.com)
 
 ## License
 
