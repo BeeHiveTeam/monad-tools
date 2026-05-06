@@ -257,9 +257,11 @@ step_io_scheduler() {
   section "IO scheduler (mq-deadline on triedb)"
 
   local target="$TRIEDB_DEV"
+
+  # Priority 1: explicit --triedb-dev= flag (already set in $target)
+
+  # Priority 2: /dev/triedb symlink — authoritative, set by monad-mpt config
   if [[ -z "$target" && -L /dev/triedb ]]; then
-    # Authoritative: follow /dev/triedb symlink (set up by monad-mpt config).
-    # Translate partition (nvme1n1p1) → parent disk (nvme1n1).
     local triedb_part triedb_disk
     triedb_part=$(readlink -f /dev/triedb 2>/dev/null)
     triedb_part="${triedb_part##*/}"
@@ -269,12 +271,47 @@ step_io_scheduler() {
       info "Detected triedb device from /dev/triedb → /dev/${triedb_part} (disk: $target)"
     fi
   fi
+
+  # Priority 3: find an UNUSED NVMe — not part of OS RAID, not mounted, no role.
+  # Avoid the dangerous "largest NVMe" guess that may pick the OS disk on
+  # asymmetric setups where multiple disks share the same size.
   if [[ -z "$target" ]]; then
-    # Fallback: largest NVMe (assumed triedb).
-    target=$(lsblk -bdn -o NAME,SIZE,TYPE 2>/dev/null \
-      | awk '$3=="disk" && $1 ~ /^nvme/ {print $1, $2}' \
-      | sort -k2 -n -r | head -1 | awk '{print $1}')
-    [[ -n "$target" ]] && warn "/dev/triedb not present — picking largest NVMe ($target) as triedb candidate"
+    local root_src root_dev parts_under_root=()
+    root_src=$(findmnt -no SOURCE / 2>/dev/null)
+    root_dev="${root_src##*/}"
+    if [[ -n "$root_dev" && -e "/sys/block/$root_dev/md" ]]; then
+      while IFS= read -r m; do
+        parts_under_root+=("$m")
+      done < <(ls "/sys/block/$root_dev/md/" 2>/dev/null | sed -n 's/^dev-//p')
+    fi
+
+    local best=""
+    while IFS= read -r disk; do
+      [[ -z "$disk" ]] && continue
+      # Reject if any partition is a member of the root md array
+      local skip=0
+      for m in "${parts_under_root[@]}"; do
+        if lsblk -ln -o NAME "/dev/$disk" 2>/dev/null | grep -qx "$m"; then skip=1; break; fi
+      done
+      (( skip )) && continue
+      # Reject if anything under this disk is mounted at /
+      if lsblk -ln -o MOUNTPOINT "/dev/$disk" 2>/dev/null | grep -qx "/"; then continue; fi
+      # Reject if disk has any non-swap mounts (already in use for something)
+      if lsblk -ln -o MOUNTPOINT "/dev/$disk" 2>/dev/null \
+         | grep -vE '^$|^\[SWAP\]$' | grep -q .; then continue; fi
+      # Pick the largest among remaining (unused) candidates.
+      local size_b
+      size_b=$(lsblk -bdn -o SIZE "/dev/$disk" 2>/dev/null)
+      if [[ -z "$best" ]] || (( size_b > $(lsblk -bdn -o SIZE "/dev/$best" 2>/dev/null || echo 0) )); then
+        best="$disk"
+      fi
+    done < <(lsblk -dn -o NAME,TYPE 2>/dev/null | awk '$2=="disk" && $1 ~ /^nvme/ {print $1}')
+
+    if [[ -n "$best" ]]; then
+      target="$best"
+      info "/dev/triedb not present — picked unused NVMe '$target' as triedb candidate"
+      info "(safer than 'largest NVMe' — won't accidentally select the OS disk)"
+    fi
   fi
 
   if [[ -z "$target" ]]; then

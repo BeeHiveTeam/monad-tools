@@ -121,6 +121,97 @@ ver_ge() {
   printf '%s\n%s\n' "$2" "$1" | sort -V -C
 }
 
+# ===== Disk topology analyzer =====
+# Classifies each NVMe disk by role:
+#   os-raid     — at least one partition is a member of a md array mounted at /
+#   os-single   — at least one partition is mounted at / directly
+#   triedb      — contains the partition that /dev/triedb points to
+#   swap-only   — only swap partitions (and nothing else mounted)
+#   unused      — no partitions or no mounted partitions (a spare)
+#   other       — partitions exist but role unclear (LVM, encrypted, etc)
+#
+# Outputs lines:  <devname>\t<size_human>\t<role>\t<detail>
+disk_topology() {
+  # Resolve which device(s) back the / mount.
+  local root_src root_dev parts_under_root=()
+  root_src=$(findmnt -no SOURCE / 2>/dev/null)
+  root_dev="${root_src##*/}"  # md3, sda1, dm-0...
+
+  # If / is on md raid, find the underlying member partitions.
+  if [[ -n "$root_dev" && -e "/sys/block/$root_dev/md" ]]; then
+    while IFS= read -r m; do
+      parts_under_root+=("$m")
+    done < <(ls "/sys/block/$root_dev/md/" 2>/dev/null | sed -n 's/^dev-//p')
+  fi
+
+  # Resolve triedb partition.
+  local triedb_part=""
+  if [[ -L /dev/triedb ]]; then
+    triedb_part=$(readlink -f /dev/triedb 2>/dev/null)
+    triedb_part="${triedb_part##*/}"
+  fi
+
+  # Iterate all top-level NVMe disks.
+  local disk
+  for disk in $(lsblk -dn -o NAME,TYPE 2>/dev/null | awk '$2=="disk" && $1 ~ /^nvme/ {print $1}'); do
+    local size_h size_b
+    size_h=$(lsblk -dn -o SIZE "/dev/$disk" 2>/dev/null)
+    size_b=$(lsblk -bdn -o SIZE "/dev/$disk" 2>/dev/null)
+
+    # Collect partition info.
+    local parts mounts has_root has_triedb has_swap has_other
+    parts=$(lsblk -ln -o NAME,MOUNTPOINT "/dev/$disk" 2>/dev/null | tail -n +2)
+    has_root=0; has_triedb=0; has_swap=0; has_other=0
+
+    while IFS= read -r line; do
+      local pname pmount
+      pname=$(awk '{print $1}' <<<"$line")
+      pmount=$(awk '{print $2}' <<<"$line")
+      [[ "$pname" == "$disk" ]] && continue
+      # Member of root md?
+      for m in "${parts_under_root[@]}"; do
+        [[ "$pname" == "$m" ]] && has_root=1
+      done
+      # Mounted at / directly (no RAID)?
+      [[ "$pmount" == "/" ]] && has_root=2
+      # Triedb
+      [[ "$pname" == "$triedb_part" ]] && has_triedb=1
+      # Swap
+      [[ "$pmount" == "[SWAP]" ]] && has_swap=1
+      # Anything else mounted
+      if [[ -n "$pmount" && "$pmount" != "[SWAP]" && "$pmount" != "/" ]]; then
+        has_other=1
+      fi
+    done <<<"$parts"
+
+    local role detail=""
+    if (( has_triedb )); then
+      role="triedb"
+      detail="/dev/triedb → $triedb_part"
+    elif (( has_root == 2 )); then
+      role="os-single"
+      detail="/ on this disk (single, no RAID)"
+    elif (( has_root == 1 )); then
+      role="os-raid"
+      detail="member of $root_dev (raid for /)"
+    elif (( has_other )); then
+      role="other"
+      detail="has mounted partitions"
+    elif (( has_swap )); then
+      role="swap-only"
+      detail="only swap"
+    elif [[ -z "$parts" ]]; then
+      role="unused"
+      detail="no partitions"
+    else
+      role="unused"
+      detail="partitions present but no mounts"
+    fi
+
+    printf '%s\t%s\t%s\t%s\n' "$disk" "$size_h" "$role" "$detail"
+  done
+}
+
 # ===== Section: HARDWARE =====
 check_cpu() {
   local cores model
@@ -189,10 +280,9 @@ check_ram() {
 }
 
 check_disks() {
-  # Find all NVMe devices
-  local nvme_devs nvme_count total_size_gb
-  nvme_devs=$(lsblk -d -o NAME,TYPE 2>/dev/null | awk '/disk/ && /^nvme/ {print $1}')
-  nvme_count=$(echo "$nvme_devs" | grep -c . || true)
+  local topo nvme_count total_size_gb
+  topo=$(disk_topology)
+  nvme_count=$(echo "$topo" | grep -c . || echo 0)
   total_size_gb=$(lsblk -bdn -o NAME,SIZE 2>/dev/null \
     | awk '/^nvme/ {s+=$2} END {printf "%d", s/1024/1024/1024}')
 
@@ -204,25 +294,60 @@ check_disks() {
 
   emit hardware "disk.nvme"     PASS "$nvme_count NVMe drive(s), ${total_size_gb} GB total"
 
-  # Check IO scheduler on each NVMe — triedb requires mq-deadline on its own disk
-  local triedb_ok=0 first_dev
-  first_dev=$(echo "$nvme_devs" | head -1)
-  for dev in $nvme_devs; do
+  # Print topology table — one line per disk with role + detail.
+  # This is INFO-level: the WARN/FAIL signals come from derived checks below.
+  while IFS=$'\t' read -r dev size role detail; do
+    [[ -z "$dev" ]] && continue
+    case "$role" in
+      triedb)    emit hardware "disk.role.$dev" PASS "$dev ($size): triedb — $detail" ;;
+      os-raid)   emit hardware "disk.role.$dev" PASS "$dev ($size): OS RAID — $detail" ;;
+      os-single) emit hardware "disk.role.$dev" WARN "$dev ($size): OS on single disk (SPOF) — $detail" \
+                      "Consider RAID1 for OS to avoid single-disk failure" ;;
+      unused)    emit hardware "disk.role.$dev" INFO "$dev ($size): unused — $detail" ;;
+      swap-only) emit hardware "disk.role.$dev" INFO "$dev ($size): swap-only" ;;
+      other)     emit hardware "disk.role.$dev" INFO "$dev ($size): $detail" ;;
+    esac
+  done <<<"$topo"
+
+  # Sanity: triedb on RAID is wasteful (extra writes, slower)
+  if [[ -L /dev/triedb ]]; then
+    local triedb_part triedb_disk
+    triedb_part=$(readlink -f /dev/triedb)
+    triedb_part="${triedb_part##*/}"
+    triedb_disk=$(lsblk -no PKNAME "/dev/${triedb_part}" 2>/dev/null | head -1)
+    if [[ -n "$triedb_disk" ]] && grep -q "${triedb_disk}p" /proc/mdstat 2>/dev/null; then
+      emit hardware "disk.triedb-raid" WARN "triedb device $triedb_disk is part of RAID — wasted writes" \
+           "Move /dev/triedb to a dedicated NVMe (no RAID, no other use)"
+    fi
+  fi
+
+  # IO scheduler — only the triedb device strictly needs mq-deadline
+  local triedb_disk_for_sched=""
+  if [[ -L /dev/triedb ]]; then
+    triedb_disk_for_sched=$(lsblk -no PKNAME "$(readlink -f /dev/triedb)" 2>/dev/null | head -1)
+  fi
+  while IFS=$'\t' read -r dev size role _; do
+    [[ -z "$dev" ]] && continue
     local sched
     sched=$(awk '{for(i=1;i<=NF;i++) if($i ~ /^\[/) {gsub(/[][]/,"",$i); print $i; exit}}' "/sys/block/$dev/queue/scheduler" 2>/dev/null)
-    if [[ "$sched" == "mq-deadline" ]]; then
-      triedb_ok=1
-      emit hardware "disk.scheduler.$dev" PASS "scheduler=mq-deadline (triedb-suitable)"
-    else
-      emit hardware "disk.scheduler.$dev" INFO "scheduler=$sched"
+    if [[ "$dev" == "$triedb_disk_for_sched" ]]; then
+      if [[ "$sched" == "mq-deadline" ]]; then
+        emit hardware "disk.sched.$dev" PASS "triedb device on mq-deadline ✓"
+      else
+        emit hardware "disk.sched.$dev" FAIL "triedb device $dev on '$sched' — must be mq-deadline" \
+             "echo mq-deadline | sudo tee /sys/block/$dev/queue/scheduler"
+      fi
     fi
-  done
+  done <<<"$topo"
 
-  if (( triedb_ok == 0 )); then
-    emit hardware "disk.triedb-sched" WARN "no NVMe with mq-deadline scheduler" \
-         "On triedb device run: echo mq-deadline | sudo tee /sys/block/$first_dev/queue/scheduler"
-  else
-    emit hardware "disk.triedb-sched" PASS "at least one NVMe on mq-deadline (triedb-ready)"
+  # If no triedb yet, recommend an unused candidate.
+  if [[ ! -L /dev/triedb ]]; then
+    local cand
+    cand=$(echo "$topo" | awk -F'\t' -v min="$DISK_GB_TRIEDB_MIN" \
+      '$3=="unused" {gsub(/[^0-9.]/,"",$2); if ($2+0 >= 0) print $1, $2}')
+    if [[ -n "$cand" ]]; then
+      emit hardware "disk.triedb-candidate" INFO "candidate(s) for /dev/triedb: $(echo "$cand" | tr '\n' ',' )"
+    fi
   fi
 
   # Free space on root (OS partition — docs say 500 GB)
