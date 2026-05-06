@@ -49,12 +49,23 @@ SYSCTL_NETDEV_BACKLOG=5000
 SYSCTL_FILE_MAX=2097152
 SYSCTL_SWAPPINESS=1
 ULIMIT_NOFILE=1048576
-MONAD_APT_REPO="${MONAD_APT_REPO:-https://apt.monad.xyz}"
 
-# UFW ports
-UFW_TCP_PORTS="22"
-UFW_UDP_PORTS="8000 8001"
-UFW_TCP_ALSO="8000 8001"  # Monad listens on both
+# Official Monad apt repo (Category Labs).
+# Source: https://docs.monad.xyz/node-ops/full-node-installation
+MONAD_APT_REPO="${MONAD_APT_REPO:-https://pkg.category.xyz/}"
+MONAD_APT_SUITE="${MONAD_APT_SUITE:-noble}"
+MONAD_APT_KEY_URL="${MONAD_APT_KEY_URL:-https://pkg.category.xyz/category-labs.gpg}"
+MONAD_APT_KEYRING="${MONAD_APT_KEYRING:-/etc/apt/keyrings/category-labs.gpg}"
+# Pin version per docs (testnet+mainnet currently use 0.14.2). Set empty for "latest".
+MONAD_PKG_VERSION="${MONAD_PKG_VERSION:-0.14.2}"
+
+# UFW ports per docs:
+#   - SSH (22/tcp)
+#   - 8000 (TCP+UDP — consensus P2P)
+#   - 8001/udp (Authenticated UDP)
+UFW_SSH_PORT="22"
+UFW_P2P_PORT="8000"        # both TCP and UDP
+UFW_AUTHUDP_PORT="8001"    # UDP only
 
 # ===== Colors =====
 if [[ -t 1 ]]; then
@@ -246,11 +257,24 @@ step_io_scheduler() {
   section "IO scheduler (mq-deadline on triedb)"
 
   local target="$TRIEDB_DEV"
+  if [[ -z "$target" && -L /dev/triedb ]]; then
+    # Authoritative: follow /dev/triedb symlink (set up by monad-mpt config).
+    # Translate partition (nvme1n1p1) → parent disk (nvme1n1).
+    local triedb_part triedb_disk
+    triedb_part=$(readlink -f /dev/triedb 2>/dev/null)
+    triedb_part="${triedb_part##*/}"
+    triedb_disk=$(lsblk -no PKNAME "/dev/${triedb_part}" 2>/dev/null | head -1)
+    if [[ -n "$triedb_disk" ]]; then
+      target="$triedb_disk"
+      info "Detected triedb device from /dev/triedb → /dev/${triedb_part} (disk: $target)"
+    fi
+  fi
   if [[ -z "$target" ]]; then
-    # Pick the largest NVMe (assumed triedb)
+    # Fallback: largest NVMe (assumed triedb).
     target=$(lsblk -bdn -o NAME,SIZE,TYPE 2>/dev/null \
       | awk '$3=="disk" && $1 ~ /^nvme/ {print $1, $2}' \
       | sort -k2 -n -r | head -1 | awk '{print $1}')
+    [[ -n "$target" ]] && warn "/dev/triedb not present — picking largest NVMe ($target) as triedb candidate"
   fi
 
   if [[ -z "$target" ]]; then
@@ -337,35 +361,41 @@ step_monad_install() {
     return 0
   fi
 
-  # Install apt repo if missing
-  local list=/etc/apt/sources.list.d/monad.list
-  if [[ ! -f "$list" ]]; then
+  # Install apt repo if missing — uses deb822 .sources format per official docs
+  local sources_file=/etc/apt/sources.list.d/category-labs.sources
+  if [[ ! -f "$sources_file" ]]; then
     if (( DRY_RUN )); then
-      echo "  ${C_DIM}[dry-run] add Monad apt repo${C_RESET}"
+      echo "  ${C_DIM}[dry-run] add Category Labs apt repo (${MONAD_APT_REPO})${C_RESET}"
     else
-      info "Adding Monad apt repository: $MONAD_APT_REPO"
-      # NOTE: replace this with the actual canonical Monad apt repo when published.
-      # As of writing, validators install via a script provided by the Monad team.
-      # Skeleton below — operator should verify URL and signing key.
-      warn "Monad apt repo URL must be verified against official docs:"
-      warn "  https://docs.monad.xyz/node-ops/install"
-      if ! confirm "Proceed with $MONAD_APT_REPO?"; then
-        info "Skipping monad install — install manually following official docs"
-        return 0
-      fi
-      # Standard apt repo addition
+      info "Adding Monad apt repository: $MONAD_APT_REPO (suite=$MONAD_APT_SUITE)"
+      mkdir -p "$(dirname "$MONAD_APT_KEYRING")"
       run "fetching signing key" bash -c \
-        "curl -fsSL ${MONAD_APT_REPO}/monad.gpg | gpg --dearmor -o /usr/share/keyrings/monad.gpg"
-      echo "deb [signed-by=/usr/share/keyrings/monad.gpg] $MONAD_APT_REPO noble main" > "$list"
+        "curl -fsSL '${MONAD_APT_KEY_URL}' -o '$MONAD_APT_KEYRING'"
+      cat > "$sources_file" <<EOF
+Types: deb
+URIs: ${MONAD_APT_REPO}
+Suites: ${MONAD_APT_SUITE}
+Components: main
+Signed-By: ${MONAD_APT_KEYRING}
+EOF
+      ok "Wrote $sources_file"
       run "apt update" apt-get update
     fi
   fi
 
   if (( DRY_RUN )); then
-    echo "  ${C_DIM}[dry-run] apt install monad${C_RESET}"
+    if [[ -n "$MONAD_PKG_VERSION" ]]; then
+      echo "  ${C_DIM}[dry-run] apt install monad=${MONAD_PKG_VERSION}${C_RESET}"
+    else
+      echo "  ${C_DIM}[dry-run] apt install monad (latest)${C_RESET}"
+    fi
     return 0
   fi
-  run "installing monad" apt-get install -y monad
+  if [[ -n "$MONAD_PKG_VERSION" ]]; then
+    run "installing monad=${MONAD_PKG_VERSION}" apt-get install -y "monad=${MONAD_PKG_VERSION}"
+  else
+    run "installing monad (latest)" apt-get install -y monad
+  fi
   if dpkg -l monad 2>/dev/null | grep -qE '^.i  monad'; then
     ok "monad package installed"
   else
@@ -384,20 +414,17 @@ step_firewall() {
   fi
 
   if (( DRY_RUN )); then
-    echo "  ${C_DIM}[dry-run] configure UFW: allow 22/tcp, $UFW_TCP_ALSO/tcp, $UFW_UDP_PORTS/udp${C_RESET}"
+    echo "  ${C_DIM}[dry-run] configure UFW: allow ${UFW_SSH_PORT}/tcp, ${UFW_P2P_PORT} (tcp+udp), ${UFW_AUTHUDP_PORT}/udp${C_RESET}"
     return 0
   fi
 
   # SSH (avoid lockout!)
-  for p in $UFW_TCP_PORTS; do
-    ufw allow "$p"/tcp comment "ssh" >>"$LOG_FILE" 2>&1 || true
-  done
-  for p in $UFW_TCP_ALSO; do
-    ufw allow "$p"/tcp comment "monad p2p tcp" >>"$LOG_FILE" 2>&1 || true
-  done
-  for p in $UFW_UDP_PORTS; do
-    ufw allow "$p"/udp comment "monad p2p udp (raptorcast/auth-udp)" >>"$LOG_FILE" 2>&1 || true
-  done
+  ufw allow "${UFW_SSH_PORT}/tcp" comment 'ssh' >>"$LOG_FILE" 2>&1 || true
+  # 8000: consensus P2P — both TCP and UDP per docs
+  ufw allow "${UFW_P2P_PORT}/tcp" comment 'monad p2p (tcp)' >>"$LOG_FILE" 2>&1 || true
+  ufw allow "${UFW_P2P_PORT}/udp" comment 'monad p2p (udp/raptorcast)' >>"$LOG_FILE" 2>&1 || true
+  # 8001: Authenticated UDP only
+  ufw allow "${UFW_AUTHUDP_PORT}/udp" comment 'monad authenticated udp' >>"$LOG_FILE" 2>&1 || true
 
   if ! ufw status | grep -q "Status: active"; then
     if confirm "Enable UFW now?"; then
@@ -467,22 +494,27 @@ ${C_GREEN}${C_BOLD}════════════════════�
 
 ${C_BOLD}Next steps (DO NOT skip):${C_RESET}
 
-  1. Place validator keys in /home/monad/monad-bft/config/
-     - bls_priv_key  (BLS signing key)
-     - secp_priv_key (consensus identity)
-     - validator_id  (your validator pubkey)
+  1. Edit /home/monad/monad-bft/config/node.toml:
+     - beneficiary = "0x<your-reward-address>"
+     - node_name    = "<unique-moniker>"
+     - peer_discovery_servers / bootstrap (per official testnet/mainnet docs)
+     - For Auth UDP: self_auth_port = 8001, authenticated_bind_address_port = 8001
+       (run \`monad-sign-name-record\` to generate self_name_record_sig)
 
-  2. Edit /home/monad/monad-bft/config/node.toml:
-     - peer_discovery_servers (bootstrap)
-     - external_address (your public IP:8000)
+  2. Place validator keys in /home/monad/monad-bft/config/ (owner=monad:monad, mode 0600).
+     Refer to https://docs.monad.xyz/node-ops/validator-installation for the
+     official key generation procedure.
 
-  3. Verify the keys file mode is 600 (owner-read only):
-     sudo chmod 600 /home/monad/monad-bft/config/{bls,secp}_priv_key
+  3. TrieDB device (state DB): docs require /dev/triedb to be a dedicated NVMe
+     symlink (e.g. /dev/triedb -> /dev/nvme1n1p1). The first start triggers
+     monad-mpt one-shot to initialize.
 
-  4. Start services in order:
+  4. Start services in order (full set):
+     sudo systemctl enable --now monad-mpt        # one-shot triedb init
      sudo systemctl enable --now monad-execution
      sudo systemctl enable --now monad-bft
      sudo systemctl enable --now monad-rpc
+     sudo systemctl enable --now monad-cruft.timer  # hourly cleanup
 
   5. Watch logs:
      journalctl -u monad-bft -f
@@ -490,11 +522,16 @@ ${C_BOLD}Next steps (DO NOT skip):${C_RESET}
   6. Re-run preflight to confirm everything is healthy:
      sudo $DOCTOR_PATH
 
+  7. Verify Authenticated UDP is active:
+     sudo $(dirname "$DOCTOR_PATH")/../authudp-check/monad-authudp-check
+     # or run the official check from Monad infra:
+     curl -fsSL https://bucket.monadinfra.com/scripts/validate-auth-udp-config.sh | bash
+
   Logs: $LOG_FILE
   Report: $REPORT_FILE
 
 ${C_BOLD}Need help?${C_RESET}
-  Docs: https://docs.monad.xyz/node-ops
+  Docs:   https://docs.monad.xyz/node-ops
   Issues: https://github.com/BeeHiveTeam/monad-tools/issues
 
 EOF

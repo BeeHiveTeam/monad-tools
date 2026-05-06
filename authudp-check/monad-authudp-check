@@ -72,6 +72,11 @@ emit() {
 }
 
 # ===== Check 1: monad version =====
+# Per docs (https://docs.monad.xyz/node-ops/upgrade-instructions/auth-udp):
+#   Auth UDP support requires monad ≥ 0.12.6. Upcoming release drops Clear UDP.
+MONAD_AUTHUDP_VERSION_MIN="${MONAD_AUTHUDP_VERSION_MIN:-0.12.6}"
+MONAD_NODE_TOML="${MONAD_NODE_TOML:-/home/monad/monad-bft/config/node.toml}"
+
 check_version() {
   if ! command -v dpkg-query >/dev/null; then
     emit "version" "info" "dpkg not available — cannot check package version"
@@ -84,11 +89,10 @@ check_version() {
     return
   fi
 
-  # 0.14.0 introduced Auth UDP; 0.14.3 makes it mandatory
-  if printf '%s\n%s\n' "0.14.0" "$v" | sort -V -C 2>/dev/null; then
-    emit "version" "pass" "monad $v (Auth UDP available)"
+  if printf '%s\n%s\n' "$MONAD_AUTHUDP_VERSION_MIN" "$v" | sort -V -C 2>/dev/null; then
+    emit "version" "pass" "monad $v (Auth UDP available, need ≥${MONAD_AUTHUDP_VERSION_MIN})"
   else
-    emit "version" "fail" "monad $v — UPGRADE REQUIRED (need ≥0.14.0)"
+    emit "version" "fail" "monad $v — UPGRADE REQUIRED (need ≥${MONAD_AUTHUDP_VERSION_MIN})"
   fi
 
   # Check for available upgrade
@@ -155,13 +159,45 @@ check_peer_keepalive() {
   fi
 }
 
-# ===== Check 5: UDP port listening =====
-check_udp_port() {
+# ===== Check 5: UDP ports listening =====
+# Per docs: 8000/UDP = consensus P2P, 8001/UDP = Authenticated UDP (separate port).
+check_udp_ports() {
   if ! command -v ss >/dev/null; then return; fi
-  if ss -uln 2>/dev/null | grep -qE ':8000\b'; then
-    emit "udp.port" "pass" "UDP port 8000 listening (raptorcast/wireauth)"
+  local out
+  out=$(ss -uln 2>/dev/null)
+  if echo "$out" | grep -qE ':8000\b'; then
+    emit "udp.8000" "pass" "UDP port 8000 listening (consensus P2P)"
   else
-    emit "udp.port" "fail" "UDP port 8000 NOT listening"
+    emit "udp.8000" "fail" "UDP port 8000 NOT listening"
+  fi
+  if echo "$out" | grep -qE ':8001\b'; then
+    emit "udp.8001" "pass" "UDP port 8001 listening (Authenticated UDP)"
+  else
+    emit "udp.8001" "fail" "UDP port 8001 NOT listening — Auth UDP not bound"
+  fi
+}
+
+# ===== Check 6: node.toml config =====
+check_node_toml() {
+  if [[ ! -r "$MONAD_NODE_TOML" ]]; then
+    emit "config.toml" "info" "node.toml not readable at $MONAD_NODE_TOML"
+    return
+  fi
+  local missing=""
+  for key in self_auth_port self_record_seq_num self_name_record_sig authenticated_bind_address_port; do
+    grep -qE "^[[:space:]]*${key}[[:space:]]*=" "$MONAD_NODE_TOML" || missing+="$key "
+  done
+  if [[ -z "$missing" ]]; then
+    emit "config.toml" "pass" "all Auth UDP keys present in node.toml"
+  else
+    emit "config.toml" "fail" "node.toml missing keys: $missing"
+  fi
+
+  # Verify the auth port matches the official 8001
+  local self_auth
+  self_auth=$(awk -F= '/^[[:space:]]*self_auth_port[[:space:]]*=/ {gsub(/[ "]/,"",$2); print $2; exit}' "$MONAD_NODE_TOML" 2>/dev/null)
+  if [[ -n "$self_auth" && "$self_auth" != "8001" ]]; then
+    emit "config.port" "warn" "self_auth_port=$self_auth (docs default: 8001)"
   fi
 }
 
@@ -243,7 +279,8 @@ main() {
   check_service
   check_wireauth_logs
   check_peer_keepalive
-  check_udp_port
+  check_udp_ports
+  check_node_toml
   print_verdict
   post_result
 

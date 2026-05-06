@@ -23,16 +23,26 @@ set -u
 # like journalctl/apt/dpkg, which would propagate as false failures.
 
 # ===== Defaults / thresholds (tuneable via env or flags) =====
-CPU_CORES_MIN=${CPU_CORES_MIN:-16}
-CPU_CORES_REC=${CPU_CORES_REC:-32}
-RAM_GB_MIN=${RAM_GB_MIN:-64}
-RAM_GB_REC=${RAM_GB_REC:-128}
-DISK_GB_MIN=${DISK_GB_MIN:-2000}
-NVME_IOPS_MIN=${NVME_IOPS_MIN:-200000}
+# Sources:
+#   - https://docs.monad.xyz/node-ops/hardware-requirements
+#   - https://docs.monad.xyz/node-ops/full-node-installation
+#   - https://docs.monad.xyz/node-ops/upgrade-instructions/auth-udp
+CPU_CORES_MIN=${CPU_CORES_MIN:-16}      # docs: "16 core CPU"
+CPU_CORES_REC=${CPU_CORES_REC:-16}
+CPU_GHZ_MIN=${CPU_GHZ_MIN:-4.5}         # docs: "4.5 GHz+ base clock speed"
+RAM_GB_MIN=${RAM_GB_MIN:-32}            # docs: "32 GB+ RAM"
+RAM_GB_REC=${RAM_GB_REC:-64}
+DISK_GB_OS_MIN=${DISK_GB_OS_MIN:-500}   # docs: "500GB Disk" for MonadBFT/OS
+DISK_GB_TRIEDB_MIN=${DISK_GB_TRIEDB_MIN:-1700}  # docs: "2TB dedicated disk" (real 2TB-class drives advertise ~1.92TB ≈ 1788 GiB)
+NVME_IOPS_MIN=${NVME_IOPS_MIN:-200000}  # not in docs — heuristic from operators
 NVME_IOPS_REC=${NVME_IOPS_REC:-500000}
 ULIMIT_MIN=${ULIMIT_MIN:-1000000}
 KERNEL_MIN=${KERNEL_MIN:-5.15}
-NET_PORTS_REQUIRED=${NET_PORTS_REQUIRED:-"8000 8001"}
+# 8000 = TCP+UDP P2P, 8001 = UDP-only Auth UDP per docs.
+# Format: "port/proto" pairs.
+NET_PORTS_REQUIRED=${NET_PORTS_REQUIRED:-"8000/tcp 8000/udp 8001/udp"}
+MONAD_AUTHUDP_VERSION_MIN=${MONAD_AUTHUDP_VERSION_MIN:-0.12.6}
+MONAD_NODE_TOML=${MONAD_NODE_TOML:-/home/monad/monad-bft/config/node.toml}
 
 JSON_OUTPUT=0
 QUICK_MODE=0
@@ -126,7 +136,24 @@ check_cpu() {
          "Validator needs ≥$CPU_CORES_MIN physical cores; current hardware insufficient"
   fi
 
-  # AVX2 / AVX512 hints (BLS sig verification benefits)
+  # CPU base clock — docs require 4.5 GHz+. Read from cpuinfo "MHz" field if available,
+  # otherwise from lscpu "CPU max MHz". Some servers report governed (current) clock not max.
+  local mhz_max
+  mhz_max=$(lscpu 2>/dev/null | awk -F: '/CPU max MHz/ {gsub(/ /,"",$2); print $2; exit}')
+  [[ -z "$mhz_max" ]] && mhz_max=$(awk -F: '/cpu MHz/ {gsub(/ /,"",$2); print $2; exit}' /proc/cpuinfo 2>/dev/null)
+  if [[ -n "$mhz_max" ]]; then
+    local ghz_max
+    ghz_max=$(awk -v m="$mhz_max" 'BEGIN {printf "%.2f", m/1000}')
+    if awk -v a="$ghz_max" -v b="$CPU_GHZ_MIN" 'BEGIN {exit !(a >= b)}'; then
+      emit hardware "cpu.clock"   PASS "${ghz_max} GHz max (≥${CPU_GHZ_MIN} GHz required)"
+    else
+      emit hardware "cpu.clock"   WARN "${ghz_max} GHz max — docs require ${CPU_GHZ_MIN} GHz+ base clock"
+    fi
+  else
+    emit hardware "cpu.clock"   INFO "could not read CPU max clock"
+  fi
+
+  # AVX2 / AVX-512 hints (BLS sig verification benefits)
   if grep -q avx512f /proc/cpuinfo; then
     emit hardware "cpu.avx"     PASS "AVX-512 supported (faster BLS)"
   elif grep -q avx2 /proc/cpuinfo; then
@@ -198,16 +225,30 @@ check_disks() {
     emit hardware "disk.triedb-sched" PASS "at least one NVMe on mq-deadline (triedb-ready)"
   fi
 
-  # Free space on root
+  # Free space on root (OS partition — docs say 500 GB)
   local free_root_gb
   free_root_gb=$(df -BG / | awk 'NR==2 {gsub("G","",$4); print $4}')
-  if (( free_root_gb >= DISK_GB_MIN )); then
-    emit hardware "disk.free"   PASS "${free_root_gb} GB free on /"
-  elif (( free_root_gb >= 500 )); then
-    emit hardware "disk.free"   WARN "${free_root_gb} GB free on / — recommend ≥${DISK_GB_MIN} GB for chain growth"
+  if (( free_root_gb >= DISK_GB_OS_MIN )); then
+    emit hardware "disk.os"     PASS "${free_root_gb} GB free on / (need ≥${DISK_GB_OS_MIN} GB)"
   else
-    emit hardware "disk.free"   FAIL "${free_root_gb} GB free on / — insufficient" \
-         "Need ≥500 GB minimum, ≥${DISK_GB_MIN} GB recommended"
+    emit hardware "disk.os"     FAIL "${free_root_gb} GB free on / — below ${DISK_GB_OS_MIN} GB minimum"
+  fi
+
+  # TriedB device size — docs require 2 TB dedicated disk
+  if [[ -L /dev/triedb ]]; then
+    local triedb_part triedb_disk triedb_size_gb
+    triedb_part=$(readlink -f /dev/triedb)
+    triedb_part="${triedb_part##*/}"
+    triedb_disk=$(lsblk -no PKNAME "/dev/${triedb_part}" 2>/dev/null | head -1)
+    triedb_size_gb=$(lsblk -bdn -o SIZE "/dev/${triedb_disk:-$triedb_part}" 2>/dev/null \
+                     | awk '{printf "%d", $1/1024/1024/1024}')
+    if [[ -n "$triedb_size_gb" ]] && (( triedb_size_gb >= DISK_GB_TRIEDB_MIN )); then
+      emit hardware "disk.triedb-size" PASS "/dev/triedb on /dev/${triedb_disk:-$triedb_part} (${triedb_size_gb} GB)"
+    elif [[ -n "$triedb_size_gb" ]]; then
+      emit hardware "disk.triedb-size" FAIL "triedb device only ${triedb_size_gb} GB — docs require ≥${DISK_GB_TRIEDB_MIN} GB"
+    fi
+  else
+    emit hardware "disk.triedb-size" INFO "/dev/triedb not present — skipping size check (created on first install)"
   fi
 }
 
@@ -399,44 +440,57 @@ check_public_ip() {
 }
 
 check_ports_free() {
-  local conflict=0
-  for p in $NET_PORTS_REQUIRED; do
-    if ss -tlnu 2>/dev/null | grep -qE ":${p}\b"; then
-      # Already in use — check if it's monad
-      local who
-      who=$(ss -tlnup 2>/dev/null | grep ":${p}\b" | head -1 | grep -oE 'users:\(\("[^"]+"' | grep -oE '"[^"]+"' | tr -d '"')
-      if [[ "$who" == "monad-node" || "$who" == "monad-bft" ]]; then
-        emit network "net.port.$p" PASS "port $p in use by $who (validator already running)"
-      else
-        emit network "net.port.$p" WARN "port $p occupied by $who — must be free or monad" \
-             "Stop conflicting service or pick different port"
-      fi
+  # NET_PORTS_REQUIRED contains "port/proto" tokens (e.g. 8000/tcp 8000/udp 8001/udp)
+  for spec in $NET_PORTS_REQUIRED; do
+    local port="${spec%/*}" proto="${spec#*/}" ss_flag
+    case "$proto" in
+      tcp) ss_flag="-tln" ;;
+      udp) ss_flag="-uln" ;;
+      *)   emit network "net.port.$spec" INFO "unknown proto '$proto'"; continue ;;
+    esac
+
+    local listening_line who
+    listening_line=$(ss $ss_flag 2>/dev/null | awk -v p=":${port}" '$0 ~ p {print; exit}')
+    if [[ -z "$listening_line" ]]; then
+      emit network "net.port.$spec" PASS "port ${port}/${proto} free"
+      continue
+    fi
+
+    # Try to identify the listening process (-p needs root)
+    who=$(ss "${ss_flag}p" 2>/dev/null | awk -v p=":${port}" '$0 ~ p {print; exit}' \
+          | grep -oE 'users:\(\("[^"]+"' | grep -oE '"[^"]+"' | tr -d '"' | head -1)
+    if [[ "$who" =~ ^monad ]]; then
+      emit network "net.port.$spec" PASS "port ${port}/${proto} owned by $who (node already running)"
     else
-      emit network "net.port.$p" PASS "port $p free"
+      emit network "net.port.$spec" WARN "port ${port}/${proto} occupied by ${who:-?} — must be free or owned by monad-*" \
+           "Stop conflicting service or rebind it to another port"
     fi
   done
 }
 
 check_firewall() {
   if require_cmd ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
-    # Check that required ports are allowed
-    local missing=""
-    for p in $NET_PORTS_REQUIRED; do
-      if ! ufw status 2>/dev/null | grep -qE "^${p}.*ALLOW|^${p}/tcp.*ALLOW|^${p}/udp.*ALLOW"; then
-        missing+="$p "
+    local ufw_status missing=""
+    ufw_status=$(ufw status 2>/dev/null)
+    for spec in $NET_PORTS_REQUIRED; do
+      local port="${spec%/*}" proto="${spec#*/}"
+      # ufw rules can appear as "8000/tcp ALLOW", "8000 ALLOW" (any proto), or "8000/udp ALLOW"
+      if echo "$ufw_status" | grep -qE "^${port}/${proto}.*ALLOW|^${port}[[:space:]].*ALLOW"; then
+        continue
       fi
+      missing+="$spec "
     done
     if [[ -z "$missing" ]]; then
-      emit network "net.firewall" PASS "ufw active, ports $NET_PORTS_REQUIRED allowed"
+      emit network "net.firewall" PASS "ufw active, all required port/proto pairs allowed"
     else
       emit network "net.firewall" WARN "ufw active but missing rules for: $missing" \
-           "Add: $(for p in $missing; do echo -n "ufw allow $p; "; done)"
+           "Add: $(for s in $missing; do echo -n "ufw allow ${s%/*}/${s#*/}; "; done)"
     fi
   elif require_cmd ufw; then
     emit network "net.firewall" WARN "ufw installed but inactive — no firewall protection" \
-         "Enable: ufw allow 22 && ufw allow $(echo $NET_PORTS_REQUIRED | tr ' ' ',') && ufw enable"
+         "Enable: ufw allow 22/tcp; ufw allow 8000; ufw allow 8001/udp; ufw enable"
   elif require_cmd nft || require_cmd iptables; then
-    emit network "net.firewall" INFO "nftables/iptables in use (manual config) — ensure ports $NET_PORTS_REQUIRED open"
+    emit network "net.firewall" INFO "nftables/iptables in use (manual config) — ensure $NET_PORTS_REQUIRED open"
   else
     emit network "net.firewall" WARN "no firewall detected" \
          "Install ufw: apt install -y ufw"
@@ -497,6 +551,53 @@ check_fail2ban() {
 }
 
 # ===== Section: MONAD-SPECIFIC (if already installed) =====
+check_monad_user() {
+  if id monad >/dev/null 2>&1; then
+    emit monad "monad.user"      PASS "monad system user exists ($(id -u monad):$(id -g monad))"
+  else
+    emit monad "monad.user"      INFO "monad user not present (created automatically by package install)"
+  fi
+}
+
+check_triedb_device() {
+  # Docs require /dev/triedb to be a symlink to a dedicated NVMe partition (e.g. nvme1n1p1).
+  # Created by /etc/monad-mpt/monad_mpt.toml and the monad-mpt one-shot service.
+  if [[ -e /dev/triedb ]]; then
+    if [[ -L /dev/triedb ]]; then
+      local tgt
+      tgt=$(readlink -f /dev/triedb)
+      emit monad "monad.triedb"  PASS "/dev/triedb → ${tgt}"
+    else
+      emit monad "monad.triedb"  WARN "/dev/triedb exists but is not a symlink"
+    fi
+  else
+    emit monad "monad.triedb"    INFO "/dev/triedb not present (created on first monad-mpt run)"
+  fi
+}
+
+check_authudp_config() {
+  # Verify Auth UDP keys in node.toml. Per docs:
+  # https://docs.monad.xyz/node-ops/upgrade-instructions/auth-udp
+  if [[ ! -r "$MONAD_NODE_TOML" ]]; then
+    emit monad "monad.authudp-cfg" INFO "node.toml not readable at $MONAD_NODE_TOML (skipped)"
+    return
+  fi
+
+  local missing=""
+  for key in self_auth_port self_record_seq_num self_name_record_sig authenticated_bind_address_port; do
+    if ! grep -qE "^[[:space:]]*${key}[[:space:]]*=" "$MONAD_NODE_TOML"; then
+      missing+="$key "
+    fi
+  done
+
+  if [[ -z "$missing" ]]; then
+    emit monad "monad.authudp-cfg" PASS "node.toml has all Auth UDP keys"
+  else
+    emit monad "monad.authudp-cfg" FAIL "node.toml missing Auth UDP keys: $missing" \
+         "Add to [peer_discovery] and [network] per docs: https://docs.monad.xyz/node-ops/upgrade-instructions/auth-udp"
+  fi
+}
+
 check_monad_install() {
   # dpkg -l states: ii=installed, hi=hold+installed, rc=removed-config, etc.
   # Match anything where 2nd char is 'i' (installed).
@@ -563,7 +664,7 @@ main() {
   run_section os        check_os check_kernel check_ulimits check_sysctl check_ntp
   run_section network   check_public_ip check_ports_free check_firewall
   run_section security  check_ssh_hardening check_unattended_upgrades check_fail2ban
-  run_section monad     check_monad_install
+  run_section monad     check_monad_user check_triedb_device check_monad_install check_authudp_config
 
   if [[ $JSON_OUTPUT -eq 1 ]]; then
     print_json
