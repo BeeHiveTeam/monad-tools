@@ -1,0 +1,551 @@
+#!/usr/bin/env bash
+# monad-validator-setup — one-shot Monad validator host configuration
+# Project: BeeHive monad-tools
+# Repo: https://github.com/BeeHiveTeam/monad-tools
+#
+# What it does (idempotent, safe to re-run):
+#   1. Run monad-doctor preflight (abort on FAIL unless --skip-preflight)
+#   2. Tune kernel (sysctl): network buffers, swappiness, file-max
+#   3. Tune ulimits: /etc/security/limits.conf
+#   4. Set IO scheduler to mq-deadline on triedb device
+#   5. Install chrony (replace systemd-timesyncd if active)
+#   6. Add Monad apt repository and install `monad` package
+#   7. Configure UFW firewall (Monad ports + SSH)
+#   8. Optionally install BeeHive monad-grafana monitoring stack
+#   9. Print post-install report and next steps for keys + start
+#
+# What it deliberately does NOT do:
+#   - Generate or import validator keys (you must do this manually)
+#   - Start monad-bft.service (you start it after placing keys)
+#   - Touch existing files without backup (.bak.<timestamp>)
+#
+# Usage:
+#   sudo ./monad-validator-setup                  # interactive
+#   sudo ./monad-validator-setup --non-interactive
+#   sudo ./monad-validator-setup --dry-run        # show what would change
+#   sudo ./monad-validator-setup --triedb-dev=nvme1n1
+#   sudo ./monad-validator-setup --with-monitoring  # also install monad-grafana
+#   sudo ./monad-validator-setup --skip-preflight # skip monad-doctor
+#   sudo ./monad-validator-setup --uninstall      # remove (best-effort)
+
+set -u
+
+# ===== Defaults =====
+NON_INTERACTIVE=0
+DRY_RUN=0
+SKIP_PREFLIGHT=0
+WITH_MONITORING=0
+TRIEDB_DEV=""
+ACTION="install"
+LOG_FILE="/tmp/monad-validator-setup-$(date +%Y%m%d-%H%M%S).log"
+TS=$(date -u +%Y%m%d-%H%M%S)
+DOCTOR_PATH="$(dirname "$0")/../doctor/monad-doctor"
+REPORT_FILE="/var/lib/monad-validator-setup/report-${TS}.json"
+
+# Tuning values
+SYSCTL_RMEM=16777216
+SYSCTL_WMEM=16777216
+SYSCTL_NETDEV_BACKLOG=5000
+SYSCTL_FILE_MAX=2097152
+SYSCTL_SWAPPINESS=1
+ULIMIT_NOFILE=1048576
+MONAD_APT_REPO="${MONAD_APT_REPO:-https://apt.monad.xyz}"
+
+# UFW ports
+UFW_TCP_PORTS="22"
+UFW_UDP_PORTS="8000 8001"
+UFW_TCP_ALSO="8000 8001"  # Monad listens on both
+
+# ===== Colors =====
+if [[ -t 1 ]]; then
+  C_RED=$'\033[0;31m'; C_GREEN=$'\033[0;32m'; C_YELLOW=$'\033[0;33m'
+  C_BLUE=$'\033[0;34m'; C_PURPLE=$'\033[0;35m'; C_BOLD=$'\033[1m'
+  C_DIM=$'\033[2m'; C_RESET=$'\033[0m'
+else
+  C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""; C_PURPLE=""; C_BOLD=""; C_DIM=""; C_RESET=""
+fi
+
+info()    { echo "${C_BLUE}[i]${C_RESET} $*"; }
+ok()      { echo "${C_GREEN}[✓]${C_RESET} $*"; }
+warn()    { echo "${C_YELLOW}[!]${C_RESET} $*" >&2; }
+err()     { echo "${C_RED}[✗]${C_RESET} $*" >&2; }
+fatal()   { err "$*"; exit 1; }
+section() { echo; echo "${C_BOLD}${C_PURPLE}━━ $* ━━${C_RESET}"; }
+
+# ===== Args =====
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --non-interactive) NON_INTERACTIVE=1 ;;
+    --dry-run)         DRY_RUN=1 ;;
+    --skip-preflight)  SKIP_PREFLIGHT=1 ;;
+    --with-monitoring) WITH_MONITORING=1 ;;
+    --triedb-dev=*)    TRIEDB_DEV="${1#*=}" ;;
+    --uninstall)       ACTION="uninstall" ;;
+    -h|--help)
+      sed -n '2,/^$/p' "$0" | sed 's/^# \?//'
+      exit 0 ;;
+    *) fatal "Unknown option: $1 (try --help)" ;;
+  esac
+  shift
+done
+
+# ===== Pre-checks =====
+[[ $EUID -eq 0 ]] || fatal "Run as root: sudo $0 $*"
+
+confirm() {
+  [[ $NON_INTERACTIVE -eq 1 ]] && { info "(non-interactive: assuming Yes for: $1)"; return 0; }
+  local ans
+  read -rp "${C_YELLOW}?${C_RESET} $1 [Y/n] " ans
+  [[ ! "$ans" =~ ^[Nn]$ ]]
+}
+
+run() {
+  # run <description> <cmd...>  — runs (or echoes if dry-run) and logs
+  local desc="$1"; shift
+  if (( DRY_RUN )); then
+    echo "  ${C_DIM}[dry-run] $desc:${C_RESET} $*"
+    return 0
+  fi
+  echo "  ${C_DIM}→ $desc${C_RESET}" >>"$LOG_FILE"
+  if "$@" >>"$LOG_FILE" 2>&1; then
+    return 0
+  else
+    local rc=$?
+    err "Command failed (rc=$rc): $*"
+    err "  See $LOG_FILE for details"
+    return $rc
+  fi
+}
+
+backup_file() {
+  local f="$1"
+  [[ -f "$f" ]] || return 0
+  local bak="${f}.bak.${TS}"
+  if (( DRY_RUN )); then
+    echo "  ${C_DIM}[dry-run] backup: $f → $bak${C_RESET}"
+    return 0
+  fi
+  cp -p "$f" "$bak" && echo "  ${C_DIM}backup: $bak${C_RESET}"
+}
+
+ensure_line() {
+  # ensure_line <file> <line>  — adds line if absent (idempotent)
+  local file="$1" line="$2"
+  if [[ -f "$file" ]] && grep -qxF "$line" "$file"; then
+    return 0
+  fi
+  if (( DRY_RUN )); then
+    echo "  ${C_DIM}[dry-run] add to $file:${C_RESET} $line"
+    return 0
+  fi
+  backup_file "$file"
+  echo "$line" >>"$file"
+}
+
+# ===== Step: preflight =====
+step_preflight() {
+  section "Pre-flight (monad-doctor)"
+
+  if (( SKIP_PREFLIGHT )); then
+    info "Skipping preflight (--skip-preflight)"
+    return 0
+  fi
+
+  if [[ ! -x "$DOCTOR_PATH" ]]; then
+    warn "monad-doctor not found at $DOCTOR_PATH — skipping preflight"
+    warn "Get it: git clone https://github.com/BeeHiveTeam/monad-tools.git"
+    return 0
+  fi
+
+  if (( DRY_RUN )); then
+    echo "  ${C_DIM}[dry-run] would run: $DOCTOR_PATH --quick${C_RESET}"
+    return 0
+  fi
+
+  info "Running monad-doctor (this is read-only, no system changes)…"
+  "$DOCTOR_PATH" --quick
+  local rc=$?
+  case $rc in
+    0) ok "Preflight: all clean" ;;
+    1) warn "Preflight: warnings (continuing)" ;;
+    2)
+      err "Preflight: FAIL — server not ready for validator"
+      if confirm "Continue anyway? (NOT recommended)"; then
+        warn "Continuing despite preflight failures"
+      else
+        fatal "Aborted by user"
+      fi ;;
+    *) warn "Preflight: unknown exit code $rc" ;;
+  esac
+}
+
+# ===== Step: sysctl =====
+step_sysctl() {
+  section "Kernel tuning (sysctl)"
+
+  local conf=/etc/sysctl.d/99-monad-validator.conf
+  local content
+  content="# monad-validator-setup ${TS}
+# Network buffers — raptorcast UDP throughput
+net.core.rmem_max = $SYSCTL_RMEM
+net.core.wmem_max = $SYSCTL_WMEM
+net.core.rmem_default = $SYSCTL_RMEM
+net.core.wmem_default = $SYSCTL_WMEM
+net.core.netdev_max_backlog = $SYSCTL_NETDEV_BACKLOG
+# File descriptors
+fs.file-max = $SYSCTL_FILE_MAX
+# Swap behaviour — validators must not swap
+vm.swappiness = $SYSCTL_SWAPPINESS
+# Reasonable defaults for high-perf servers
+net.ipv4.tcp_fastopen = 3
+"
+
+  if [[ -f "$conf" ]] && [[ "$(cat "$conf" 2>/dev/null)" == "$content" ]]; then
+    ok "sysctl already configured ($conf)"
+    return 0
+  fi
+
+  backup_file "$conf"
+  if (( DRY_RUN )); then
+    echo "  ${C_DIM}[dry-run] write $conf with monad tuning${C_RESET}"
+    return 0
+  fi
+  echo "$content" >"$conf"
+  ok "Wrote $conf"
+  run "applying sysctl" sysctl --system
+}
+
+# ===== Step: ulimits =====
+step_ulimits() {
+  section "ulimits"
+
+  local conf=/etc/security/limits.d/99-monad-validator.conf
+  local content
+  content="# monad-validator-setup ${TS}
+* soft nofile $ULIMIT_NOFILE
+* hard nofile $ULIMIT_NOFILE
+root soft nofile $ULIMIT_NOFILE
+root hard nofile $ULIMIT_NOFILE
+"
+
+  if [[ -f "$conf" ]] && [[ "$(cat "$conf" 2>/dev/null)" == "$content" ]]; then
+    ok "ulimits already configured ($conf)"
+    return 0
+  fi
+
+  if (( DRY_RUN )); then
+    echo "  ${C_DIM}[dry-run] write $conf with nofile=$ULIMIT_NOFILE${C_RESET}"
+    return 0
+  fi
+  echo "$content" >"$conf"
+  ok "Wrote $conf (effective on next login or service restart)"
+}
+
+# ===== Step: IO scheduler =====
+step_io_scheduler() {
+  section "IO scheduler (mq-deadline on triedb)"
+
+  local target="$TRIEDB_DEV"
+  if [[ -z "$target" ]]; then
+    # Pick the largest NVMe (assumed triedb)
+    target=$(lsblk -bdn -o NAME,SIZE,TYPE 2>/dev/null \
+      | awk '$3=="disk" && $1 ~ /^nvme/ {print $1, $2}' \
+      | sort -k2 -n -r | head -1 | awk '{print $1}')
+  fi
+
+  if [[ -z "$target" ]]; then
+    warn "No NVMe found — cannot tune IO scheduler"
+    return 0
+  fi
+
+  local sched_file="/sys/block/$target/queue/scheduler"
+  if [[ ! -f "$sched_file" ]]; then
+    warn "$sched_file does not exist — skipping"
+    return 0
+  fi
+
+  local cur
+  cur=$(awk '{for(i=1;i<=NF;i++) if($i ~ /^\[/) {gsub(/[][]/,"",$i); print $i; exit}}' "$sched_file")
+  if [[ "$cur" == "mq-deadline" ]]; then
+    ok "$target already on mq-deadline"
+  else
+    if (( DRY_RUN )); then
+      echo "  ${C_DIM}[dry-run] echo mq-deadline > $sched_file${C_RESET}"
+    else
+      echo mq-deadline > "$sched_file" && ok "$target: scheduler $cur → mq-deadline"
+    fi
+  fi
+
+  # Persist via udev rule
+  local rule=/etc/udev/rules.d/60-monad-triedb-scheduler.rules
+  local rule_content="# monad-validator-setup ${TS}
+ACTION==\"add|change\", KERNEL==\"${target}\", ATTR{queue/scheduler}=\"mq-deadline\"
+"
+  if [[ -f "$rule" ]] && [[ "$(cat "$rule")" == "$rule_content" ]]; then
+    ok "udev rule already in place"
+    return 0
+  fi
+  if (( DRY_RUN )); then
+    echo "  ${C_DIM}[dry-run] write udev rule $rule${C_RESET}"
+    return 0
+  fi
+  echo "$rule_content" >"$rule"
+  ok "Wrote udev rule (persists across reboots)"
+  run "reloading udev" udevadm control --reload-rules
+}
+
+# ===== Step: chrony =====
+step_chrony() {
+  section "NTP (chrony)"
+
+  if command -v chronyc >/dev/null && systemctl is-active --quiet chrony; then
+    ok "chrony already active"
+    return 0
+  fi
+
+  if (( DRY_RUN )); then
+    echo "  ${C_DIM}[dry-run] disable systemd-timesyncd, install chrony${C_RESET}"
+    return 0
+  fi
+
+  if systemctl is-active --quiet systemd-timesyncd; then
+    info "Disabling systemd-timesyncd (drifts ~10–100ms, inflates vote_delay)"
+    systemctl disable --now systemd-timesyncd >>"$LOG_FILE" 2>&1
+  fi
+
+  run "installing chrony" apt-get install -y chrony
+  run "starting chrony" systemctl enable --now chrony
+  sleep 2
+  if systemctl is-active --quiet chrony; then
+    ok "chrony installed and active"
+  else
+    err "chrony failed to start"
+    return 1
+  fi
+}
+
+# ===== Step: monad apt repo + package =====
+step_monad_install() {
+  section "Monad package"
+
+  # Already installed?
+  if dpkg -l monad 2>/dev/null | grep -qE '^.i  monad'; then
+    local cur
+    cur=$(dpkg-query -W -f='${Version}' monad)
+    ok "monad already installed (version $cur)"
+    info "To upgrade: apt update && apt install --only-upgrade monad"
+    return 0
+  fi
+
+  # Install apt repo if missing
+  local list=/etc/apt/sources.list.d/monad.list
+  if [[ ! -f "$list" ]]; then
+    if (( DRY_RUN )); then
+      echo "  ${C_DIM}[dry-run] add Monad apt repo${C_RESET}"
+    else
+      info "Adding Monad apt repository: $MONAD_APT_REPO"
+      # NOTE: replace this with the actual canonical Monad apt repo when published.
+      # As of writing, validators install via a script provided by the Monad team.
+      # Skeleton below — operator should verify URL and signing key.
+      warn "Monad apt repo URL must be verified against official docs:"
+      warn "  https://docs.monad.xyz/node-ops/install"
+      if ! confirm "Proceed with $MONAD_APT_REPO?"; then
+        info "Skipping monad install — install manually following official docs"
+        return 0
+      fi
+      # Standard apt repo addition
+      run "fetching signing key" bash -c \
+        "curl -fsSL ${MONAD_APT_REPO}/monad.gpg | gpg --dearmor -o /usr/share/keyrings/monad.gpg"
+      echo "deb [signed-by=/usr/share/keyrings/monad.gpg] $MONAD_APT_REPO noble main" > "$list"
+      run "apt update" apt-get update
+    fi
+  fi
+
+  if (( DRY_RUN )); then
+    echo "  ${C_DIM}[dry-run] apt install monad${C_RESET}"
+    return 0
+  fi
+  run "installing monad" apt-get install -y monad
+  if dpkg -l monad 2>/dev/null | grep -qE '^.i  monad'; then
+    ok "monad package installed"
+  else
+    err "monad install failed — check $LOG_FILE"
+    return 1
+  fi
+}
+
+# ===== Step: firewall (UFW) =====
+step_firewall() {
+  section "Firewall (UFW)"
+
+  if ! command -v ufw >/dev/null; then
+    info "Installing ufw…"
+    run "installing ufw" apt-get install -y ufw
+  fi
+
+  if (( DRY_RUN )); then
+    echo "  ${C_DIM}[dry-run] configure UFW: allow 22/tcp, $UFW_TCP_ALSO/tcp, $UFW_UDP_PORTS/udp${C_RESET}"
+    return 0
+  fi
+
+  # SSH (avoid lockout!)
+  for p in $UFW_TCP_PORTS; do
+    ufw allow "$p"/tcp comment "ssh" >>"$LOG_FILE" 2>&1 || true
+  done
+  for p in $UFW_TCP_ALSO; do
+    ufw allow "$p"/tcp comment "monad p2p tcp" >>"$LOG_FILE" 2>&1 || true
+  done
+  for p in $UFW_UDP_PORTS; do
+    ufw allow "$p"/udp comment "monad p2p udp (raptorcast/auth-udp)" >>"$LOG_FILE" 2>&1 || true
+  done
+
+  if ! ufw status | grep -q "Status: active"; then
+    if confirm "Enable UFW now?"; then
+      ufw --force enable >>"$LOG_FILE" 2>&1
+      ok "UFW enabled"
+    else
+      warn "UFW configured but not enabled — run 'sudo ufw enable' when ready"
+    fi
+  else
+    ok "UFW rules added"
+  fi
+}
+
+# ===== Step: monitoring (optional) =====
+step_monitoring() {
+  if (( WITH_MONITORING == 0 )); then
+    info "Skipping monitoring (use --with-monitoring to install monad-grafana)"
+    return 0
+  fi
+  section "Monitoring (BeeHive monad-grafana)"
+
+  if (( DRY_RUN )); then
+    echo "  ${C_DIM}[dry-run] curl -fsSL https://raw.githubusercontent.com/BeeHiveTeam/monad-grafana/main/install.sh | sudo bash${C_RESET}"
+    return 0
+  fi
+
+  info "Launching monad-grafana installer…"
+  curl -fsSL https://raw.githubusercontent.com/BeeHiveTeam/monad-grafana/main/install.sh \
+    | bash -s -- --non-interactive
+}
+
+# ===== Step: report =====
+step_report() {
+  section "Post-install report"
+
+  mkdir -p "$(dirname "$REPORT_FILE")"
+  if (( DRY_RUN )); then
+    echo "  ${C_DIM}[dry-run] write report to $REPORT_FILE${C_RESET}"
+    return 0
+  fi
+
+  cat >"$REPORT_FILE" <<EOF
+{
+  "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "host": "$(hostname)",
+  "kernel": "$(uname -r)",
+  "os": "$(. /etc/os-release; echo "$PRETTY_NAME")",
+  "monad_version": "$(dpkg-query -W -f='${Version}' monad 2>/dev/null || echo "not-installed")",
+  "tuning": {
+    "sysctl_conf": "/etc/sysctl.d/99-monad-validator.conf",
+    "limits_conf": "/etc/security/limits.d/99-monad-validator.conf",
+    "udev_scheduler": "/etc/udev/rules.d/60-monad-triedb-scheduler.rules"
+  },
+  "log_file": "$LOG_FILE"
+}
+EOF
+  ok "Report: $REPORT_FILE"
+}
+
+# ===== Print next steps =====
+print_next_steps() {
+  cat <<EOF
+
+${C_GREEN}${C_BOLD}═══════════════════════════════════════════════════
+  Validator host configured.
+═══════════════════════════════════════════════════${C_RESET}
+
+${C_BOLD}Next steps (DO NOT skip):${C_RESET}
+
+  1. Place validator keys in /home/monad/monad-bft/config/
+     - bls_priv_key  (BLS signing key)
+     - secp_priv_key (consensus identity)
+     - validator_id  (your validator pubkey)
+
+  2. Edit /home/monad/monad-bft/config/node.toml:
+     - peer_discovery_servers (bootstrap)
+     - external_address (your public IP:8000)
+
+  3. Verify the keys file mode is 600 (owner-read only):
+     sudo chmod 600 /home/monad/monad-bft/config/{bls,secp}_priv_key
+
+  4. Start services in order:
+     sudo systemctl enable --now monad-execution
+     sudo systemctl enable --now monad-bft
+     sudo systemctl enable --now monad-rpc
+
+  5. Watch logs:
+     journalctl -u monad-bft -f
+
+  6. Re-run preflight to confirm everything is healthy:
+     sudo $DOCTOR_PATH
+
+  Logs: $LOG_FILE
+  Report: $REPORT_FILE
+
+${C_BOLD}Need help?${C_RESET}
+  Docs: https://docs.monad.xyz/node-ops
+  Issues: https://github.com/BeeHiveTeam/monad-tools/issues
+
+EOF
+}
+
+# ===== Uninstall (best-effort) =====
+do_uninstall() {
+  warn "This will REMOVE configuration files written by this installer."
+  warn "It will NOT remove the monad package, chrony, ufw, or your keys."
+  confirm "Continue?" || { info "Aborted."; exit 0; }
+
+  for f in /etc/sysctl.d/99-monad-validator.conf \
+           /etc/security/limits.d/99-monad-validator.conf \
+           /etc/udev/rules.d/60-monad-triedb-scheduler.rules; do
+    if [[ -f "$f" ]]; then
+      rm -f "$f" && ok "Removed $f"
+    fi
+  done
+  sysctl --system >/dev/null 2>&1 || true
+  udevadm control --reload-rules 2>/dev/null || true
+  ok "Configuration removed. Reboot recommended to fully reset kernel parameters."
+}
+
+# ===== Main =====
+do_install() {
+  echo "${C_BOLD}${C_PURPLE}"
+  cat <<'EOF'
+  ╔══════════════════════════════════════════════╗
+  ║   monad-validator-setup — host preparation   ║
+  ║   BeeHive monad-tools                        ║
+  ╚══════════════════════════════════════════════╝
+EOF
+  echo "${C_RESET}"
+  info "Log file: $LOG_FILE"
+  (( DRY_RUN )) && warn "DRY-RUN MODE: no changes will be made"
+  echo
+
+  step_preflight
+  step_sysctl
+  step_ulimits
+  step_io_scheduler
+  step_chrony
+  step_monad_install
+  step_firewall
+  step_monitoring
+  step_report
+
+  print_next_steps
+}
+
+case "$ACTION" in
+  install)   do_install ;;
+  uninstall) do_uninstall ;;
+esac

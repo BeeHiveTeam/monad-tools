@@ -1,0 +1,627 @@
+#!/usr/bin/env bash
+# monad-doctor — pre-flight readiness check for Monad validator nodes
+# Project: BeeHive monad-tools
+# Repo: https://github.com/BeeHiveTeam/monad-tools
+#
+# Usage:
+#   sudo ./monad-doctor                        # full check (default)
+#   sudo ./monad-doctor --json                 # machine-readable
+#   sudo ./monad-doctor --quick                # skip slow checks (fio IOPS)
+#   sudo ./monad-doctor --section hardware     # only one section
+#   sudo ./monad-doctor --no-color             # no ANSI colors
+#
+# One-liner from internet:
+#   curl -fsSL https://raw.githubusercontent.com/BeeHiveTeam/monad-tools/main/doctor/monad-doctor | sudo bash
+#
+# Exit codes:
+#   0  all checks passed (or only INFO/PASS)
+#   1  warnings only — node will run but suboptimal
+#   2  one or more FAIL — node should NOT be deployed yet
+
+set -u
+# Note: no pipefail — `grep -q` exits early on match, causing SIGPIPE on producers
+# like journalctl/apt/dpkg, which would propagate as false failures.
+
+# ===== Defaults / thresholds (tuneable via env or flags) =====
+CPU_CORES_MIN=${CPU_CORES_MIN:-16}
+CPU_CORES_REC=${CPU_CORES_REC:-32}
+RAM_GB_MIN=${RAM_GB_MIN:-64}
+RAM_GB_REC=${RAM_GB_REC:-128}
+DISK_GB_MIN=${DISK_GB_MIN:-2000}
+NVME_IOPS_MIN=${NVME_IOPS_MIN:-200000}
+NVME_IOPS_REC=${NVME_IOPS_REC:-500000}
+ULIMIT_MIN=${ULIMIT_MIN:-1000000}
+KERNEL_MIN=${KERNEL_MIN:-5.15}
+NET_PORTS_REQUIRED=${NET_PORTS_REQUIRED:-"8000 8001"}
+
+JSON_OUTPUT=0
+QUICK_MODE=0
+SECTION=""
+USE_COLOR=1
+
+# ===== Argument parsing =====
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --json)      JSON_OUTPUT=1 ;;
+    --quick)     QUICK_MODE=1 ;;
+    --section)   SECTION="${2:-}"; shift ;;
+    --section=*) SECTION="${1#*=}" ;;
+    --no-color)  USE_COLOR=0 ;;
+    -h|--help)
+      sed -n '2,/^$/p' "$0" | sed 's/^# \?//'
+      exit 0 ;;
+    *) echo "Unknown option: $1 (--help for usage)" >&2; exit 64 ;;
+  esac
+  shift
+done
+
+# ===== Colors =====
+if [[ $USE_COLOR -eq 1 && -t 1 && $JSON_OUTPUT -eq 0 ]]; then
+  C_RED=$'\033[0;31m'; C_GREEN=$'\033[0;32m'; C_YELLOW=$'\033[0;33m'
+  C_BLUE=$'\033[0;34m'; C_PURPLE=$'\033[0;35m'; C_CYAN=$'\033[0;36m'
+  C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'; C_RESET=$'\033[0m'
+else
+  C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""; C_PURPLE=""; C_CYAN=""
+  C_BOLD=""; C_DIM=""; C_RESET=""
+fi
+
+# ===== Result accumulation =====
+declare -a RESULTS_NAME RESULTS_STATUS RESULTS_MSG RESULTS_FIX RESULTS_SECTION
+declare -i COUNT_PASS=0 COUNT_WARN=0 COUNT_FAIL=0 COUNT_INFO=0
+
+emit() {
+  # emit <section> <name> <status> <msg> [fix]
+  local section="$1" name="$2" status="$3" msg="$4" fix="${5:-}"
+  RESULTS_SECTION+=("$section")
+  RESULTS_NAME+=("$name")
+  RESULTS_STATUS+=("$status")
+  RESULTS_MSG+=("$msg")
+  RESULTS_FIX+=("$fix")
+  case "$status" in
+    PASS) COUNT_PASS+=1 ;;
+    WARN) COUNT_WARN+=1 ;;
+    FAIL) COUNT_FAIL+=1 ;;
+    INFO) COUNT_INFO+=1 ;;
+  esac
+
+  [[ $JSON_OUTPUT -eq 1 ]] && return
+
+  local sym color
+  case "$status" in
+    PASS) sym="✓"; color="$C_GREEN"  ;;
+    WARN) sym="!"; color="$C_YELLOW" ;;
+    FAIL) sym="✗"; color="$C_RED"    ;;
+    INFO) sym="i"; color="$C_BLUE"   ;;
+  esac
+
+  printf "  ${color}%s${C_RESET} %-30s %s\n" "$sym" "$name" "$msg"
+  [[ -n "$fix" ]] && printf "    ${C_DIM}→ %s${C_RESET}\n" "$fix"
+}
+
+section_header() {
+  [[ $JSON_OUTPUT -eq 1 ]] && return
+  printf "\n${C_BOLD}${C_PURPLE}━━ %s ━━${C_RESET}\n" "$1"
+}
+
+# ===== Helpers =====
+require_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+ver_ge() {
+  # ver_ge "5.15.0" "5.15"  → 0 (true)
+  printf '%s\n%s\n' "$2" "$1" | sort -V -C
+}
+
+# ===== Section: HARDWARE =====
+check_cpu() {
+  local cores model
+  cores=$(nproc)
+  model=$(awk -F: '/model name/ {print $2; exit}' /proc/cpuinfo | sed 's/^ *//')
+
+  if (( cores >= CPU_CORES_REC )); then
+    emit hardware "cpu.cores"   PASS "$cores cores ($model)"
+  elif (( cores >= CPU_CORES_MIN )); then
+    emit hardware "cpu.cores"   WARN "$cores cores — meets min ($CPU_CORES_MIN), recommend $CPU_CORES_REC+ ($model)"
+  else
+    emit hardware "cpu.cores"   FAIL "$cores cores — below minimum $CPU_CORES_MIN ($model)" \
+         "Validator needs ≥$CPU_CORES_MIN physical cores; current hardware insufficient"
+  fi
+
+  # AVX2 / AVX512 hints (BLS sig verification benefits)
+  if grep -q avx512f /proc/cpuinfo; then
+    emit hardware "cpu.avx"     PASS "AVX-512 supported (faster BLS)"
+  elif grep -q avx2 /proc/cpuinfo; then
+    emit hardware "cpu.avx"     PASS "AVX2 supported"
+  else
+    emit hardware "cpu.avx"     WARN "no AVX2 — BLS verification will be slower"
+  fi
+}
+
+check_ram() {
+  local total_gb avail_gb
+  total_gb=$(awk '/MemTotal/ {printf "%d", $2/1024/1024}' /proc/meminfo)
+  avail_gb=$(awk '/MemAvailable/ {printf "%d", $2/1024/1024}' /proc/meminfo)
+
+  if (( total_gb >= RAM_GB_REC )); then
+    emit hardware "ram.total"   PASS "${total_gb} GB total (${avail_gb} GB available)"
+  elif (( total_gb >= RAM_GB_MIN )); then
+    emit hardware "ram.total"   WARN "${total_gb} GB — meets min ($RAM_GB_MIN), recommend ${RAM_GB_REC}+"
+  else
+    emit hardware "ram.total"   FAIL "${total_gb} GB — below minimum $RAM_GB_MIN GB" \
+         "Add RAM or use a server with ≥$RAM_GB_REC GB"
+  fi
+
+  # Swap usage warning (validator should not be swapping)
+  local swap_used_mb
+  swap_used_mb=$(awk '/SwapFree/ {sf=$2} /SwapTotal/ {st=$2} END {printf "%d", (st-sf)/1024}' /proc/meminfo)
+  if (( swap_used_mb > 100 )); then
+    emit hardware "ram.swap"    WARN "swap in use: ${swap_used_mb} MB — node may stall under load" \
+         "Investigate memory pressure: 'sudo swapoff -a && sudo swapon -a' to reset"
+  else
+    emit hardware "ram.swap"    PASS "swap not in use"
+  fi
+}
+
+check_disks() {
+  # Find all NVMe devices
+  local nvme_devs nvme_count total_size_gb
+  nvme_devs=$(lsblk -d -o NAME,TYPE 2>/dev/null | awk '/disk/ && /^nvme/ {print $1}')
+  nvme_count=$(echo "$nvme_devs" | grep -c . || true)
+  total_size_gb=$(lsblk -bdn -o NAME,SIZE 2>/dev/null \
+    | awk '/^nvme/ {s+=$2} END {printf "%d", s/1024/1024/1024}')
+
+  if (( nvme_count == 0 )); then
+    emit hardware "disk.nvme"   FAIL "no NVMe drives detected" \
+         "Validator REQUIRES NVMe SSD — SATA/HDD will fail under triedb load"
+    return
+  fi
+
+  emit hardware "disk.nvme"     PASS "$nvme_count NVMe drive(s), ${total_size_gb} GB total"
+
+  # Check IO scheduler on each NVMe — triedb requires mq-deadline on its own disk
+  local triedb_ok=0 first_dev
+  first_dev=$(echo "$nvme_devs" | head -1)
+  for dev in $nvme_devs; do
+    local sched
+    sched=$(awk '{for(i=1;i<=NF;i++) if($i ~ /^\[/) {gsub(/[][]/,"",$i); print $i; exit}}' "/sys/block/$dev/queue/scheduler" 2>/dev/null)
+    if [[ "$sched" == "mq-deadline" ]]; then
+      triedb_ok=1
+      emit hardware "disk.scheduler.$dev" PASS "scheduler=mq-deadline (triedb-suitable)"
+    else
+      emit hardware "disk.scheduler.$dev" INFO "scheduler=$sched"
+    fi
+  done
+
+  if (( triedb_ok == 0 )); then
+    emit hardware "disk.triedb-sched" WARN "no NVMe with mq-deadline scheduler" \
+         "On triedb device run: echo mq-deadline | sudo tee /sys/block/$first_dev/queue/scheduler"
+  else
+    emit hardware "disk.triedb-sched" PASS "at least one NVMe on mq-deadline (triedb-ready)"
+  fi
+
+  # Free space on root
+  local free_root_gb
+  free_root_gb=$(df -BG / | awk 'NR==2 {gsub("G","",$4); print $4}')
+  if (( free_root_gb >= DISK_GB_MIN )); then
+    emit hardware "disk.free"   PASS "${free_root_gb} GB free on /"
+  elif (( free_root_gb >= 500 )); then
+    emit hardware "disk.free"   WARN "${free_root_gb} GB free on / — recommend ≥${DISK_GB_MIN} GB for chain growth"
+  else
+    emit hardware "disk.free"   FAIL "${free_root_gb} GB free on / — insufficient" \
+         "Need ≥500 GB minimum, ≥${DISK_GB_MIN} GB recommended"
+  fi
+}
+
+check_iops() {
+  if (( QUICK_MODE == 1 )); then
+    emit hardware "disk.iops"   INFO "skipped (--quick)"
+    return
+  fi
+  if ! require_cmd fio; then
+    emit hardware "disk.iops"   INFO "skipped (fio not installed) — install: apt install -y fio"
+    return
+  fi
+
+  local target_dev
+  target_dev=$(lsblk -d -o NAME,TYPE 2>/dev/null | awk '/disk/ && /^nvme/ {print "/dev/"$1; exit}')
+  if [[ -z "$target_dev" ]]; then
+    emit hardware "disk.iops"   INFO "skipped (no NVMe found)"
+    return
+  fi
+
+  emit hardware "disk.iops"     INFO "running fio on $target_dev (10s random read, non-destructive)…"
+  local iops
+  iops=$(fio --name=mdr --filename="$target_dev" --rw=randread --bs=4k \
+    --runtime=10 --time_based=1 --ioengine=libaio --iodepth=32 --direct=1 \
+    --numjobs=4 --group_reporting --output-format=terse 2>/dev/null \
+    | awk -F\; '{print $8}' | head -1)
+
+  if [[ -z "$iops" || "$iops" == "0" ]]; then
+    emit hardware "disk.iops"   WARN "fio returned no result"
+    return
+  fi
+
+  if (( iops >= NVME_IOPS_REC )); then
+    emit hardware "disk.iops"   PASS "${iops} 4k random read IOPS"
+  elif (( iops >= NVME_IOPS_MIN )); then
+    emit hardware "disk.iops"   WARN "${iops} IOPS — meets min ($NVME_IOPS_MIN), recommend $NVME_IOPS_REC+"
+  else
+    emit hardware "disk.iops"   FAIL "${iops} IOPS — below minimum $NVME_IOPS_MIN" \
+         "Replace with datacenter-class NVMe (Samsung PM9A3, WD SN850X, Micron 7450)"
+  fi
+}
+
+# ===== Section: OS =====
+check_os() {
+  if [[ ! -r /etc/os-release ]]; then
+    emit os "os.release" FAIL "/etc/os-release not readable"
+    return
+  fi
+  . /etc/os-release
+  case "$ID" in
+    ubuntu)
+      local ver_id="${VERSION_ID:-0}"
+      if ver_ge "$ver_id" "22.04"; then
+        emit os "os.distro"     PASS "$PRETTY_NAME"
+      else
+        emit os "os.distro"     FAIL "$PRETTY_NAME — Ubuntu 22.04+ required" \
+             "Reinstall with Ubuntu 22.04 LTS or 24.04 LTS"
+      fi ;;
+    debian)
+      emit os "os.distro"       WARN "$PRETTY_NAME — Debian works but Ubuntu 22.04+ is officially supported"
+      ;;
+    *)
+      emit os "os.distro"       FAIL "$PRETTY_NAME — only Ubuntu (Debian) supported" \
+           "Use Ubuntu 22.04 or 24.04 LTS"
+      ;;
+  esac
+
+  # Architecture
+  local arch
+  arch=$(uname -m)
+  if [[ "$arch" == "x86_64" ]]; then
+    emit os "os.arch"           PASS "x86_64"
+  else
+    emit os "os.arch"           FAIL "$arch — only x86_64 supported" \
+         "Use a server with x86_64 (AMD64) CPU"
+  fi
+}
+
+check_kernel() {
+  local k
+  k=$(uname -r | cut -d- -f1)
+  if ver_ge "$k" "$KERNEL_MIN"; then
+    emit os "kernel.version"    PASS "$(uname -r)"
+  else
+    emit os "kernel.version"    FAIL "kernel $k — need $KERNEL_MIN+" \
+         "Upgrade kernel: apt install linux-generic-hwe-22.04"
+  fi
+}
+
+check_ulimits() {
+  # If monad-bft.service exists, its LimitNOFILE is the authoritative value
+  # for the validator process. Shell ulimit is only relevant if running monad manually.
+  if systemctl cat monad-bft 2>/dev/null >/dev/null; then
+    local svc_limit
+    svc_limit=$(systemctl show monad-bft -p LimitNOFILE 2>/dev/null | cut -d= -f2)
+    svc_limit=${svc_limit:-0}
+    if (( svc_limit >= ULIMIT_MIN )); then
+      emit os "ulimit.service"  PASS "monad-bft LimitNOFILE=$svc_limit"
+    else
+      emit os "ulimit.service"  WARN "monad-bft LimitNOFILE=$svc_limit — recommend ≥$ULIMIT_MIN" \
+           "Add to /etc/systemd/system/monad-bft.service.d/override.conf: [Service] LimitNOFILE=1048576"
+    fi
+  else
+    # No service yet — fall back to /etc/security/limits.conf
+    local conf_limit
+    conf_limit=$(awk '$1=="*" && $2=="hard" && $3=="nofile" {print $4}' /etc/security/limits.conf 2>/dev/null | tail -1)
+    if [[ -n "$conf_limit" && "$conf_limit" -ge "$ULIMIT_MIN" ]]; then
+      emit os "ulimit.limits-conf" PASS "limits.conf hard nofile=$conf_limit"
+    else
+      emit os "ulimit.limits-conf" WARN "no high nofile limit set in /etc/security/limits.conf" \
+           "Add: '* soft nofile 1048576' and '* hard nofile 1048576' to /etc/security/limits.conf"
+    fi
+  fi
+
+  # System-wide file-max
+  local sysmax
+  sysmax=$(cat /proc/sys/fs/file-max 2>/dev/null || echo 0)
+  if (( sysmax >= ULIMIT_MIN )); then
+    emit os "ulimit.system"     PASS "fs.file-max = $sysmax"
+  else
+    emit os "ulimit.system"     WARN "fs.file-max = $sysmax — low" \
+         "Add to /etc/sysctl.conf: 'fs.file-max = 2097152' && sysctl -p"
+  fi
+}
+
+check_sysctl() {
+  # Network buffer sizes critical for raptorcast UDP throughput
+  local rmem_max wmem_max
+  rmem_max=$(sysctl -n net.core.rmem_max 2>/dev/null || echo 0)
+  wmem_max=$(sysctl -n net.core.wmem_max 2>/dev/null || echo 0)
+  local need=16777216  # 16 MB
+  if (( rmem_max >= need && wmem_max >= need )); then
+    emit os "sysctl.netbuf"     PASS "rmem_max=$rmem_max wmem_max=$wmem_max"
+  else
+    emit os "sysctl.netbuf"     WARN "rmem/wmem_max below ${need} — UDP raptorcast may drop" \
+         "Add to /etc/sysctl.conf: net.core.rmem_max=16777216, net.core.wmem_max=16777216 && sysctl -p"
+  fi
+
+  local swappiness
+  swappiness=$(sysctl -n vm.swappiness 2>/dev/null || echo 60)
+  if (( swappiness <= 10 )); then
+    emit os "sysctl.swappiness" PASS "vm.swappiness=$swappiness"
+  else
+    emit os "sysctl.swappiness" WARN "vm.swappiness=$swappiness — high" \
+         "Set vm.swappiness=1 in /etc/sysctl.conf to avoid validator stalls"
+  fi
+}
+
+check_ntp() {
+  if require_cmd chronyc && systemctl is-active --quiet chrony 2>/dev/null; then
+    local off
+    off=$(chronyc tracking 2>/dev/null | awk -F': ' '/Last offset/ {print $2}' | awk '{print $1}')
+    local off_us
+    off_us=$(awk -v o="$off" 'BEGIN {printf "%d", (o<0?-o:o)*1000000}')
+    if (( off_us < 1000 )); then
+      emit os "ntp"             PASS "chrony, |offset|=${off_us}µs"
+    elif (( off_us < 10000 )); then
+      emit os "ntp"             WARN "chrony, |offset|=${off_us}µs — slight drift"
+    else
+      emit os "ntp"             FAIL "chrony, |offset|=${off_us}µs — significant drift" \
+           "Investigate: chronyc sources -v"
+    fi
+  elif systemctl is-active --quiet systemd-timesyncd 2>/dev/null; then
+    emit os "ntp"               WARN "systemd-timesyncd active — drifts ~10-100ms, inflates vote_delay" \
+         "Replace: apt install -y chrony && systemctl disable --now systemd-timesyncd"
+  else
+    emit os "ntp"               FAIL "no NTP daemon active" \
+         "Install: apt install -y chrony"
+  fi
+}
+
+# ===== Section: NETWORK =====
+check_public_ip() {
+  local ip
+  ip=$(curl -fsS -m 4 https://api.ipify.org 2>/dev/null || true)
+  if [[ -z "$ip" ]]; then
+    emit network "net.public-ip" WARN "couldn't determine public IP (api.ipify.org timeout)"
+    return
+  fi
+  emit network "net.public-ip"   PASS "$ip"
+
+  # Check that public IP is on this host (not behind NAT)
+  if hostname -I 2>/dev/null | grep -qw "$ip"; then
+    emit network "net.nat-detect" PASS "public IP bound to interface (no NAT)"
+  else
+    emit network "net.nat-detect" WARN "public IP not on local interface — possible NAT" \
+         "Validator behind NAT requires port-forwarding for ports $NET_PORTS_REQUIRED"
+  fi
+}
+
+check_ports_free() {
+  local conflict=0
+  for p in $NET_PORTS_REQUIRED; do
+    if ss -tlnu 2>/dev/null | grep -qE ":${p}\b"; then
+      # Already in use — check if it's monad
+      local who
+      who=$(ss -tlnup 2>/dev/null | grep ":${p}\b" | head -1 | grep -oE 'users:\(\("[^"]+"' | grep -oE '"[^"]+"' | tr -d '"')
+      if [[ "$who" == "monad-node" || "$who" == "monad-bft" ]]; then
+        emit network "net.port.$p" PASS "port $p in use by $who (validator already running)"
+      else
+        emit network "net.port.$p" WARN "port $p occupied by $who — must be free or monad" \
+             "Stop conflicting service or pick different port"
+      fi
+    else
+      emit network "net.port.$p" PASS "port $p free"
+    fi
+  done
+}
+
+check_firewall() {
+  if require_cmd ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
+    # Check that required ports are allowed
+    local missing=""
+    for p in $NET_PORTS_REQUIRED; do
+      if ! ufw status 2>/dev/null | grep -qE "^${p}.*ALLOW|^${p}/tcp.*ALLOW|^${p}/udp.*ALLOW"; then
+        missing+="$p "
+      fi
+    done
+    if [[ -z "$missing" ]]; then
+      emit network "net.firewall" PASS "ufw active, ports $NET_PORTS_REQUIRED allowed"
+    else
+      emit network "net.firewall" WARN "ufw active but missing rules for: $missing" \
+           "Add: $(for p in $missing; do echo -n "ufw allow $p; "; done)"
+    fi
+  elif require_cmd ufw; then
+    emit network "net.firewall" WARN "ufw installed but inactive — no firewall protection" \
+         "Enable: ufw allow 22 && ufw allow $(echo $NET_PORTS_REQUIRED | tr ' ' ',') && ufw enable"
+  elif require_cmd nft || require_cmd iptables; then
+    emit network "net.firewall" INFO "nftables/iptables in use (manual config) — ensure ports $NET_PORTS_REQUIRED open"
+  else
+    emit network "net.firewall" WARN "no firewall detected" \
+         "Install ufw: apt install -y ufw"
+  fi
+}
+
+# ===== Section: SECURITY =====
+check_ssh_hardening() {
+  local sshd=/etc/ssh/sshd_config
+  [[ -r "$sshd" ]] || { emit security "ssh.config" INFO "sshd_config not readable (skipped)"; return; }
+
+  # PasswordAuthentication
+  local pwauth
+  pwauth=$(grep -E '^[[:space:]]*PasswordAuthentication' "$sshd" 2>/dev/null | awk '{print $2}' | tail -1)
+  pwauth=${pwauth:-yes}  # default
+  case "$pwauth" in
+    no|No|NO)  emit security "ssh.passwordauth" PASS "PasswordAuthentication=no" ;;
+    *)         emit security "ssh.passwordauth" WARN "PasswordAuthentication=$pwauth — bruteforce risk" \
+                  "Set 'PasswordAuthentication no' in /etc/ssh/sshd_config && systemctl reload ssh" ;;
+  esac
+
+  # PermitRootLogin
+  local rootlogin
+  rootlogin=$(grep -E '^[[:space:]]*PermitRootLogin' "$sshd" 2>/dev/null | awk '{print $2}' | tail -1)
+  rootlogin=${rootlogin:-prohibit-password}
+  case "$rootlogin" in
+    no|No|NO|prohibit-password)
+      emit security "ssh.rootlogin" PASS "PermitRootLogin=$rootlogin" ;;
+    yes|Yes|YES)
+      emit security "ssh.rootlogin" WARN "PermitRootLogin=yes — risky" \
+        "Set 'PermitRootLogin no' or 'prohibit-password'" ;;
+    *)
+      emit security "ssh.rootlogin" INFO "PermitRootLogin=$rootlogin" ;;
+  esac
+}
+
+check_unattended_upgrades() {
+  if dpkg -l unattended-upgrades 2>/dev/null | grep -q '^ii'; then
+    if [[ -f /etc/apt/apt.conf.d/20auto-upgrades ]] \
+       && grep -q '^APT::Periodic::Unattended-Upgrade "1"' /etc/apt/apt.conf.d/20auto-upgrades 2>/dev/null; then
+      emit security "auto-upgrades" WARN "unattended-upgrades enabled — may auto-restart node mid-epoch" \
+           "Disable for validator: systemctl disable --now unattended-upgrades"
+    else
+      emit security "auto-upgrades" PASS "unattended-upgrades installed but not active"
+    fi
+  else
+    emit security "auto-upgrades" PASS "unattended-upgrades not installed"
+  fi
+}
+
+check_fail2ban() {
+  if systemctl is-active --quiet fail2ban 2>/dev/null; then
+    emit security "fail2ban"     PASS "fail2ban active"
+  else
+    emit security "fail2ban"     INFO "fail2ban not active — recommended for SSH bruteforce protection" \
+         "apt install -y fail2ban && systemctl enable --now fail2ban"
+  fi
+}
+
+# ===== Section: MONAD-SPECIFIC (if already installed) =====
+check_monad_install() {
+  # dpkg -l states: ii=installed, hi=hold+installed, rc=removed-config, etc.
+  # Match anything where 2nd char is 'i' (installed).
+  if ! dpkg -l monad 2>/dev/null | grep -qE '^.i  monad'; then
+    emit monad "monad.installed" INFO "monad package not installed (this is a pre-flight check, OK)"
+    return
+  fi
+
+  local installed available state
+  installed=$(dpkg-query -W -f='${Version}' monad 2>/dev/null || echo "?")
+  state=$(dpkg -l monad 2>/dev/null | awk '/^.i  monad/ {print $1; exit}')
+  # apt list output: "monad/noble 0.14.3 amd64 [upgradable from: 0.14.2]"
+  # Field 2 (after split by space) is the version.
+  available=$(apt list --upgradable 2>/dev/null | awk '/^monad\// {print $2}' | head -1)
+
+  if [[ "$state" == "hi" ]]; then
+    emit monad "monad.installed" INFO "monad on hold — apt won't auto-upgrade (intentional?)"
+  fi
+
+  if [[ -n "$available" && "$available" != "$installed" ]]; then
+    emit monad "monad.version"   WARN "installed=$installed, available=$available" \
+         "Update: apt update && apt install --only-upgrade monad (or unhold first: apt-mark unhold monad)"
+  else
+    emit monad "monad.version"   PASS "installed=$installed (latest)"
+  fi
+
+  # Auth UDP check — wireauth log entries (DEBUG level, may need broader scan)
+  if systemctl is-active --quiet monad-bft 2>/dev/null; then
+    # Scan last 500 lines instead of time-based — DEBUG messages may be rotated
+    if journalctl -u monad-bft -n 500 --no-pager 2>/dev/null | grep -q monad_wireauth; then
+      emit monad "monad.authudp" PASS "Auth UDP active (wireauth sessions in logs)"
+    else
+      emit monad "monad.authudp" WARN "no wireauth log entries — Auth UDP may not be active or DEBUG logs disabled" \
+           "Verify: journalctl -u monad-bft -n 1000 | grep wireauth"
+    fi
+  fi
+}
+
+# ===== Run all checks =====
+header() {
+  [[ $JSON_OUTPUT -eq 1 ]] && return
+  cat <<EOF
+${C_BOLD}${C_PURPLE}
+  ╔══════════════════════════════════════════════╗
+  ║       monad-doctor — pre-flight check        ║
+  ║       BeeHive monad-tools                    ║
+  ╚══════════════════════════════════════════════╝${C_RESET}
+  Hostname: $(hostname)
+  Date:     $(date -u +%Y-%m-%dT%H:%M:%SZ)
+  $([ $QUICK_MODE -eq 1 ] && echo "Mode:     ${C_YELLOW}quick (--quick)${C_RESET}")
+EOF
+}
+
+run_section() {
+  local name="$1"; shift
+  [[ -n "$SECTION" && "$SECTION" != "$name" ]] && return
+  section_header "$(echo "$name" | tr a-z A-Z)"
+  for fn in "$@"; do "$fn"; done
+}
+
+main() {
+  header
+  run_section hardware  check_cpu check_ram check_disks check_iops
+  run_section os        check_os check_kernel check_ulimits check_sysctl check_ntp
+  run_section network   check_public_ip check_ports_free check_firewall
+  run_section security  check_ssh_hardening check_unattended_upgrades check_fail2ban
+  run_section monad     check_monad_install
+
+  if [[ $JSON_OUTPUT -eq 1 ]]; then
+    print_json
+  else
+    print_summary
+  fi
+
+  # Exit code
+  if (( COUNT_FAIL > 0 )); then exit 2
+  elif (( COUNT_WARN > 0 )); then exit 1
+  else exit 0
+  fi
+}
+
+print_summary() {
+  echo
+  printf "${C_BOLD}━━ Summary ━━${C_RESET}\n"
+  printf "  ${C_GREEN}PASS${C_RESET}: %d   " "$COUNT_PASS"
+  printf "${C_YELLOW}WARN${C_RESET}: %d   " "$COUNT_WARN"
+  printf "${C_RED}FAIL${C_RESET}: %d   " "$COUNT_FAIL"
+  printf "${C_BLUE}INFO${C_RESET}: %d\n" "$COUNT_INFO"
+  echo
+
+  if (( COUNT_FAIL > 0 )); then
+    printf "${C_RED}${C_BOLD}✗ Verdict: NOT READY${C_RESET}\n"
+    printf "  Fix the FAIL items before deploying a validator.\n"
+  elif (( COUNT_WARN > 0 )); then
+    printf "${C_YELLOW}${C_BOLD}! Verdict: READY WITH WARNINGS${C_RESET}\n"
+    printf "  Node will run but address WARN items for best operation.\n"
+  else
+    printf "${C_GREEN}${C_BOLD}✓ Verdict: READY${C_RESET}\n"
+    printf "  All checks passed. Server is ready for Monad validator deployment.\n"
+  fi
+  echo
+}
+
+print_json() {
+  printf '{\n'
+  printf '  "host": "%s",\n' "$(hostname)"
+  printf '  "date": "%s",\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  printf '  "summary": {"pass": %d, "warn": %d, "fail": %d, "info": %d},\n' \
+    "$COUNT_PASS" "$COUNT_WARN" "$COUNT_FAIL" "$COUNT_INFO"
+  if (( COUNT_FAIL > 0 )); then printf '  "verdict": "NOT_READY",\n'
+  elif (( COUNT_WARN > 0 )); then printf '  "verdict": "READY_WITH_WARNINGS",\n'
+  else printf '  "verdict": "READY",\n'; fi
+  printf '  "checks": [\n'
+  local n=${#RESULTS_NAME[@]}
+  for ((i=0; i<n; i++)); do
+    local sep=","
+    (( i == n-1 )) && sep=""
+    printf '    {"section": "%s", "name": "%s", "status": "%s", "message": "%s", "fix": "%s"}%s\n' \
+      "${RESULTS_SECTION[i]}" "${RESULTS_NAME[i]}" "${RESULTS_STATUS[i]}" \
+      "$(echo "${RESULTS_MSG[i]}" | sed 's/"/\\"/g')" \
+      "$(echo "${RESULTS_FIX[i]}" | sed 's/"/\\"/g')" \
+      "$sep"
+  done
+  printf '  ]\n'
+  printf '}\n'
+}
+
+main

@@ -1,0 +1,256 @@
+#!/usr/bin/env bash
+# monad-authudp-check — verify your Monad node has Authenticated UDP active
+# Project: BeeHive monad-tools
+# Repo: https://github.com/BeeHiveTeam/monad-tools
+#
+# Why: Monad release 0.14.3 will drop support for non-authenticated UDP at the
+# network level. Nodes that have not migrated to Authenticated UDP will be
+# disconnected. Reference:
+#   https://docs.monad.xyz/node-ops/upgrade-instructions/authenticated-udp-checking
+#
+# This script checks (in order, fast-to-slow):
+#   1. monad package version (≥0.14.0 has Auth UDP enforced)
+#   2. Active wireauth log entries in monad-bft journal (proof it's running)
+#   3. wireauth UDP socket open
+#   4. Recent peer keepalive activity (from logs)
+#
+# Usage:
+#   ./monad-authudp-check                # text report
+#   ./monad-authudp-check --json         # machine-readable
+#   ./monad-authudp-check --quiet        # only print on FAIL
+#   ./monad-authudp-check --post URL     # POST result JSON to URL (compliance tracker)
+
+set -u
+
+JSON_OUTPUT=0
+QUIET=0
+POST_URL=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --json)   JSON_OUTPUT=1 ;;
+    --quiet)  QUIET=1 ;;
+    --post)   POST_URL="${2:-}"; shift ;;
+    --post=*) POST_URL="${1#*=}" ;;
+    -h|--help)
+      sed -n '2,/^$/p' "$0" | sed 's/^# \?//'
+      exit 0 ;;
+    *) echo "Unknown option: $1" >&2; exit 64 ;;
+  esac
+  shift
+done
+
+if [[ -t 1 && $JSON_OUTPUT -eq 0 && $QUIET -eq 0 ]]; then
+  C_RED=$'\033[0;31m'; C_GREEN=$'\033[0;32m'; C_YELLOW=$'\033[0;33m'
+  C_BLUE=$'\033[0;34m'; C_BOLD=$'\033[1m'; C_RESET=$'\033[0m'
+else
+  C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""; C_BOLD=""; C_RESET=""
+fi
+
+# Result accumulator
+declare -A R
+HAS_FAIL=0; HAS_WARN=0
+
+emit() {
+  local key="$1" status="$2" detail="$3"
+  R["${key}.status"]="$status"
+  R["${key}.detail"]="$detail"
+  case "$status" in
+    fail) HAS_FAIL=1 ;;
+    warn) HAS_WARN=1 ;;
+  esac
+  if [[ $JSON_OUTPUT -eq 0 && $QUIET -eq 0 ]]; then
+    local sym color
+    case "$status" in
+      pass) sym="✓"; color="$C_GREEN" ;;
+      warn) sym="!"; color="$C_YELLOW" ;;
+      fail) sym="✗"; color="$C_RED" ;;
+      info) sym="i"; color="$C_BLUE" ;;
+    esac
+    printf "  ${color}%s${C_RESET} %-25s %s\n" "$sym" "$key" "$detail"
+  fi
+}
+
+# ===== Check 1: monad version =====
+check_version() {
+  if ! command -v dpkg-query >/dev/null; then
+    emit "version" "info" "dpkg not available — cannot check package version"
+    return
+  fi
+  local v
+  v=$(dpkg-query -W -f='${Version}' monad 2>/dev/null || true)
+  if [[ -z "$v" ]]; then
+    emit "version" "info" "monad package not installed"
+    return
+  fi
+
+  # 0.14.0 introduced Auth UDP; 0.14.3 makes it mandatory
+  if printf '%s\n%s\n' "0.14.0" "$v" | sort -V -C 2>/dev/null; then
+    emit "version" "pass" "monad $v (Auth UDP available)"
+  else
+    emit "version" "fail" "monad $v — UPGRADE REQUIRED (need ≥0.14.0)"
+  fi
+
+  # Check for available upgrade
+  if command -v apt-get >/dev/null; then
+    local avail
+    avail=$(apt list --upgradable 2>/dev/null | awk '/^monad\// {print $2}' | head -1)
+    if [[ -n "$avail" && "$avail" != "$v" ]]; then
+      emit "version.upgrade" "warn" "newer version available: $avail (current $v)"
+    fi
+  fi
+}
+
+# ===== Check 2: monad-bft service =====
+check_service() {
+  if ! command -v systemctl >/dev/null; then
+    emit "service" "info" "systemctl not available — cannot verify service"
+    return
+  fi
+  if systemctl is-active --quiet monad-bft 2>/dev/null; then
+    emit "service" "pass" "monad-bft.service active"
+  else
+    emit "service" "fail" "monad-bft.service NOT active"
+  fi
+}
+
+# ===== Check 3: wireauth log entries =====
+check_wireauth_logs() {
+  if ! command -v journalctl >/dev/null; then
+    emit "wireauth.logs" "info" "journalctl not available"
+    return
+  fi
+  if [[ $EUID -ne 0 ]] && ! groups | grep -q '\(systemd-journal\|adm\)'; then
+    emit "wireauth.logs" "info" "run as root or member of systemd-journal/adm group for log access"
+    return
+  fi
+
+  local count
+  count=$(journalctl -u monad-bft -n 1000 --no-pager 2>/dev/null | grep -c monad_wireauth || true)
+  if (( count >= 5 )); then
+    emit "wireauth.logs" "pass" "$count wireauth log entries in last 1000 lines"
+  elif (( count > 0 )); then
+    emit "wireauth.logs" "warn" "only $count wireauth entries found — verify Auth UDP is active"
+  else
+    emit "wireauth.logs" "fail" "0 wireauth entries — Auth UDP may not be active"
+  fi
+}
+
+# ===== Check 4: peer connectivity =====
+check_peer_keepalive() {
+  if ! command -v journalctl >/dev/null; then return; fi
+  if [[ $EUID -ne 0 ]] && ! groups | grep -q '\(systemd-journal\|adm\)'; then return; fi
+
+  local recent_peers
+  recent_peers=$(journalctl -u monad-bft -n 2000 --no-pager 2>/dev/null \
+    | grep 'sending keepalive packet' \
+    | grep -oE 'remote_addr":"[0-9.]+' \
+    | sort -u | wc -l)
+  if (( recent_peers >= 5 )); then
+    emit "wireauth.peers" "pass" "$recent_peers unique peers seen in keepalives"
+  elif (( recent_peers > 0 )); then
+    emit "wireauth.peers" "warn" "only $recent_peers unique peer(s) — small set"
+  else
+    emit "wireauth.peers" "info" "no recent keepalive activity in logs"
+  fi
+}
+
+# ===== Check 5: UDP port listening =====
+check_udp_port() {
+  if ! command -v ss >/dev/null; then return; fi
+  if ss -uln 2>/dev/null | grep -qE ':8000\b'; then
+    emit "udp.port" "pass" "UDP port 8000 listening (raptorcast/wireauth)"
+  else
+    emit "udp.port" "fail" "UDP port 8000 NOT listening"
+  fi
+}
+
+# ===== Output =====
+print_header() {
+  [[ $JSON_OUTPUT -eq 1 || $QUIET -eq 1 ]] && return
+  cat <<EOF
+${C_BOLD}monad-authudp-check${C_RESET}  —  $(hostname) at $(date -u +%Y-%m-%dT%H:%M:%SZ)
+EOF
+}
+
+print_verdict() {
+  if [[ $JSON_OUTPUT -eq 1 ]]; then
+    print_json
+    return
+  fi
+  [[ $QUIET -eq 1 && $HAS_FAIL -eq 0 ]] && return
+
+  echo
+  if (( HAS_FAIL )); then
+    echo "${C_RED}${C_BOLD}✗ FAIL — your node may be disconnected at next Monad release${C_RESET}"
+    echo "  Action: upgrade monad and verify wireauth is running."
+    echo "  Docs: https://docs.monad.xyz/node-ops/upgrade-instructions/auth-udp"
+  elif (( HAS_WARN )); then
+    echo "${C_YELLOW}${C_BOLD}! OK — Auth UDP active but with warnings${C_RESET}"
+  else
+    echo "${C_GREEN}${C_BOLD}✓ READY — Auth UDP active, node compliant${C_RESET}"
+  fi
+}
+
+print_json() {
+  local verdict
+  if (( HAS_FAIL )); then verdict="FAIL"
+  elif (( HAS_WARN )); then verdict="WARN"
+  else verdict="PASS"; fi
+  printf '{\n'
+  printf '  "host": "%s",\n' "$(hostname)"
+  printf '  "timestamp": "%s",\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  printf '  "verdict": "%s",\n' "$verdict"
+  printf '  "checks": {\n'
+  local keys=()
+  for k in "${!R[@]}"; do
+    [[ "$k" == *.status ]] && keys+=("${k%.status}")
+  done
+  local n=${#keys[@]} i=0
+  for key in "${keys[@]}"; do
+    local sep=","
+    (( ++i == n )) && sep=""
+    printf '    "%s": {"status": "%s", "detail": "%s"}%s\n' \
+      "$key" "${R[${key}.status]}" \
+      "$(printf '%s' "${R[${key}.detail]}" | sed 's/"/\\"/g')" \
+      "$sep"
+  done
+  printf '  }\n'
+  printf '}\n'
+}
+
+# ===== Optional: POST result to compliance tracker =====
+post_result() {
+  [[ -z "$POST_URL" ]] && return
+  if ! command -v curl >/dev/null; then
+    [[ $QUIET -eq 0 ]] && echo "(curl not installed — skipping --post)" >&2
+    return
+  fi
+  local payload
+  payload=$(JSON_OUTPUT=1; print_json 2>/dev/null)
+  if curl -fsS -m 5 -X POST "$POST_URL" \
+    -H 'Content-Type: application/json' \
+    -d "$payload" >/dev/null 2>&1; then
+    [[ $QUIET -eq 0 ]] && echo "Result posted to $POST_URL"
+  else
+    [[ $QUIET -eq 0 ]] && echo "Failed to POST to $POST_URL" >&2
+  fi
+}
+
+main() {
+  print_header
+  check_version
+  check_service
+  check_wireauth_logs
+  check_peer_keepalive
+  check_udp_port
+  print_verdict
+  post_result
+
+  if (( HAS_FAIL )); then exit 2
+  elif (( HAS_WARN )); then exit 1
+  else exit 0
+  fi
+}
+
+main
