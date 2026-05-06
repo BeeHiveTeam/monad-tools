@@ -59,7 +59,7 @@ These tools encode the lessons learned running a real Monad validator into runna
 
 ## Project status
 
-This is **opinionated, production-tested code** running on the BeeHive validator (`198.51.100.42`, peer in 200-validator testnet active set). PRs welcome, especially for:
+This is **opinionated, production-tested code** running on the BeeHive validator — a peer in the 200-validator testnet active set. PRs welcome, especially for:
 
 - Additional hardware checks (specific NVMe model warnings, RAID configurations)
 - Non-Ubuntu support (Debian, RHEL — currently Ubuntu-only)
@@ -99,7 +99,7 @@ contact:
 
 ## Authors
 
-- BeeHive team — operator of `198.51.100.42` and [monad-tech.com](https://monad-tech.com)
+- BeeHive team — operators of [monad-tech.com](https://monad-tech.com)
 
 ## License
 
