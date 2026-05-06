@@ -20,13 +20,15 @@
 #   - Touch existing files without backup (.bak.<timestamp>)
 #
 # Usage:
-#   sudo ./monad-validator-setup                  # interactive
-#   sudo ./monad-validator-setup --non-interactive
-#   sudo ./monad-validator-setup --dry-run        # show what would change
+#   sudo ./monad-validator-setup                       # interactive (asks network)
+#   sudo ./monad-validator-setup --network=testnet     # skip prompt
+#   sudo ./monad-validator-setup --network=mainnet --non-interactive
+#   sudo ./monad-validator-setup --full-node           # full-node template (default: validator)
+#   sudo ./monad-validator-setup --dry-run             # show what would change
 #   sudo ./monad-validator-setup --triedb-dev=nvme1n1
-#   sudo ./monad-validator-setup --with-monitoring  # also install monad-grafana
-#   sudo ./monad-validator-setup --skip-preflight # skip monad-doctor
-#   sudo ./monad-validator-setup --uninstall      # remove (best-effort)
+#   sudo ./monad-validator-setup --with-monitoring     # also install monad-grafana
+#   sudo ./monad-validator-setup --skip-preflight      # skip monad-doctor
+#   sudo ./monad-validator-setup --uninstall           # remove (best-effort)
 
 set -u
 
@@ -36,11 +38,16 @@ DRY_RUN=0
 SKIP_PREFLIGHT=0
 WITH_MONITORING=0
 TRIEDB_DEV=""
+NETWORK=""                  # testnet | mainnet — asked interactively if empty
+NODE_TYPE="validator"       # validator | full — affects which node.toml to fetch
 ACTION="install"
 LOG_FILE="/tmp/monad-validator-setup-$(date +%Y%m%d-%H%M%S).log"
 TS=$(date -u +%Y%m%d-%H%M%S)
 DOCTOR_PATH="$(dirname "$0")/../doctor/monad-doctor"
 REPORT_FILE="/var/lib/monad-validator-setup/report-${TS}.json"
+
+# Monad foundation config bucket per docs (full-node-installation page).
+MF_BUCKET="${MF_BUCKET:-https://bucket.monadinfra.com}"
 
 # Tuning values
 SYSCTL_RMEM=16777216
@@ -91,6 +98,9 @@ while [[ $# -gt 0 ]]; do
     --skip-preflight)  SKIP_PREFLIGHT=1 ;;
     --with-monitoring) WITH_MONITORING=1 ;;
     --triedb-dev=*)    TRIEDB_DEV="${1#*=}" ;;
+    --network=*)       NETWORK="${1#*=}" ;;
+    --node-type=*)     NODE_TYPE="${1#*=}" ;;
+    --full-node)       NODE_TYPE="full" ;;
     --uninstall)       ACTION="uninstall" ;;
     -h|--help)
       sed -n '2,/^$/p' "$0" | sed 's/^# \?//'
@@ -100,6 +110,16 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
+# Validate flags
+case "$NETWORK" in
+  ""|testnet|mainnet) ;;
+  *) fatal "Invalid --network='$NETWORK' (must be 'testnet' or 'mainnet')" ;;
+esac
+case "$NODE_TYPE" in
+  validator|full) ;;
+  *) fatal "Invalid --node-type='$NODE_TYPE' (must be 'validator' or 'full')" ;;
+esac
+
 # ===== Pre-checks =====
 [[ $EUID -eq 0 ]] || fatal "Run as root: sudo $0 $*"
 
@@ -108,6 +128,31 @@ confirm() {
   local ans
   read -rp "${C_YELLOW}?${C_RESET} $1 [Y/n] " ans
   [[ ! "$ans" =~ ^[Nn]$ ]]
+}
+
+# Ask the operator to choose network if not provided via --network=.
+choose_network() {
+  if [[ -n "$NETWORK" ]]; then
+    info "Network: ${C_BOLD}${NETWORK}${C_RESET} (from --network=${NETWORK})"
+    return 0
+  fi
+  if [[ $NON_INTERACTIVE -eq 1 ]]; then
+    fatal "--network=testnet or --network=mainnet required in --non-interactive mode"
+  fi
+  echo
+  echo "${C_BOLD}Which Monad network are you setting up this node for?${C_RESET}"
+  echo "  1) testnet  (recommended for first deployment; VDP requires testnet validator)"
+  echo "  2) mainnet"
+  local ans
+  while true; do
+    read -rp "${C_YELLOW}?${C_RESET} Choose [1/2]: " ans
+    case "$ans" in
+      1|testnet) NETWORK="testnet"; break ;;
+      2|mainnet) NETWORK="mainnet"; break ;;
+      *)         echo "  Please enter 1 or 2." ;;
+    esac
+  done
+  info "Network: ${C_BOLD}${NETWORK}${C_RESET}"
 }
 
 run() {
@@ -320,6 +365,67 @@ ENV{ID_PART_ENTRY_UUID}==\"${partuuid}\", MODE=\"0666\", SYMLINK+=\"triedb\"
   echo "$content" >"$rule"
   ok "Wrote $rule (PARTUUID=$partuuid)"
   run "reloading udev" udevadm control --reload-rules
+}
+
+# ===== Step: download config files (.env + node.toml) =====
+# Per docs (full-node-installation):
+#   curl -o /home/monad/.env $MF_BUCKET/config/<network>/latest/.env.example
+#   curl -o /home/monad/monad-bft/config/node.toml \
+#        $MF_BUCKET/config/<network>/latest/<full-node-node.toml | node.toml>
+# Validator template is `node.toml`; full-node template is `full-node-node.toml`.
+step_config_files() {
+  section "Bootstrap config files (.env + node.toml)"
+
+  if [[ -z "$NETWORK" ]]; then
+    warn "Network not chosen — skipping config download (run choose_network first)"
+    return
+  fi
+
+  local env_file=/home/monad/.env
+  local node_toml=/home/monad/monad-bft/config/node.toml
+  local toml_name
+  if [[ "$NODE_TYPE" == "validator" ]]; then
+    toml_name="node.toml"
+  else
+    toml_name="full-node-node.toml"
+  fi
+  local env_url="${MF_BUCKET}/config/${NETWORK}/latest/.env.example"
+  local toml_url="${MF_BUCKET}/config/${NETWORK}/latest/${toml_name}"
+
+  # .env — preserve if already exists (operator may have customized)
+  if [[ -f "$env_file" ]]; then
+    info ".env already present — keeping (delete first to re-download)"
+  elif (( DRY_RUN )); then
+    echo "  ${C_DIM}[dry-run] curl -o $env_file $env_url${C_RESET}"
+  else
+    mkdir -p "$(dirname "$env_file")"
+    if run "downloading .env (${NETWORK})" curl -fsSL --max-time 30 -o "$env_file" "$env_url"; then
+      chown monad:monad "$env_file" 2>/dev/null || true
+      chmod 0644 "$env_file"
+      ok "Wrote $env_file (from $env_url)"
+    else
+      warn "Failed to download .env — operator must place manually"
+      return 1
+    fi
+  fi
+
+  # node.toml — preserve if already exists
+  if [[ -f "$node_toml" ]]; then
+    info "node.toml already present — keeping (delete first to re-download)"
+  elif (( DRY_RUN )); then
+    echo "  ${C_DIM}[dry-run] curl -o $node_toml $toml_url${C_RESET}"
+  else
+    mkdir -p "$(dirname "$node_toml")"
+    if run "downloading node.toml (${NODE_TYPE} on ${NETWORK})" \
+         curl -fsSL --max-time 30 -o "$node_toml" "$toml_url"; then
+      chown monad:monad "$node_toml" 2>/dev/null || true
+      chmod 0644 "$node_toml"
+      ok "Wrote $node_toml (from $toml_url)"
+    else
+      warn "Failed to download node.toml — operator must place manually"
+      return 1
+    fi
+  fi
 }
 
 # ===== Step: enable monad-cruft.timer =====
@@ -686,42 +792,42 @@ ${C_GREEN}${C_BOLD}════════════════════�
   Validator host configured.
 ═══════════════════════════════════════════════════${C_RESET}
 
-${C_BOLD}Next steps (DO NOT skip):${C_RESET}
+${C_BOLD}Next steps (network: ${NETWORK:-?}, type: ${NODE_TYPE}):${C_RESET}
 
-  1. Edit /home/monad/monad-bft/config/node.toml:
+  1. Customize /home/monad/monad-bft/config/node.toml (template downloaded from
+     ${MF_BUCKET}/config/${NETWORK:-<network>}/latest/):
      - beneficiary = "0x<your-reward-address>"
-     - node_name    = "<unique-moniker>"
-     - peer_discovery_servers / bootstrap (per official testnet/mainnet docs)
+     - node_name   = "<unique-moniker>"
      - For Auth UDP: self_auth_port = 8001, authenticated_bind_address_port = 8001
-       (run \`monad-sign-name-record\` to generate self_name_record_sig)
+       Run monad-sign-name-record to generate self_name_record_sig
+       (see docs.monad.xyz/node-ops/upgrade-instructions/auth-udp).
 
-  2. Place validator keys in /home/monad/monad-bft/config/ (owner=monad:monad, mode 0600).
-     Refer to https://docs.monad.xyz/node-ops/validator-installation for the
-     official key generation procedure.
+  2. Place validator keys in /home/monad/monad-bft/config/
+     (owner=monad:monad, mode 0600). Refer to:
+     https://docs.monad.xyz/node-ops/validator-installation
 
-  3. TrieDB device (state DB): docs require /dev/triedb to be a dedicated NVMe
-     symlink (e.g. /dev/triedb -> /dev/nvme1n1p1). The first start triggers
-     monad-mpt one-shot to initialize.
+  3. TrieDB device: /dev/triedb must symlink to a dedicated 512-byte LBA NVMe
+     partition. step_triedb_symlink wrote /etc/udev/rules.d/99-triedb.rules
+     if a partition was already present. If you partition a new disk later,
+     re-run this step.
 
-  4. Start services in order (full set):
-     sudo systemctl enable --now monad-mpt        # one-shot triedb init
+  4. Start services (in order):
      sudo systemctl enable --now monad-execution
      sudo systemctl enable --now monad-bft
      sudo systemctl enable --now monad-rpc
-     sudo systemctl enable --now monad-cruft.timer  # hourly cleanup
 
   5. Watch logs:
      journalctl -u monad-bft -f
 
-  6. Re-run preflight to confirm everything is healthy:
+  6. Verify everything healthy:
      sudo $DOCTOR_PATH
 
-  7. Verify Authenticated UDP is active:
+  7. Verify Auth UDP active:
      sudo $(dirname "$DOCTOR_PATH")/../authudp-check/monad-authudp-check
-     # or run the official check from Monad infra:
+     # Foundation's official check:
      curl -fsSL https://bucket.monadinfra.com/scripts/validate-auth-udp-config.sh | bash
 
-  Logs: $LOG_FILE
+  Logs:   $LOG_FILE
   Report: $REPORT_FILE
 
 ${C_BOLD}Need help?${C_RESET}
@@ -763,6 +869,9 @@ EOF
   (( DRY_RUN )) && warn "DRY-RUN MODE: no changes will be made"
   echo
 
+  # Ask early so the rest of the run can show consistent banner.
+  choose_network
+
   local failed=()
   step_preflight        || failed+=("preflight")
   step_dependencies     || failed+=("dependencies")
@@ -773,6 +882,7 @@ EOF
   step_triedb_symlink   || failed+=("triedb-symlink")
   step_chrony           || failed+=("chrony")
   step_monad_install    || failed+=("monad-install")
+  step_config_files     || failed+=("config-files")
   step_cruft_timer      || failed+=("cruft-timer")
   step_firewall         || failed+=("firewall")
   step_iptables_ddos    || failed+=("iptables-ddos")
