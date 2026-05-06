@@ -49,6 +49,8 @@ UBUNTU_VERSION_MIN=${UBUNTU_VERSION_MIN:-24.04}
 # 8000 = TCP+UDP P2P, 8001 = UDP-only Auth UDP per docs.
 # Format: "port/proto" pairs.
 NET_PORTS_REQUIRED=${NET_PORTS_REQUIRED:-"8000/tcp 8000/udp 8001/udp"}
+NET_SPEED_VALIDATOR_MBPS=${NET_SPEED_VALIDATOR_MBPS:-300}   # docs: "300 Mbit/s (Validators)"
+NET_SPEED_FULLNODE_MBPS=${NET_SPEED_FULLNODE_MBPS:-100}     # docs: "100 Mbit/s (Full Nodes)"
 MONAD_AUTHUDP_VERSION_MIN=${MONAD_AUTHUDP_VERSION_MIN:-0.12.6}
 MONAD_NODE_TOML=${MONAD_NODE_TOML:-/home/monad/monad-bft/config/node.toml}
 
@@ -234,6 +236,25 @@ disk_topology() {
 }
 
 # ===== Section: HARDWARE =====
+check_baremetal() {
+  # Per docs.monad.xyz/node-ops/hardware-requirements:
+  #   "Monad nodes must operate on bare metal servers rather than virtualized
+  #    or cloud-based environments"
+  # Quirk: systemd-detect-virt exits 1 when virt is "none" (bare metal).
+  # So we explicitly check the output, not the exit code.
+  if ! command -v systemd-detect-virt >/dev/null; then
+    emit hardware "host.bare-metal" INFO "systemd-detect-virt not available — cannot verify"
+    return
+  fi
+  local virt
+  virt=$(systemd-detect-virt 2>/dev/null)
+  case "$virt" in
+    none|"") emit hardware "host.bare-metal" PASS "running on bare metal" ;;
+    *)       emit hardware "host.bare-metal" FAIL "running in '$virt' (virtualized) — docs require bare metal" \
+                  "Move to a bare-metal server. VDP/Foundation requires bare-metal per hardware-requirements." ;;
+  esac
+}
+
 check_cpu() {
   local model phys_cores logical
   model=$(awk -F: '/model name/ {print $2; exit}' /proc/cpuinfo | sed 's/^ *//')
@@ -651,6 +672,35 @@ check_ntp() {
 }
 
 # ===== Section: NETWORK =====
+check_bandwidth() {
+  # Per docs: 300 Mbit/s for validators, 100 Mbit/s for full nodes.
+  # ethtool reports link speed; iface running on a virtio adapter often
+  # reports 0 or "Unknown!" — INFO in that case.
+  if ! command -v ethtool >/dev/null; then
+    emit network "net.speed" INFO "ethtool not installed — cannot check link speed"
+    return
+  fi
+  local checked=0
+  while IFS= read -r iface; do
+    [[ "$iface" == "lo" ]] && continue
+    [[ "$iface" =~ ^(docker|veth|br-|virbr) ]] && continue
+    local speed
+    speed=$(ethtool "$iface" 2>/dev/null | awk '/Speed:/ {sub(/Mb\/s.*/,"",$2); print $2; exit}')
+    [[ -z "$speed" || ! "$speed" =~ ^[0-9]+$ ]] && continue
+    checked=1
+    if (( speed >= NET_SPEED_VALIDATOR_MBPS )); then
+      emit network "net.speed.$iface" PASS "${speed} Mb/s on $iface (≥${NET_SPEED_VALIDATOR_MBPS} required for validator)"
+    elif (( speed >= NET_SPEED_FULLNODE_MBPS )); then
+      emit network "net.speed.$iface" WARN "${speed} Mb/s on $iface — below validator min (${NET_SPEED_VALIDATOR_MBPS}), OK for full-node (${NET_SPEED_FULLNODE_MBPS})"
+    else
+      emit network "net.speed.$iface" FAIL "${speed} Mb/s on $iface — below full-node min (${NET_SPEED_FULLNODE_MBPS})"
+    fi
+  done < <(ip -o link show 2>/dev/null | awk -F': ' '/state UP/ {print $2}' | awk '{print $1}')
+  if (( checked == 0 )); then
+    emit network "net.speed" INFO "no UP physical interface reported a numeric link speed"
+  fi
+}
+
 check_public_ip() {
   local ip
   ip=$(curl -fsS -m 4 https://api.ipify.org 2>/dev/null || true)
@@ -728,6 +778,71 @@ check_firewall() {
 }
 
 # ===== Section: SECURITY =====
+check_rpc_exposure() {
+  # Per docs.monad.xyz/node-ops/validator-delegation-program:
+  #   "Not use a validator node to service external RPCs (Axelar, Wormhole, etc.)"
+  # If RPC ports (8080/8081) are publicly open in UFW → operator violates VDP.
+  if ! require_cmd ufw || ! ufw status >/dev/null 2>&1; then
+    return
+  fi
+  local ufw_status flagged=()
+  ufw_status=$(ufw status 2>/dev/null)
+  for rpc_port in 8080 8081; do
+    # Anywhere = publicly exposed; we accept rules limited to specific source IPs
+    if echo "$ufw_status" \
+        | awk -v port="$rpc_port" '$0 ~ "^"port".*ALLOW.*Anywhere"' \
+        | grep -q .; then
+      flagged+=("$rpc_port")
+    fi
+  done
+  if (( ${#flagged[@]} > 0 )); then
+    emit security "rpc.exposure" FAIL "RPC port(s) ${flagged[*]} publicly exposed — VDP forbids 'external RPC servicing on validator nodes'" \
+         "Restrict source: ufw delete allow ${flagged[0]}; ufw allow from <internal-ip> to any port ${flagged[0]}"
+  else
+    emit security "rpc.exposure" PASS "no RPC ports (8080/8081) publicly exposed"
+  fi
+}
+
+check_iptables_udp_filter() {
+  # Per docs.monad.xyz/node-ops/full-node-installation:
+  #   "Additional iptables rule for robustness:
+  #    sudo iptables -I INPUT -p udp --dport 8000 -m length --length 0:1400 -j DROP"
+  if ! command -v iptables >/dev/null; then
+    emit security "iptables.udp-filter" INFO "iptables not installed — skipping check"
+    return
+  fi
+  if iptables -C INPUT -p udp --dport 8000 -m length --length 0:1400 -j DROP 2>/dev/null; then
+    emit security "iptables.udp-filter" PASS "UDP length filter on :8000 active (per docs)"
+  else
+    emit security "iptables.udp-filter" WARN "no UDP length 0:1400 DROP rule on :8000 — robustness against UDP DDoS missing" \
+         "sudo iptables -I INPUT -p udp --dport 8000 -m length --length 0:1400 -j DROP && netfilter-persistent save"
+  fi
+}
+
+check_cve_2026_31431() {
+  # Per Foundation Discord 2026-04-30 (ACTION RECOMMENDED):
+  # algif_aead kernel module LPE — blacklist as mitigation.
+  if [[ -f /etc/modprobe.d/disable-algif.conf ]] \
+     && grep -q 'algif_aead' /etc/modprobe.d/disable-algif.conf 2>/dev/null; then
+    emit security "cve.2026-31431" PASS "algif_aead blacklisted (CVE-2026-31431 mitigated)"
+  elif ! lsmod 2>/dev/null | grep -q algif_aead; then
+    emit security "cve.2026-31431" PASS "algif_aead not loaded (CVE-2026-31431 not exploitable currently)"
+  else
+    emit security "cve.2026-31431" WARN "algif_aead loaded and not blacklisted — CVE-2026-31431 (LPE) unmitigated" \
+         "echo 'install algif_aead /bin/false' | sudo tee /etc/modprobe.d/disable-algif.conf"
+  fi
+}
+
+check_nvme_cli() {
+  # Required for /dev/triedb LBA reformat (`nvme format` command).
+  if command -v nvme >/dev/null; then
+    emit security "deps.nvme-cli" PASS "nvme-cli installed"
+  else
+    emit security "deps.nvme-cli" WARN "nvme-cli not installed — needed for LBA reformat command" \
+         "apt install -y nvme-cli"
+  fi
+}
+
 check_ssh_hardening() {
   local sshd=/etc/ssh/sshd_config
   [[ -r "$sshd" ]] || { emit security "ssh.config" INFO "sshd_config not readable (skipped)"; return; }
@@ -742,7 +857,8 @@ check_ssh_hardening() {
                   "Set 'PasswordAuthentication no' in /etc/ssh/sshd_config && systemctl reload ssh" ;;
   esac
 
-  # PermitRootLogin
+  # PermitRootLogin — but if PasswordAuth is already off, key-only root login
+  # has the same effective security as 'prohibit-password'.
   local rootlogin
   rootlogin=$(grep -E '^[[:space:]]*PermitRootLogin' "$sshd" 2>/dev/null | awk '{print $2}' | tail -1)
   rootlogin=${rootlogin:-prohibit-password}
@@ -750,8 +866,13 @@ check_ssh_hardening() {
     no|No|NO|prohibit-password)
       emit security "ssh.rootlogin" PASS "PermitRootLogin=$rootlogin" ;;
     yes|Yes|YES)
-      emit security "ssh.rootlogin" WARN "PermitRootLogin=yes — risky" \
-        "Set 'PermitRootLogin no' or 'prohibit-password'" ;;
+      if [[ "$pwauth" == "no" || "$pwauth" == "No" || "$pwauth" == "NO" ]]; then
+        emit security "ssh.rootlogin" INFO "PermitRootLogin=yes — but PasswordAuth=no, so effectively key-only" \
+             "Optional tightening: set 'PermitRootLogin prohibit-password'"
+      else
+        emit security "ssh.rootlogin" WARN "PermitRootLogin=yes with password auth — risky" \
+             "Set 'PermitRootLogin prohibit-password' or disable password auth first"
+      fi ;;
     *)
       emit security "ssh.rootlogin" INFO "PermitRootLogin=$rootlogin" ;;
   esac
@@ -912,10 +1033,12 @@ run_section() {
 
 main() {
   header
-  run_section hardware  check_cpu check_ram check_disks check_iops
+  run_section hardware  check_baremetal check_cpu check_ram check_disks check_iops
   run_section os        check_os check_kernel check_ulimits check_sysctl check_ntp
-  run_section network   check_public_ip check_ports_free check_firewall
-  run_section security  check_ssh_hardening check_unattended_upgrades check_fail2ban
+  run_section network   check_public_ip check_bandwidth check_ports_free check_firewall
+  run_section security  check_ssh_hardening check_unattended_upgrades check_fail2ban \
+                        check_rpc_exposure check_iptables_udp_filter check_cve_2026_31431 \
+                        check_nvme_cli
   run_section monad     check_monad_user check_triedb_device check_monad_install check_authudp_config
 
   if [[ $JSON_OUTPUT -eq 1 ]]; then

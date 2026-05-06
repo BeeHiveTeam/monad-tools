@@ -190,6 +190,157 @@ step_preflight() {
   esac
 }
 
+# ===== Step: dependencies =====
+# Per docs (full-node-installation): apt install -y curl nvme-cli aria2 jq
+step_dependencies() {
+  section "System dependencies (per docs)"
+  local pkgs=(curl nvme-cli aria2 jq ethtool ufw iptables iptables-persistent)
+  local missing=()
+  for p in "${pkgs[@]}"; do
+    dpkg -l "$p" 2>/dev/null | grep -qE '^.i  ' || missing+=("$p")
+  done
+  if (( ${#missing[@]} == 0 )); then
+    ok "All dependencies installed: ${pkgs[*]}"
+    return
+  fi
+  if (( DRY_RUN )); then
+    echo "  ${C_DIM}[dry-run] apt install -y ${missing[*]}${C_RESET}"
+    return
+  fi
+  # iptables-persistent prompts non-interactively — preseed answers.
+  echo iptables-persistent iptables-persistent/autosave_v4 boolean true | debconf-set-selections
+  echo iptables-persistent iptables-persistent/autosave_v6 boolean true | debconf-set-selections
+  run "apt update" apt-get update -qq
+  run "installing missing deps: ${missing[*]}" apt-get install -y "${missing[@]}"
+  ok "Dependencies installed."
+}
+
+# ===== Step: monad user / directories =====
+# Per docs: useradd -m -s /bin/bash monad
+#          mkdir -p /home/monad/monad-bft/{config,ledger,config/forkpoint,config/validators}
+step_monad_user() {
+  section "Monad user / directories (per docs)"
+  if id monad >/dev/null 2>&1; then
+    ok "user 'monad' already exists ($(id -u monad):$(id -g monad))"
+  else
+    if (( DRY_RUN )); then
+      echo "  ${C_DIM}[dry-run] useradd -m -s /bin/bash monad${C_RESET}"
+    else
+      run "creating user monad" useradd -m -s /bin/bash monad
+    fi
+  fi
+  local dirs=(
+    /home/monad/monad-bft/config
+    /home/monad/monad-bft/ledger
+    /home/monad/monad-bft/config/forkpoint
+    /home/monad/monad-bft/config/validators
+  )
+  for d in "${dirs[@]}"; do
+    if [[ -d "$d" ]]; then
+      :
+    elif (( DRY_RUN )); then
+      echo "  ${C_DIM}[dry-run] mkdir -p $d${C_RESET}"
+    else
+      mkdir -p "$d"
+    fi
+  done
+  if (( DRY_RUN == 0 )) && id monad >/dev/null 2>&1; then
+    chown -R monad:monad /home/monad/monad-bft 2>/dev/null || true
+  fi
+  ok "Directory tree under /home/monad/monad-bft/ ready"
+}
+
+# ===== Step: iptables UDP DDoS filter =====
+# Per docs: sudo iptables -I INPUT -p udp --dport 8000 -m length --length 0:1400 -j DROP
+step_iptables_ddos() {
+  section "iptables UDP length filter (per docs)"
+  if ! command -v iptables >/dev/null; then
+    warn "iptables not installed — skipping (install via step_dependencies)"
+    return
+  fi
+  if iptables -C INPUT -p udp --dport 8000 -m length --length 0:1400 -j DROP 2>/dev/null; then
+    ok "rule already present"
+    return
+  fi
+  if (( DRY_RUN )); then
+    echo "  ${C_DIM}[dry-run] iptables -I INPUT -p udp --dport 8000 -m length --length 0:1400 -j DROP${C_RESET}"
+    echo "  ${C_DIM}[dry-run] netfilter-persistent save${C_RESET}"
+    return
+  fi
+  run "adding UDP length 0:1400 DROP rule" \
+    iptables -I INPUT -p udp --dport 8000 -m length --length 0:1400 -j DROP
+  if command -v netfilter-persistent >/dev/null; then
+    run "persisting iptables rules" netfilter-persistent save
+  else
+    warn "netfilter-persistent not available — rule will be lost on reboot"
+  fi
+  ok "UDP length filter active and persisted"
+}
+
+# ===== Step: /dev/triedb SYMLINK udev rule =====
+# Per docs:
+#   PARTUUID=$(lsblk -o PARTUUID $TRIEDB_DRIVE | tail -n 1)
+#   echo "ENV{ID_PART_ENTRY_UUID}==\"$PARTUUID\", MODE=\"0666\", SYMLINK+=\"triedb\"" \
+#     | tee /etc/udev/rules.d/99-triedb.rules
+step_triedb_symlink() {
+  section "TriedB SYMLINK udev rule (per docs)"
+  local rule=/etc/udev/rules.d/99-triedb.rules
+
+  # Identify triedb partition: prefer existing /dev/triedb symlink; else
+  # nothing to do (operator must partition first or specify --triedb-dev=).
+  local triedb_part=""
+  if [[ -L /dev/triedb ]]; then
+    triedb_part=$(readlink -f /dev/triedb)
+  fi
+  if [[ -z "$triedb_part" || ! -b "$triedb_part" ]]; then
+    info "No triedb partition detected (/dev/triedb missing) — operator must"
+    info "partition the triedb device first, then re-run this step."
+    return
+  fi
+
+  local partuuid
+  partuuid=$(lsblk -no PARTUUID "$triedb_part" 2>/dev/null | tr -d ' ')
+  if [[ -z "$partuuid" ]]; then
+    warn "Could not read PARTUUID of $triedb_part — skipping symlink rule"
+    return
+  fi
+
+  local content="# monad-validator-setup ${TS}
+ENV{ID_PART_ENTRY_UUID}==\"${partuuid}\", MODE=\"0666\", SYMLINK+=\"triedb\"
+"
+  if [[ -f "$rule" ]] && [[ "$(cat "$rule" 2>/dev/null)" == "$content" ]]; then
+    ok "udev rule for triedb SYMLINK already in place (PARTUUID=$partuuid)"
+    return
+  fi
+  if (( DRY_RUN )); then
+    echo "  ${C_DIM}[dry-run] write $rule with PARTUUID=$partuuid${C_RESET}"
+    return
+  fi
+  backup_file "$rule"
+  echo "$content" >"$rule"
+  ok "Wrote $rule (PARTUUID=$partuuid)"
+  run "reloading udev" udevadm control --reload-rules
+}
+
+# ===== Step: enable monad-cruft.timer =====
+step_cruft_timer() {
+  section "monad-cruft.timer (hourly cleanup)"
+  if ! systemctl cat monad-cruft.timer >/dev/null 2>&1; then
+    info "monad-cruft.timer not installed (will appear after monad package install)"
+    return
+  fi
+  if systemctl is-active --quiet monad-cruft.timer; then
+    ok "monad-cruft.timer already active"
+    return
+  fi
+  if (( DRY_RUN )); then
+    echo "  ${C_DIM}[dry-run] systemctl enable --now monad-cruft.timer${C_RESET}"
+    return
+  fi
+  run "enabling monad-cruft.timer" systemctl enable --now monad-cruft.timer
+  ok "monad-cruft.timer active"
+}
+
 # ===== Step: sysctl =====
 step_sysctl() {
   section "Kernel tuning (sysctl)"
@@ -613,14 +764,19 @@ EOF
   echo
 
   local failed=()
-  step_preflight       || failed+=("preflight")
-  step_sysctl          || failed+=("sysctl")
-  step_ulimits         || failed+=("ulimits")
-  step_io_scheduler    || failed+=("io-scheduler")
-  step_chrony          || failed+=("chrony")
-  step_monad_install   || failed+=("monad-install")
-  step_firewall        || failed+=("firewall")
-  step_monitoring      || failed+=("monitoring")
+  step_preflight        || failed+=("preflight")
+  step_dependencies     || failed+=("dependencies")
+  step_monad_user       || failed+=("monad-user")
+  step_sysctl           || failed+=("sysctl")
+  step_ulimits          || failed+=("ulimits")
+  step_io_scheduler     || failed+=("io-scheduler")
+  step_triedb_symlink   || failed+=("triedb-symlink")
+  step_chrony           || failed+=("chrony")
+  step_monad_install    || failed+=("monad-install")
+  step_cruft_timer      || failed+=("cruft-timer")
+  step_firewall         || failed+=("firewall")
+  step_iptables_ddos    || failed+=("iptables-ddos")
+  step_monitoring       || failed+=("monitoring")
   step_report
 
   if (( ${#failed[@]} > 0 )); then
