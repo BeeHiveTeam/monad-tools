@@ -4,9 +4,9 @@ Operator tooling for Monad validator nodes, by [BeeHive](https://bee-hive.work).
 
 | Tool | What | Lines |
 |---|---|---|
-| **[monad-doctor](doctor/)** | Pre-flight readiness check — hardware/OS/network/security/monad. 32 checks, 30 seconds. | ~500 |
-| **[monad-validator-setup](validator-setup/)** | One-shot host configuration — kernel tuning, IO scheduler, chrony, monad apt, UFW, optional monitoring. Idempotent, reversible. | ~400 |
-| **[monad-authudp-check](authudp-check/)** | Verify Auth UDP active for the 0.14.3 cutover; optional POST to public compliance tracker. | ~200 |
+| **[monad-doctor](doctor/)** | Pre-flight readiness check — hardware/OS/network/security/monad. **48 checks** in 30 seconds, JSON output, exits 0/1/2. | ~1150 |
+| **[monad-validator-setup](validator-setup/)** | One-shot host configuration — **13 steps**: deps → user → tuning → triedb → chrony → monad apt → bootstrap configs → UFW → iptables. Idempotent, `--dry-run`, `--network=testnet\|mainnet`. | ~910 |
+| **[monad-authudp-check](authudp-check/)** | Verify Auth UDP active. Two-tier version threshold (≥0.12.6 capable / ≥0.14.0 enforced). Optional `--post URL` to compliance tracker. | ~340 |
 
 Companion repo: [BeeHiveTeam/monad-grafana](https://github.com/BeeHiveTeam/monad-grafana) — Prometheus + Grafana monitoring stack with 47-panel dashboard, installs in one command.
 
@@ -19,24 +19,29 @@ Companion repo: [BeeHiveTeam/monad-grafana](https://github.com/BeeHiveTeam/monad
 git clone https://github.com/BeeHiveTeam/monad-tools.git
 cd monad-tools
 
-# 2. Check the server is ready
+# 2. Check the server is ready (48 checks, 30 seconds)
 sudo ./doctor/monad-doctor
 
-# 3. If READY (no FAIL): configure host
-sudo ./validator-setup/monad-validator-setup --with-monitoring
+# 3. If READY (no FAIL): configure host. Asks testnet/mainnet interactively,
+#    or pass --network=testnet|mainnet. Adds --with-monitoring for Grafana.
+sudo ./validator-setup/monad-validator-setup --network=testnet --with-monitoring
 
-# 4. Place your validator keys
+# 4. node.toml has been downloaded from $MF_BUCKET/config/<network>/latest/
+#    Edit it to set: beneficiary, node_name, Auth UDP keys
+sudo -u monad nano /home/monad/monad-bft/config/node.toml
+
+# 5. Place your validator keys
 sudo cp bls_priv_key secp_priv_key validator_id /home/monad/monad-bft/config/
 sudo chmod 600 /home/monad/monad-bft/config/{bls,secp}_priv_key
 sudo chown -R monad:monad /home/monad/monad-bft/config/
 
-# 5. Start services
+# 6. Start services
 sudo systemctl enable --now monad-execution monad-bft monad-rpc
 
-# 6. Verify Auth UDP active (timely with 0.14.3 cutover)
+# 7. Verify Auth UDP active (mandatory for 0.14.3+ cutover)
 sudo ./authudp-check/monad-authudp-check
 
-# 7. Open Grafana via SSH tunnel
+# 8. (with --with-monitoring) open Grafana via SSH tunnel
 ssh -L 3000:127.0.0.1:3000 -L 9090:127.0.0.1:9090 user@your.server
 # → http://localhost:3000  (admin / pass in /opt/monad-grafana/.env)
 ```
@@ -48,12 +53,14 @@ ssh -L 3000:127.0.0.1:3000 -L 9090:127.0.0.1:9090 user@your.server
 Setting up a Monad validator means walking through 30+ steps from the official docs, copy-pasting configurations and hoping you didn't miss a sysctl tunable. Most operators eventually learn the hard way that:
 
 - `vm.swappiness=60` causes vote_delay spikes when your server has 100+ GB RAM.
-- The triedb device must be on `mq-deadline` or random reads tank to ~10k IOPS.
+- The triedb device must be on `mq-deadline` AND **512-byte LBA** or random reads tank.
 - `systemd-timesyncd` drifts ~50ms and inflates p99 vote_delay metrics.
-- Default `unattended-upgrades` will randomly restart your node mid-epoch.
-- A consumer NVMe shows fine in `lsblk` but only does 80k random IOPS instead of the 500k+ datacenter SSDs hit.
+- Default `unattended-upgrades` will randomly restart your node mid-epoch (now configurable: `Automatic-Reboot=false`).
+- Kernel `6.8.0-{56..59}` has a known hang bug — operators have lost weeks debugging it.
+- **SMT/HyperThreading must be disabled in BIOS** per docs — easy to miss.
+- The validator node **must be on bare metal** — Foundation rejects KVM/cloud per VDP eligibility.
 
-These tools encode the lessons learned running a real Monad validator into runnable scripts. They don't replace the docs — they enforce them.
+These tools encode the lessons learned running a real Monad validator into runnable scripts. They don't replace the docs — they enforce them, with fix commands included for every WARN.
 
 ---
 

@@ -5,27 +5,30 @@ Verify your Monad node has Authenticated UDP active and won't be disconnected wh
 ```bash
 $ sudo ./monad-authudp-check
 
-monad-authudp-check  —  validator-1.example at 2026-05-06T17:09:10Z
-  ✓ version            monad 0.14.2 (Auth UDP available)
-  ! version.upgrade    newer version available: 0.14.3 (current 0.14.2)
+monad-authudp-check  —  validator-1 at 2026-05-07T16:13:46Z
+  ✓ version            monad 0.14.3 — fully compliant (≥0.14.0, Auth UDP enforced)
   ✓ service            monad-bft.service active
-  ✓ wireauth.logs      40 wireauth log entries in last 1000 lines
-  ✓ wireauth.peers     8 unique peers seen in keepalives
-  ✓ udp.port           UDP port 8000 listening (raptorcast/wireauth)
+  ✓ wireauth.logs      755 wireauth log entries in last 1000 lines
+  ✓ wireauth.peers     248 unique peers seen in keepalives
+  ✓ udp.8000           UDP port 8000 listening (consensus P2P)
+  ✓ udp.8001           UDP port 8001 listening (Authenticated UDP)
+  ✓ config.toml        all Auth UDP keys present in correct sections
 
-! OK — Auth UDP active but with warnings
+✓ READY — Auth UDP active, node compliant
 ```
 
 ## Why
 
-[Monad release 0.14.3 will drop support for non-authenticated UDP at the network level](https://docs.monad.xyz/node-ops/upgrade-instructions/authenticated-udp-checking). Nodes that have not migrated will be disconnected.
+[Monad release 0.14.3 dropped support for non-authenticated UDP at the network level](https://docs.monad.xyz/node-ops/upgrade-instructions/authenticated-udp-checking). Nodes that haven't migrated are disconnected.
 
 The official guidance is "running 0.14.x means you're set" — but it's worth verifying:
 
-- The package version (≥0.14.0)
-- That `monad_wireauth` log entries are actively being produced (proof Auth UDP is running, not just installed)
-- That UDP port 8000 is actually listening
-- That peer keepalives are flowing (proof peers acknowledge our authenticated handshake)
+- Package version is at least `0.12.6` (capability) and ideally `≥0.14.0` (fully compliant)
+- `monad-bft.service` is actually active
+- `monad_wireauth` log entries are flowing — proof Auth UDP code path is running
+- Both UDP **8000** (consensus P2P) AND **8001** (Auth UDP) are listening — they are different ports
+- `node.toml` has the 4 required keys in the **correct TOML sections** (`[peer_discovery]` and `[network]`)
+- Peer keepalives flowing — proof remote peers acknowledge our authenticated handshake
 
 ## Run
 
@@ -46,19 +49,49 @@ sudo ./monad-authudp-check --post URL    # post result to a compliance tracker
 
 ### CI / cron
 
-Add to operator's monitoring — fail loud if Auth UDP regresses:
-
 ```cron
 */15 * * * * /opt/monad-tools/authudp-check/monad-authudp-check --quiet --json | logger -t authudp-check
+```
+
+## Two-tier version threshold
+
+Per Foundation Discord (2026-05-06):
+> Running 0.14.x or later? You're all set — Authenticated UDP is already enforced and active on your node. Running before 0.14.0? Suggestion to upgrade as soon as possible.
+
+| Version | Status | Verdict |
+|---|---|---|
+| `≥0.14.0` | **PASS** | Fully compliant — 0.14.3 enforcement won't drop this node |
+| `0.12.6 ≤ v < 0.14.0` | **WARN** | Auth UDP capable but pre-0.14.0 (Foundation says "suggestion to upgrade") |
+| `<0.12.6` | **FAIL** | Upgrade required immediately |
+
+Override the thresholds via env if needed:
+
+```bash
+sudo MONAD_AUTHUDP_VERSION_MIN=0.12.6 MONAD_AUTHUDP_VERSION_REC=0.14.0 ./monad-authudp-check
 ```
 
 ## Exit codes
 
 | Code | Meaning |
 |---|---|
-| `0` | Auth UDP confirmed active |
+| `0` | Auth UDP confirmed active (or monad not installed — script bows out gracefully) |
 | `1` | Active but with warnings (e.g. upgrade available, low peer count) |
-| `2` | FAIL — node will be disconnected at next release |
+| `2` | FAIL — node will be disconnected by the network |
+
+If `monad` is not installed at all, the script prints a single info line and exits `0` instead of producing a wall of misleading FAIL'и (previous behaviour).
+
+## What it checks
+
+| Check | What | Why |
+|---|---|---|
+| `version` | dpkg `monad` version against two-tier threshold | Auth UDP shipped in 0.12.6, enforced from 0.14.0 |
+| `version.upgrade` | apt has newer | Foundation 48-hour upgrade SLA |
+| `service` | monad-bft.service active | Without it nothing else matters |
+| `wireauth.logs` | `monad_wireauth` entries in journal | Proof Auth UDP code path is running, not just compiled in |
+| `wireauth.peers` | unique peer addresses in keepalives (IPv4 + IPv6) | Proof peers acknowledge our handshake |
+| `udp.8000` | UDP port 8000 listening | Required for consensus P2P |
+| `udp.8001` | UDP port 8001 listening | Required for Authenticated UDP (separate from 8000) |
+| `config.toml` | All 4 Auth UDP keys present in correct TOML sections | `[peer_discovery]` → `self_auth_port`, `self_record_seq_num`, `self_name_record_sig`; `[network]` → `authenticated_bind_address_port`. Section-aware match — a key in the wrong section gives FAIL because monad won't pick it up. |
 
 ## --post compliance tracker (optional)
 
@@ -66,25 +99,12 @@ Add to operator's monitoring — fail loud if Auth UDP regresses:
 sudo ./monad-authudp-check --post https://monad-tech.com/api/authudp-report
 ```
 
-Submits result JSON to a public tracker. The BeeHive monad-tech site aggregates these into a network-wide compliance dashboard:
+Submits result JSON to a public tracker. The BeeHive [monad-tech.com](https://monad-tech.com) site aggregates these into a network-wide compliance dashboard:
 
-> **Auth UDP compliance: 187/200 active validators ready** (as of 2026-05-06)
+> **Auth UDP compliance: 187/200 active validators ready** (as of 2026-05-07)
 > Validators still on legacy UDP: 0xa1b2…, 0x3f4e…, …
 
-The compliance API is open to any operator; if you're maintaining a similar tracker, follow the same JSON schema and submit a PR to point this script at multiple endpoints.
-
-The result JSON is non-sensitive — only contains hostname (which you can override via `HOSTNAME=anonymous`), timestamp, version, and pass/fail status. No keys, no chain data.
-
-## What it checks
-
-| Check | What | Why |
-|---|---|---|
-| `version` | `dpkg -W monad` ≥ 0.14.0 | Auth UDP only enforced from 0.14.0+ |
-| `version.upgrade` | apt has newer | Stay current with releases |
-| `service` | monad-bft.service active | Without it nothing else matters |
-| `wireauth.logs` | `monad_wireauth` entries in journal | Proof Auth UDP code path is running |
-| `wireauth.peers` | unique peer addresses in keepalives | Proof peers acknowledge handshake |
-| `udp.port` | UDP 8000 listening | Required for raptorcast + auth-udp |
+The result JSON is non-sensitive — only contains hostname (override via `HOSTNAME=anonymous`), timestamp, version, and pass/fail status. No keys, no chain data.
 
 ## License
 

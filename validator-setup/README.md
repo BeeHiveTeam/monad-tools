@@ -1,50 +1,66 @@
 # monad-validator-setup
 
-One-shot host preparation for a Monad validator. Tunes the kernel, configures the firewall, installs the `monad` package and (optionally) the BeeHive monitoring stack — all idempotent, all reversible.
+One-shot host preparation for a Monad validator. Tunes the kernel, configures the firewall, installs the `monad` package, downloads the right config templates for your network — all idempotent, all reversible.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/BeeHiveTeam/monad-tools/main/validator-setup/monad-validator-setup | sudo bash -s -- --with-monitoring
+curl -fsSL https://raw.githubusercontent.com/BeeHiveTeam/monad-tools/main/validator-setup/monad-validator-setup \
+  | sudo bash -s -- --network=testnet --with-monitoring
 ```
 
-Replaces 30+ minutes of copy-pasting from docs with a single command. After it finishes, place your keys, start the services, and your validator is online.
+Replaces ~30 minutes of copy-pasting from docs with a single command. After it finishes, edit `node.toml`, place keys, start services, validator is online.
 
-## What it does
+## What it does (13 steps)
 
 1. **Pre-flight** — runs [`monad-doctor`](../doctor/) and aborts on FAIL (override with `--skip-preflight`)
-2. **`/etc/sysctl.d/99-monad-validator.conf`** — `rmem_max`, `wmem_max`, `netdev_max_backlog`, `file-max`, `swappiness=1`, `tcp_fastopen`
-3. **`/etc/security/limits.d/99-monad-validator.conf`** — `nofile=1048576` for all users + root
-4. **IO scheduler** — `mq-deadline` on the largest NVMe (or `--triedb-dev=nvmeXnY`), persisted via udev rule
-5. **chrony** — replaces `systemd-timesyncd` if active (sub-millisecond NTP for accurate `vote_delay`)
-6. **Monad apt package** — adds the official repository (signed-by) and installs `monad`
-7. **UFW** — opens `22/tcp` (SSH), `8000/8001 tcp+udp` (Monad P2P + raptorcast)
-8. **(optional)** Calls the [BeeHive monad-grafana](https://github.com/BeeHiveTeam/monad-grafana) installer when `--with-monitoring` is set
+2. **Dependencies** — `apt install -y curl nvme-cli aria2 jq ethtool ufw iptables iptables-persistent` (per docs)
+3. **Monad user + dirs** — `useradd -m -s /bin/bash monad` and the 4 directories under `/home/monad/monad-bft/` listed in docs (`config`, `ledger`, `config/forkpoint`, `config/validators`)
+4. **`/etc/sysctl.d/99-monad-validator.conf`** — `rmem_max`, `wmem_max`, `netdev_max_backlog`, `file-max=2097152`, `swappiness=1`, `tcp_fastopen=3`
+5. **`/etc/security/limits.d/99-monad-validator.conf`** — `nofile=1048576`
+6. **IO scheduler** — `mq-deadline` on the triedb device. Selection priority: `--triedb-dev=` flag → `/dev/triedb` symlink → unused NVMe (largest, never picks an OS-RAID member). Persisted via udev rule that matches by attribute (`rotational=0`, `nvme*`) so swapping the disk doesn't silently regress.
+7. **TriedB SYMLINK udev rule** — writes `/etc/udev/rules.d/99-triedb.rules` with `ENV{ID_PART_ENTRY_UUID}==<PARTUUID>, MODE="0666", SYMLINK+="triedb"` exactly per docs format. Skips gracefully if no triedb partition exists yet.
+8. **chrony** — replaces `systemd-timesyncd` (sub-millisecond NTP for accurate `vote_delay`)
+9. **Monad apt package** — adds `https://pkg.category.xyz/` (Category Labs, official) using deb822 `.sources` format with signing key at `/etc/apt/keyrings/category-labs.gpg`. Installs `monad=$MONAD_PKG_VERSION` (default `0.14.3`).
+10. **Bootstrap configs** — downloads `.env` and `node.toml` from `$MF_BUCKET/config/<network>/latest/` per docs. Validator gets `node.toml`; full-node gets `full-node-node.toml` (toggle with `--full-node`). Idempotent: preserves existing files (no overwrite).
+11. **`monad-cruft.timer`** — auto-enables hourly cleanup (was previously left to operator)
+12. **UFW** — `22/tcp` (SSH), `8000/tcp+udp` (P2P), `8001/udp` (Auth UDP only — not TCP)
+13. **iptables UDP DDoS filter** — `iptables -I INPUT -p udp --dport 8000 -m length --length 0:1400 -j DROP` per docs, persisted via `netfilter-persistent save`
+14. **(optional)** `--with-monitoring` runs the BeeHive monad-grafana installer
+15. JSON post-install report at `/var/lib/monad-validator-setup/report-<ts>.json`
 
 ## What it does NOT do
 
 - **Does not generate or import validator keys.** Keys are sensitive — you place them yourself in `/home/monad/monad-bft/config/`.
-- **Does not start `monad-bft.service`.** Without keys this would just crash-loop. Operator starts services after key placement.
-- **Does not modify any file without backup.** Every existing file is copied to `<file>.bak.<timestamp>` before edit.
+- **Does not start `monad-bft.service`.** Without keys this would just crash-loop.
+- **Does not modify any file without backup.** Existing files are copied to `<file>.bak.<timestamp>` before edit.
+- **Does not install OTEL collector.** Out of scope — would conflict with monad-grafana's `otelcol-contrib`. Monad's apt package installs `otelcol` itself.
 
 ## Run
 
 ```bash
-# Interactive (recommended first time)
+# Interactive (asks testnet/mainnet)
 sudo ./monad-validator-setup
 
-# Show what would change without doing it
-sudo ./monad-validator-setup --dry-run
+# Skip the prompt
+sudo ./monad-validator-setup --network=testnet
+sudo ./monad-validator-setup --network=mainnet
 
-# Non-interactive (CI / automation)
-sudo ./monad-validator-setup --non-interactive
+# Full-node template instead of validator
+sudo ./monad-validator-setup --network=testnet --full-node
+
+# Show what would change without doing it
+sudo ./monad-validator-setup --network=testnet --dry-run
+
+# Non-interactive (CI / automation) — --network is REQUIRED
+sudo ./monad-validator-setup --network=testnet --non-interactive
 
 # With Grafana monitoring stack
-sudo ./monad-validator-setup --with-monitoring
+sudo ./monad-validator-setup --network=testnet --with-monitoring
 
-# Pin a specific NVMe as triedb device
-sudo ./monad-validator-setup --triedb-dev=nvme1n1
+# Pin a specific NVMe as triedb device (overrides /dev/triedb autodetect)
+sudo ./monad-validator-setup --network=testnet --triedb-dev=nvme1n1
 
-# Skip preflight (you already ran monad-doctor)
-sudo ./monad-validator-setup --skip-preflight
+# Skip preflight if you already ran monad-doctor
+sudo ./monad-validator-setup --network=testnet --skip-preflight
 ```
 
 ## After install — next steps
@@ -52,28 +68,45 @@ sudo ./monad-validator-setup --skip-preflight
 The installer prints these explicitly. Summarized:
 
 ```bash
-# 1. Place keys
+# 1. Edit node.toml (template was downloaded to /home/monad/monad-bft/config/node.toml)
+sudo -u monad nano /home/monad/monad-bft/config/node.toml
+#    Set: beneficiary, node_name, Auth UDP keys
+#    For Auth UDP: run monad-sign-name-record to generate self_name_record_sig
+
+# 2. Place keys
 sudo cp bls_priv_key secp_priv_key validator_id /home/monad/monad-bft/config/
 sudo chmod 600 /home/monad/monad-bft/config/{bls,secp}_priv_key
 sudo chown -R monad:monad /home/monad/monad-bft/config/
 
-# 2. Configure node.toml — peer_discovery_servers, external_address
-
 # 3. Start services
 sudo systemctl enable --now monad-execution monad-bft monad-rpc
 
-# 4. Verify
+# 4. Verify health
 sudo /opt/monad-tools/doctor/monad-doctor
+sudo /opt/monad-tools/authudp-check/monad-authudp-check
 journalctl -u monad-bft -f
 ```
 
 ## Idempotency
 
 Safe to re-run any number of times. Each step:
-- Checks current state first (e.g. "is chrony already active?")
+- Checks current state first ("is chrony already active?")
 - Skips changes if state matches desired
 - Backs up before modifying
 - Files written are deterministic — re-running produces identical content
+- `step_config_files` preserves existing `.env` / `node.toml` (delete first to re-download)
+
+## Error handling
+
+If any step fails, `do_install` collects the failed names and exits 1 with a summary instead of pretending success:
+
+```
+═══════════════════════════════════════════════════
+  Setup INCOMPLETE — failed steps: monad-install firewall
+═══════════════════════════════════════════════════
+  See log for details: /tmp/monad-validator-setup-...log
+  Re-run after fixing, or open an issue.
+```
 
 ## Uninstall
 
@@ -81,22 +114,21 @@ Safe to re-run any number of times. Each step:
 sudo ./monad-validator-setup --uninstall
 ```
 
-Removes the three config files written by the installer:
+Removes the config files written by the installer:
 - `/etc/sysctl.d/99-monad-validator.conf`
 - `/etc/security/limits.d/99-monad-validator.conf`
 - `/etc/udev/rules.d/60-monad-triedb-scheduler.rules`
 
 It does NOT remove:
-- The `monad` apt package — `sudo apt remove monad` if you want
-- chrony, ufw, monad-grafana — independent of this tool
-- Your validator keys, configs, chain data — these are yours, your responsibility
+- `/etc/udev/rules.d/99-triedb.rules` (TriedB SYMLINK — required for monad to find triedb at boot)
+- The `monad` apt package — `sudo apt-mark unhold monad && sudo apt remove monad` if you want
+- chrony, ufw, monad-grafana, iptables rules — independent of this tool
+- Validator keys, configs, chain data — your responsibility
 
 ## Logs and reports
 
 - Per-run log: `/tmp/monad-validator-setup-YYYYMMDD-HHMMSS.log`
 - Post-install JSON report: `/var/lib/monad-validator-setup/report-YYYYMMDD-HHMMSS.json`
-
-The report captures hostname, kernel, OS, monad version, paths to written config files. Useful for support tickets and for verifying drift over time.
 
 ## Configurable values
 
@@ -104,15 +136,20 @@ Override via environment variable:
 
 | Variable | Default | What it controls |
 |---|---|---|
+| `MONAD_APT_REPO` | `https://pkg.category.xyz/` | Category Labs apt source URL (per docs) |
+| `MONAD_APT_SUITE` | `noble` | apt suite (only `noble` exists upstream) |
+| `MONAD_APT_KEY_URL` | `${MONAD_APT_REPO}/category-labs.gpg` | GPG signing key |
+| `MONAD_APT_KEYRING` | `/etc/apt/keyrings/category-labs.gpg` | local keyring path |
+| `MONAD_PKG_VERSION` | `0.14.3` | pinned package version (set empty for `latest`) |
+| `MF_BUCKET` | `https://bucket.monadinfra.com` | Foundation config bucket |
 | `SYSCTL_RMEM` / `SYSCTL_WMEM` | `16777216` | UDP receive/send buffer max (raptorcast) |
 | `SYSCTL_FILE_MAX` | `2097152` | system-wide file descriptor limit |
-| `SYSCTL_SWAPPINESS` | `1` | discourage swapping |
+| `SYSCTL_SWAPPINESS` | `1` | discourage swapping (validator must not swap) |
 | `ULIMIT_NOFILE` | `1048576` | per-user file descriptor limit |
-| `MONAD_APT_REPO` | `https://apt.monad.xyz` | apt source URL |
 
 Example:
 ```bash
-sudo SYSCTL_FILE_MAX=4194304 ./monad-validator-setup --non-interactive
+sudo MONAD_PKG_VERSION=0.14.3 ./monad-validator-setup --network=mainnet --non-interactive
 ```
 
 ## License
