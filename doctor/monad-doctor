@@ -971,6 +971,36 @@ check_authudp_config() {
   fi
 }
 
+check_github_release() {
+  # Cross-check against the canonical GitHub release tag. Useful when apt is
+  # not yet configured (greenfield host) or its cache is stale.
+  # Independent source of truth — GitHub releases/latest excludes pre-releases.
+  if ! command -v curl >/dev/null; then return; fi
+  local latest installed
+  installed=$(dpkg-query -W -f='${Version}' monad 2>/dev/null || true)
+  latest=$(curl -fsS -m 5 -H 'Accept: application/vnd.github+json' \
+    https://api.github.com/repos/category-labs/monad-bft/releases/latest 2>/dev/null \
+    | grep -oE '"tag_name":[^,]+' | head -1 \
+    | grep -oE 'v[0-9.]+(-[a-z0-9.]+)?' | sed 's/^v//')
+  if [[ -z "$latest" ]]; then
+    emit monad "monad.upstream" INFO "GitHub API unreachable (offline or rate-limited)"
+    return
+  fi
+  if [[ -z "$installed" ]]; then
+    emit monad "monad.upstream" INFO "GitHub latest stable: v$latest (monad not installed yet)"
+  elif [[ "$latest" == "$installed" ]]; then
+    emit monad "monad.upstream" PASS "matches GitHub latest stable (v$latest)"
+  else
+    # Distinguish "we're ahead" (e.g. on RC) vs "we're behind"
+    if printf '%s\n%s\n' "$latest" "$installed" | sort -V -C 2>/dev/null; then
+      emit monad "monad.upstream" INFO "installed v$installed > GitHub latest stable v$latest (RC or pre-release?)"
+    else
+      emit monad "monad.upstream" WARN "GitHub stable v$latest > installed v$installed" \
+           "Upgrade: apt-mark unhold monad; apt update; apt install --only-upgrade monad; apt-mark hold monad"
+    fi
+  fi
+}
+
 check_monad_install() {
   # dpkg -l states: ii=installed, hi=hold+installed, rc=removed-config, etc.
   # Match anything where 2nd char is 'i' (installed).
@@ -1039,7 +1069,8 @@ main() {
   run_section security  check_ssh_hardening check_unattended_upgrades check_fail2ban \
                         check_rpc_exposure check_iptables_udp_filter check_cve_2026_31431 \
                         check_nvme_cli
-  run_section monad     check_monad_user check_triedb_device check_monad_install check_authudp_config
+  run_section monad     check_monad_user check_triedb_device check_monad_install \
+                        check_github_release check_authudp_config
 
   if [[ $JSON_OUTPUT -eq 1 ]]; then
     print_json
