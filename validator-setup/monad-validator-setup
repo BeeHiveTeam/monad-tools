@@ -63,8 +63,13 @@ MONAD_APT_REPO="${MONAD_APT_REPO:-https://pkg.category.xyz/}"
 MONAD_APT_SUITE="${MONAD_APT_SUITE:-noble}"
 MONAD_APT_KEY_URL="${MONAD_APT_KEY_URL:-https://pkg.category.xyz/category-labs.gpg}"
 MONAD_APT_KEYRING="${MONAD_APT_KEYRING:-/etc/apt/keyrings/category-labs.gpg}"
-# Pin version per docs (testnet+mainnet currently use 0.14.2). Set empty for "latest".
-MONAD_PKG_VERSION="${MONAD_PKG_VERSION:-0.14.2}"
+# Pin version per docs — testnet and mainnet currently ship different versions.
+# Source: https://docs.monad.xyz/node-ops/full-node-installation
+# Resolved after --network=/choose_network. Set MONAD_PKG_VERSION explicitly to override
+# both defaults, or set it empty to install "latest" available in the apt repo.
+MONAD_PKG_VERSION_TESTNET="${MONAD_PKG_VERSION_TESTNET:-0.14.3}"
+MONAD_PKG_VERSION_MAINNET="${MONAD_PKG_VERSION_MAINNET:-0.14.2}"
+MONAD_PKG_VERSION="${MONAD_PKG_VERSION-__auto__}"   # __auto__ = pick by NETWORK later
 
 # UFW ports per docs:
 #   - SSH (22/tcp)
@@ -134,6 +139,7 @@ confirm() {
 choose_network() {
   if [[ -n "$NETWORK" ]]; then
     info "Network: ${C_BOLD}${NETWORK}${C_RESET} (from --network=${NETWORK})"
+    resolve_pkg_version
     return 0
   fi
   if [[ $NON_INTERACTIVE -eq 1 ]]; then
@@ -153,6 +159,22 @@ choose_network() {
     esac
   done
   info "Network: ${C_BOLD}${NETWORK}${C_RESET}"
+  resolve_pkg_version
+}
+
+# Resolve MONAD_PKG_VERSION from per-network defaults if user did not set it
+# explicitly. Empty value means "install latest available in apt repo".
+resolve_pkg_version() {
+  if [[ "$MONAD_PKG_VERSION" == "__auto__" ]]; then
+    case "$NETWORK" in
+      testnet) MONAD_PKG_VERSION="$MONAD_PKG_VERSION_TESTNET" ;;
+      mainnet) MONAD_PKG_VERSION="$MONAD_PKG_VERSION_MAINNET" ;;
+      *)       MONAD_PKG_VERSION="" ;;
+    esac
+    info "Pinned monad version for ${NETWORK}: ${C_BOLD}${MONAD_PKG_VERSION:-latest}${C_RESET} (default per docs)"
+  else
+    info "Pinned monad version: ${C_BOLD}${MONAD_PKG_VERSION:-latest}${C_RESET} (from MONAD_PKG_VERSION env)"
+  fi
 }
 
 run() {

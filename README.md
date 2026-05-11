@@ -4,7 +4,7 @@ Operator tooling for Monad validator nodes, by [BeeHive](https://bee-hive.work).
 
 | Tool | What | Lines |
 |---|---|---|
-| **[monad-doctor](doctor/)** | Pre-flight readiness check — hardware/OS/network/security/monad. **48 checks** in 30 seconds, JSON output, exits 0/1/2. | ~1150 |
+| **[monad-doctor](doctor/)** | Pre-flight readiness check — hardware/OS/network/security/monad. **50 checks** in 30 seconds, JSON output, exits 0/1/2. | ~1200 |
 | **[monad-validator-setup](validator-setup/)** | One-shot host configuration — **13 steps**: deps → user → tuning → triedb → chrony → monad apt → bootstrap configs → UFW → iptables. Idempotent, `--dry-run`, `--network=testnet\|mainnet`. | ~910 |
 | **[monad-authudp-check](authudp-check/)** | Verify Auth UDP active. Two-tier version threshold (≥0.12.6 capable / ≥0.14.0 enforced). Optional `--post URL` to compliance tracker. | ~340 |
 
@@ -19,7 +19,7 @@ Companion repo: [BeeHiveTeam/monad-grafana](https://github.com/BeeHiveTeam/monad
 git clone https://github.com/BeeHiveTeam/monad-tools.git
 cd monad-tools
 
-# 2. Check the server is ready (48 checks, 30 seconds)
+# 2. Check the server is ready (50 checks, 30 seconds)
 sudo ./doctor/monad-doctor
 
 # 3. If READY (no FAIL): configure host. Asks testnet/mainnet interactively,

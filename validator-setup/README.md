@@ -19,7 +19,7 @@ Replaces ~30 minutes of copy-pasting from docs with a single command. After it f
 6. **IO scheduler** — `mq-deadline` on the triedb device. Selection priority: `--triedb-dev=` flag → `/dev/triedb` symlink → unused NVMe (largest, never picks an OS-RAID member). Persisted via udev rule that matches by attribute (`rotational=0`, `nvme*`) so swapping the disk doesn't silently regress.
 7. **TriedB SYMLINK udev rule** — writes `/etc/udev/rules.d/99-triedb.rules` with `ENV{ID_PART_ENTRY_UUID}==<PARTUUID>, MODE="0666", SYMLINK+="triedb"` exactly per docs format. Skips gracefully if no triedb partition exists yet.
 8. **chrony** — replaces `systemd-timesyncd` (sub-millisecond NTP for accurate `vote_delay`)
-9. **Monad apt package** — adds `https://pkg.category.xyz/` (Category Labs, official) using deb822 `.sources` format with signing key at `/etc/apt/keyrings/category-labs.gpg`. Installs `monad=$MONAD_PKG_VERSION` (default `0.14.3`).
+9. **Monad apt package** — adds `https://pkg.category.xyz/` (Category Labs, official) using deb822 `.sources` format with signing key at `/etc/apt/keyrings/category-labs.gpg`. Installs `monad=$MONAD_PKG_VERSION`. Default is **per-network per docs**: testnet → `0.14.3`, mainnet → `0.14.2`. Override with `MONAD_PKG_VERSION=` env var (empty = install latest available).
 10. **Bootstrap configs** — downloads `.env` and `node.toml` from `$MF_BUCKET/config/<network>/latest/` per docs. Validator gets `node.toml`; full-node gets `full-node-node.toml` (toggle with `--full-node`). Idempotent: preserves existing files (no overwrite).
 11. **`monad-cruft.timer`** — auto-enables hourly cleanup (was previously left to operator)
 12. **UFW** — `22/tcp` (SSH), `8000/tcp+udp` (P2P), `8001/udp` (Auth UDP only — not TCP)
@@ -140,7 +140,9 @@ Override via environment variable:
 | `MONAD_APT_SUITE` | `noble` | apt suite (only `noble` exists upstream) |
 | `MONAD_APT_KEY_URL` | `${MONAD_APT_REPO}/category-labs.gpg` | GPG signing key |
 | `MONAD_APT_KEYRING` | `/etc/apt/keyrings/category-labs.gpg` | local keyring path |
-| `MONAD_PKG_VERSION` | `0.14.3` | pinned package version (set empty for `latest`) |
+| `MONAD_PKG_VERSION_TESTNET` | `0.14.3` | pinned testnet version (per docs) |
+| `MONAD_PKG_VERSION_MAINNET` | `0.14.2` | pinned mainnet version (per docs) |
+| `MONAD_PKG_VERSION` | unset (auto-pick by `--network=`) | overrides both defaults; set empty for `latest` |
 | `MF_BUCKET` | `https://bucket.monadinfra.com` | Foundation config bucket |
 | `SYSCTL_RMEM` / `SYSCTL_WMEM` | `16777216` | UDP receive/send buffer max (raptorcast) |
 | `SYSCTL_FILE_MAX` | `2097152` | system-wide file descriptor limit |
@@ -149,7 +151,7 @@ Override via environment variable:
 
 Example:
 ```bash
-sudo MONAD_PKG_VERSION=0.14.3 ./monad-validator-setup --network=mainnet --non-interactive
+sudo MONAD_PKG_VERSION=0.14.3 ./monad-validator-setup --network=testnet --non-interactive
 ```
 
 ## License

@@ -427,13 +427,18 @@ check_disks() {
     fi
   done <<<"$topo"
 
-  # If no triedb yet, recommend an unused candidate.
+  # If no triedb yet, recommend an unused candidate. If none — WARN: there
+  # is no free NVMe for triedb, so validator-setup will require --triedb-dev
+  # or fail entirely (all disks are RAID members / mounted / swap).
   if [[ ! -L /dev/triedb ]]; then
     local cand
     cand=$(echo "$topo" | awk -F'\t' -v min="$DISK_GB_TRIEDB_MIN" \
       '$3=="unused" {gsub(/[^0-9.]/,"",$2); if ($2+0 >= 0) print $1, $2}')
     if [[ -n "$cand" ]]; then
       emit hardware "disk.triedb-candidate" INFO "candidate(s) for /dev/triedb: $(echo "$cand" | tr '\n' ',' )"
+    else
+      emit hardware "disk.triedb-candidate" WARN "no unused NVMe for /dev/triedb — every disk is RAID/mounted/swap; validator-setup will need --triedb-dev or fail" \
+           "Add a dedicated NVMe for triedb, or repartition to free one (triedb must NOT share with OS RAID)"
     fi
   fi
 
@@ -556,18 +561,35 @@ check_os() {
   fi
 }
 
+kernel_upgrade_tip() {
+  # On Ubuntu <24.04 the `linux-generic-hwe-24.04` package does not exist
+  # (HWE meta-packages target their own LTS). Reinstall is the only way to
+  # reach kernel ≥${KERNEL_MIN}-${KERNEL_MIN_PATCH}. On 24.04 the HWE rolls
+  # forward as new generic kernels ship.
+  local ver_id=""
+  if [[ -r /etc/os-release ]]; then
+    ver_id=$(. /etc/os-release && echo "${VERSION_ID:-}")
+  fi
+  if [[ -n "$ver_id" ]] && ver_ge "$ver_id" "$UBUNTU_VERSION_MIN"; then
+    echo "Upgrade: apt install --install-recommends linux-generic-hwe-24.04"
+  else
+    echo "Reinstall with Ubuntu ${UBUNTU_VERSION_MIN}+ first — HWE on older releases does not reach ${KERNEL_MIN}-${KERNEL_MIN_PATCH}"
+  fi
+}
+
 check_kernel() {
-  local full base patch
+  local full base patch tip
   full=$(uname -r)              # e.g. "6.8.0-60-generic"
   base=$(echo "$full" | cut -d- -f1)
   patch=$(echo "$full" | sed -nE 's/^[0-9]+\.[0-9]+\.[0-9]+-([0-9]+).*/\1/p')
+  tip=$(kernel_upgrade_tip)
 
   # Reject buggy 6.8.0-{56..59} range explicitly (docs cite this hang bug)
   if [[ "$base" == "6.8.0" && -n "$patch" ]]; then
     for bad in $KERNEL_BUGGY_PATCHES; do
       if [[ "$patch" == "$bad" ]]; then
         emit os "kernel.version"  FAIL "kernel $full — known buggy range 6.8.0-${KERNEL_BUGGY_PATCHES// /,} (causes Monad client hangs)" \
-             "Upgrade: apt install --install-recommends linux-generic-hwe-24.04"
+             "$tip"
         return
       fi
     done
@@ -577,13 +599,13 @@ check_kernel() {
   if ver_ge "$base" "$KERNEL_MIN"; then
     if [[ "$base" == "$KERNEL_MIN" && -n "$patch" && "$patch" -lt "$KERNEL_MIN_PATCH" ]]; then
       emit os "kernel.version"  FAIL "kernel $full — need ≥${KERNEL_MIN}-${KERNEL_MIN_PATCH}" \
-           "Upgrade: apt install --install-recommends linux-generic-hwe-24.04"
+           "$tip"
     else
       emit os "kernel.version"  PASS "$full"
     fi
   else
     emit os "kernel.version"    FAIL "kernel $base — need ≥${KERNEL_MIN}-${KERNEL_MIN_PATCH}" \
-         "Upgrade: apt install --install-recommends linux-generic-hwe-24.04"
+         "$tip"
   fi
 }
 
@@ -822,11 +844,14 @@ check_iptables_udp_filter() {
 check_cve_2026_31431() {
   # Per Foundation Discord 2026-04-30 (ACTION RECOMMENDED):
   # algif_aead kernel module LPE — blacklist as mitigation.
+  # PASS only if blacklisted (true mitigation). WARN if not loaded but not
+  # blacklisted — module is one `modprobe` away from being exploitable.
   if [[ -f /etc/modprobe.d/disable-algif.conf ]] \
      && grep -q 'algif_aead' /etc/modprobe.d/disable-algif.conf 2>/dev/null; then
     emit security "cve.2026-31431" PASS "algif_aead blacklisted (CVE-2026-31431 mitigated)"
   elif ! lsmod 2>/dev/null | grep -q algif_aead; then
-    emit security "cve.2026-31431" PASS "algif_aead not loaded (CVE-2026-31431 not exploitable currently)"
+    emit security "cve.2026-31431" WARN "algif_aead not blacklisted — module not loaded now but can be loaded any time (CVE-2026-31431 LPE)" \
+         "echo 'install algif_aead /bin/false' | sudo tee /etc/modprobe.d/disable-algif.conf"
   else
     emit security "cve.2026-31431" WARN "algif_aead loaded and not blacklisted — CVE-2026-31431 (LPE) unmitigated" \
          "echo 'install algif_aead /bin/false' | sudo tee /etc/modprobe.d/disable-algif.conf"
@@ -932,6 +957,44 @@ check_triedb_device() {
     fi
   else
     emit monad "monad.triedb"    INFO "/dev/triedb not present (created on first monad-mpt run)"
+  fi
+}
+
+check_triedb_udev() {
+  # Docs require a udev rule mapping the triedb partition's PARTUUID to the
+  # /dev/triedb symlink so it survives reboot regardless of disk enumeration.
+  # https://docs.monad.xyz/node-ops/full-node-installation (TrieDB section)
+  local rule=/etc/udev/rules.d/99-triedb.rules
+  if [[ -f "$rule" ]]; then
+    if grep -qE 'SYMLINK\+="?triedb"?' "$rule" 2>/dev/null; then
+      emit monad "monad.triedb-udev" PASS "$rule present with SYMLINK+=\"triedb\" rule"
+    else
+      emit monad "monad.triedb-udev" WARN "$rule exists but no SYMLINK+=\"triedb\" entry — /dev/triedb may not appear on reboot" \
+           "Re-create the rule per docs: udev rule must contain SYMLINK+=\"triedb\""
+    fi
+  else
+    if [[ -L /dev/triedb ]]; then
+      emit monad "monad.triedb-udev" WARN "no $rule — /dev/triedb may disappear after reboot if created manually" \
+           "Create per docs: ENV{ID_PART_ENTRY_UUID}==\"<PARTUUID>\", MODE=\"0666\", SYMLINK+=\"triedb\""
+    else
+      emit monad "monad.triedb-udev" INFO "$rule not present (created during validator-setup)"
+    fi
+  fi
+}
+
+check_cruft_timer() {
+  # monad-cruft.timer is a stock hourly cleanup unit shipped by the monad
+  # package (drops old artifacts so disk doesn't fill). Docs list it among
+  # required services. systemctl returns non-zero if unit is missing/disabled.
+  if systemctl cat monad-cruft.timer >/dev/null 2>&1; then
+    if systemctl is-enabled --quiet monad-cruft.timer 2>/dev/null; then
+      emit monad "monad.cruft-timer" PASS "monad-cruft.timer enabled (hourly artifact cleanup)"
+    else
+      emit monad "monad.cruft-timer" WARN "monad-cruft.timer present but not enabled — old artifacts will accumulate" \
+           "systemctl enable --now monad-cruft.timer"
+    fi
+  else
+    emit monad "monad.cruft-timer" INFO "monad-cruft.timer not installed (ships with monad package)"
   fi
 }
 
@@ -1069,7 +1132,8 @@ main() {
   run_section security  check_ssh_hardening check_unattended_upgrades check_fail2ban \
                         check_rpc_exposure check_iptables_udp_filter check_cve_2026_31431 \
                         check_nvme_cli
-  run_section monad     check_monad_user check_triedb_device check_monad_install \
+  run_section monad     check_monad_user check_triedb_device check_triedb_udev \
+                        check_cruft_timer check_monad_install \
                         check_github_release check_authudp_config
 
   if [[ $JSON_OUTPUT -eq 1 ]]; then
