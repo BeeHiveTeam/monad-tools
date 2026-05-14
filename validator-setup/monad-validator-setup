@@ -12,7 +12,8 @@
 #   6. Add Monad apt repository and install `monad` package
 #   7. Configure UFW firewall (Monad ports + SSH)
 #   8. Optionally install BeeHive monad-grafana monitoring stack
-#   9. Print post-install report and next steps for keys + start
+#   9. Optionally enable VDP OTel push to Monad Foundation (--with-vdp-otel)
+#  10. Print post-install report and next steps for keys + start
 #
 # What it deliberately does NOT do:
 #   - Generate or import validator keys (you must do this manually)
@@ -27,6 +28,7 @@
 #   sudo ./monad-validator-setup --dry-run             # show what would change
 #   sudo ./monad-validator-setup --triedb-dev=nvme1n1
 #   sudo ./monad-validator-setup --with-monitoring     # also install monad-grafana
+#   sudo ./monad-validator-setup --with-vdp-otel       # run MF VDP OTel push setup (testnet first!)
 #   sudo ./monad-validator-setup --skip-preflight      # skip monad-doctor
 #   sudo ./monad-validator-setup --uninstall           # remove (best-effort)
 
@@ -37,6 +39,7 @@ NON_INTERACTIVE=0
 DRY_RUN=0
 SKIP_PREFLIGHT=0
 WITH_MONITORING=0
+WITH_VDP_OTEL=0
 TRIEDB_DEV=""
 NETWORK=""                  # testnet | mainnet — asked interactively if empty
 NODE_TYPE="validator"       # validator | full — affects which node.toml to fetch
@@ -102,6 +105,7 @@ while [[ $# -gt 0 ]]; do
     --dry-run)         DRY_RUN=1 ;;
     --skip-preflight)  SKIP_PREFLIGHT=1 ;;
     --with-monitoring) WITH_MONITORING=1 ;;
+    --with-vdp-otel)   WITH_VDP_OTEL=1 ;;
     --triedb-dev=*)    TRIEDB_DEV="${1#*=}" ;;
     --network=*)       NETWORK="${1#*=}" ;;
     --node-type=*)     NODE_TYPE="${1#*=}" ;;
@@ -778,6 +782,65 @@ step_monitoring() {
     | bash -s -- --non-interactive
 }
 
+# Per MF email (May 2026): every validator must push OTel metrics to
+# otel-external.monadinfra.com:443 for VDP compliance. MF distributes the setup
+# script via bucket.monadinfra.com with a verified sha256.
+#
+# Pinned sha256 for /tmp/otel-validator-setup.sh that was current as of 2026-05-14.
+# If MF rotates the script, this check will (intentionally) fail — re-fetch the
+# new sha256 from the official email/Discord before relaxing.
+VDP_OTEL_SETUP_URL="${VDP_OTEL_SETUP_URL:-https://bucket.monadinfra.com/tmp/otel-validator-setup.sh}"
+VDP_OTEL_SETUP_SHA256="${VDP_OTEL_SETUP_SHA256:-92cca0add5456db13c792b6e1b484999724b348ebd41a40a73d7f42086f26a23}"
+
+step_vdp_otel_push() {
+  if (( WITH_VDP_OTEL == 0 )); then
+    info "Skipping VDP OTel push setup (use --with-vdp-otel to enable; testnet first!)"
+    return 0
+  fi
+  section "VDP OTel push (Monad Foundation metrics export)"
+
+  # Critical pre-conditions: KEYSTORE_PASSWORD must be in /home/monad/.env
+  # (set by the operator when generating SECP/BLS keys). Without it, monad-keystore
+  # can't recover the SECP pubkey that the MF script needs for the resource label.
+  if [[ ! -f /home/monad/.env ]] || ! grep -q "^KEYSTORE_PASSWORD=" /home/monad/.env 2>/dev/null; then
+    err "/home/monad/.env missing or has no KEYSTORE_PASSWORD — set it after generating keys"
+    err "Skipping VDP setup. Re-run with --with-vdp-otel once keys are placed."
+    return 1
+  fi
+
+  # Bail out cleanly if the operator runs a custom otelcol-contrib (e.g. ours
+  # extended with journald → Loki). The MF script targets plain otelcol and would
+  # write to /etc/otelcol/config.yaml which a contrib service doesn't read,
+  # producing no error but no compliance either.
+  if systemctl is-active --quiet otelcol-contrib 2>/dev/null; then
+    warn "otelcol-contrib.service is active — MF setup script targets plain 'otelcol' and may NOT work on contrib setups"
+    warn "Refer to https://github.com/BeeHiveTeam/monad-tools/blob/main/docs/vdp-otel-push.md"
+    warn "Skipping --with-vdp-otel auto-apply. Apply the equivalent manually (see wiki) and re-check with monad-doctor."
+    return 0
+  fi
+
+  if (( DRY_RUN )); then
+    echo "  ${C_DIM}[dry-run] curl -fsSL -o /tmp/otel-validator-setup.sh $VDP_OTEL_SETUP_URL${C_RESET}"
+    echo "  ${C_DIM}[dry-run] sha256sum -c against $VDP_OTEL_SETUP_SHA256${C_RESET}"
+    echo "  ${C_DIM}[dry-run] sudo bash /tmp/otel-validator-setup.sh${C_RESET}"
+    return 0
+  fi
+
+  info "Downloading MF VDP setup script…"
+  curl -fsSL -o /tmp/otel-validator-setup.sh "$VDP_OTEL_SETUP_URL" \
+    || { err "Failed to download $VDP_OTEL_SETUP_URL"; return 1; }
+
+  info "Verifying sha256…"
+  if ! echo "$VDP_OTEL_SETUP_SHA256  /tmp/otel-validator-setup.sh" | sha256sum -c; then
+    err "SHA-256 mismatch — MF may have rotated the script."
+    err "Verify the new sha256 from MF email/Discord and update VDP_OTEL_SETUP_SHA256."
+    return 1
+  fi
+
+  info "Running MF VDP setup (idempotent on re-runs)…"
+  bash /tmp/otel-validator-setup.sh
+}
+
 # ===== Step: report =====
 step_report() {
   section "Post-install report"
@@ -909,6 +972,7 @@ EOF
   step_firewall         || failed+=("firewall")
   step_iptables_ddos    || failed+=("iptables-ddos")
   step_monitoring       || failed+=("monitoring")
+  step_vdp_otel_push    || failed+=("vdp-otel-push")
   step_report
 
   if (( ${#failed[@]} > 0 )); then

@@ -1117,6 +1117,120 @@ ${C_BOLD}${C_PURPLE}
 EOF
 }
 
+check_vdp_otel_collector() {
+  # MF VDP (May 2026 email) requires every validator to push OTel metrics to
+  # otel-external.monadinfra.com:443. That needs an active OTel collector.
+  # Plain `otelcol` ships with Monad apt package; `otelcol-contrib` is sometimes
+  # installed separately for journald receivers (logs → Loki). Either is fine —
+  # VDP only cares the push works.
+  local active=""
+  for svc in otelcol otelcol-contrib; do
+    if systemctl is-active --quiet "$svc" 2>/dev/null; then
+      active="$svc"
+      break
+    fi
+  done
+  if [[ -z "$active" ]]; then
+    emit monad "vdp.otel-collector" FAIL "no active OTel collector — VDP requires metrics push to MF" \
+         "Monad apt package installs otelcol; ensure: sudo systemctl enable --now otelcol"
+    return
+  fi
+  emit monad "vdp.otel-collector" PASS "$active.service active"
+}
+
+check_vdp_otel_version() {
+  # MF VDP setup script (May 2026) targets otelcol >= 0.139.0 — earlier versions
+  # lack the resource processor attributes used by MF config.
+  local required="0.139.0"
+  local bin=""
+  for svc in otelcol otelcol-contrib; do
+    if systemctl is-active --quiet "$svc" 2>/dev/null && command -v "$svc" >/dev/null 2>&1; then
+      bin="$svc"
+      break
+    fi
+  done
+  if [[ -z "$bin" ]]; then
+    emit monad "vdp.otel-version" INFO "no active OTel collector to version-check"
+    return
+  fi
+  local ver
+  ver=$("$bin" --version 2>/dev/null | awk '{print $NF; exit}')
+  if [[ -z "$ver" ]]; then
+    emit monad "vdp.otel-version" WARN "could not determine $bin version"
+    return
+  fi
+  if dpkg --compare-versions "$ver" ge "$required" 2>/dev/null; then
+    emit monad "vdp.otel-version" PASS "$bin v$ver (>= $required required by MF setup script)"
+  else
+    emit monad "vdp.otel-version" WARN "$bin v$ver < $required — MF setup script targets $required" \
+         "MF setup script auto-installs the right version; or upgrade manually: apt install otelcol=$required-1"
+  fi
+}
+
+check_vdp_secp_key_label() {
+  # MF VDP compliance check: every monad_* metric served by local Prometheus
+  # exporter on :8889 must carry a secp_key="<pubkey>" label so MF can identify
+  # the validator. This is exactly what the MF script's idempotency-check looks for.
+  if ! command -v curl >/dev/null 2>&1; then
+    emit monad "vdp.secp-key-label" INFO "curl not installed — skipping VDP label check"
+    return
+  fi
+  local metrics_url="http://localhost:8889/metrics"
+  local payload
+  payload=$(curl -sf --max-time 5 "$metrics_url" 2>/dev/null) || {
+    emit monad "vdp.secp-key-label" WARN "could not reach $metrics_url — OTel collector may not be exposing :8889" \
+         "Check binding: ss -tln | grep 8889 (Monad apt config or MF setup script should bind it)"
+    return
+  }
+  local secp
+  secp=$(printf '%s\n' "$payload" | grep -oE 'secp_key="[0-9a-f]{2,}"' | head -1 | sed 's/secp_key="\([0-9a-f]*\)"/\1/')
+  if [[ -z "$secp" ]]; then
+    emit monad "vdp.secp-key-label" FAIL "metrics on :8889 lack 'secp_key' label — NOT VDP-compliant" \
+         "Run MF setup (testnet first): curl -fsSL -o /tmp/x.sh bucket.monadinfra.com/tmp/otel-validator-setup.sh && verify sha256 then sudo bash /tmp/x.sh"
+    return
+  fi
+  local len=${#secp}
+  if [[ $len -ge 64 ]]; then
+    emit monad "vdp.secp-key-label" PASS "metrics tagged with secp_key=${secp:0:8}…${secp: -4} (VDP-compliant)"
+  else
+    emit monad "vdp.secp-key-label" WARN "secp_key label present but unusually short ($len chars)"
+  fi
+}
+
+check_vdp_mf_push() {
+  # MF push uses OTLP gRPC over TLS to otel-external.monadinfra.com:443 (Cloudflare-fronted).
+  # We confirm a live push by counting ESTABLISHED TLS connections from the
+  # otelcol process to :443 destinations.
+  if ! command -v ss >/dev/null 2>&1; then
+    emit monad "vdp.mf-push" INFO "ss not available — skipping connection check"
+    return
+  fi
+  local otel_pids=""
+  for svc in otelcol otelcol-contrib; do
+    if systemctl is-active --quiet "$svc" 2>/dev/null; then
+      local pid
+      pid=$(systemctl show "$svc" --property=MainPID --value 2>/dev/null)
+      [[ -n "$pid" && "$pid" != "0" ]] && otel_pids="$otel_pids $pid"
+    fi
+  done
+  if [[ -z "$otel_pids" ]]; then
+    emit monad "vdp.mf-push" INFO "no active otelcol process — already covered by vdp.otel-collector"
+    return
+  fi
+  local conns=0
+  for pid in $otel_pids; do
+    local c
+    c=$(ss -tnp 2>/dev/null | awk -v pid="pid=$pid," '$0 ~ pid && $5 ~ /:443$/' | wc -l)
+    conns=$((conns + c))
+  done
+  if (( conns >= 1 )); then
+    emit monad "vdp.mf-push" PASS "OTel collector has $conns active TLS connection(s) to :443 — push to MF appears active"
+  else
+    emit monad "vdp.mf-push" WARN "no ESTABLISHED :443 connections from otelcol — push to MF may not be configured" \
+         "Verify exporter 'otlp/monadinfra' → https://otel-external.monadinfra.com:443; check: journalctl -u <svc> | grep -i monadinfra"
+  fi
+}
+
 run_section() {
   local name="$1"; shift
   [[ -n "$SECTION" && "$SECTION" != "$name" ]] && return
@@ -1134,7 +1248,9 @@ main() {
                         check_nvme_cli
   run_section monad     check_monad_user check_triedb_device check_triedb_udev \
                         check_cruft_timer check_monad_install \
-                        check_github_release check_authudp_config
+                        check_github_release check_authudp_config \
+                        check_vdp_otel_collector check_vdp_otel_version \
+                        check_vdp_secp_key_label check_vdp_mf_push
 
   if [[ $JSON_OUTPUT -eq 1 ]]; then
     print_json
