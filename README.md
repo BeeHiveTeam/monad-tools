@@ -1,12 +1,11 @@
 # monad-tools
 
-Operator tooling for Monad validator nodes, by [BeeHive](https://bee-hive.work). Three single-file bash scripts, zero external dependencies for the diagnostic ones, opinionated defaults that match what we run in production.
+Operator tooling for Monad validator nodes, by [BeeHive](https://bee-hive.work). Two single-file bash scripts, zero external dependencies for the diagnostic one, opinionated defaults that match what we run in production.
 
 | Tool | What | Lines |
 |---|---|---|
-| **[monad-doctor](doctor/)** | Pre-flight readiness check — hardware/OS/network/security/monad. **50 checks** in 30 seconds, JSON output, exits 0/1/2. | ~1200 |
-| **[monad-validator-setup](validator-setup/)** | One-shot host configuration — **13 steps**: deps → user → tuning → triedb → chrony → monad apt → bootstrap configs → UFW → iptables. Idempotent, `--dry-run`, `--network=testnet\|mainnet`. | ~910 |
-| **[monad-authudp-check](authudp-check/)** | Verify Auth UDP active. Two-tier version threshold (≥0.12.6 capable / ≥0.14.0 enforced). Optional `--post URL` to compliance tracker. | ~340 |
+| **[monad-doctor](doctor/)** | Pre-flight readiness check — hardware/OS/network/security/monad/VDP. **54 checks** in 30 seconds, JSON output, exits 0/1/2. Auth UDP config + runtime verification included. | ~1330 |
+| **[monad-validator-setup](validator-setup/)** | One-shot host configuration — **14 steps**: deps → user → tuning → triedb → chrony → monad apt → bootstrap configs → UFW → iptables → (optional) VDP OTel push. Idempotent, `--dry-run`, `--network=testnet\|mainnet`. | ~1000 |
 
 Companion repo: [BeeHiveTeam/monad-grafana](https://github.com/BeeHiveTeam/monad-grafana) — Prometheus + Grafana monitoring stack with 47-panel dashboard, installs in one command.
 
@@ -19,11 +18,12 @@ Companion repo: [BeeHiveTeam/monad-grafana](https://github.com/BeeHiveTeam/monad
 git clone https://github.com/BeeHiveTeam/monad-tools.git
 cd monad-tools
 
-# 2. Check the server is ready (50 checks, 30 seconds)
+# 2. Check the server is ready (54 checks, 30 seconds)
 sudo ./doctor/monad-doctor
 
 # 3. If READY (no FAIL): configure host. Asks testnet/mainnet interactively,
-#    or pass --network=testnet|mainnet. Adds --with-monitoring for Grafana.
+#    or pass --network=testnet|mainnet. Adds --with-monitoring for Grafana,
+#    --with-vdp-otel for MF metrics push compliance (testnet first).
 sudo ./validator-setup/monad-validator-setup --network=testnet --with-monitoring
 
 # 4. node.toml has been downloaded from $MF_BUCKET/config/<network>/latest/
@@ -38,8 +38,8 @@ sudo chown -R monad:monad /home/monad/monad-bft/config/
 # 6. Start services
 sudo systemctl enable --now monad-execution monad-bft monad-rpc
 
-# 7. Verify Auth UDP active (mandatory for 0.14.3+ cutover)
-sudo ./authudp-check/monad-authudp-check
+# 7. Verify everything healthy (incl. Auth UDP runtime + config, VDP push)
+sudo ./doctor/monad-doctor
 
 # 8. (with --with-monitoring) open Grafana via SSH tunnel
 ssh -L 3000:127.0.0.1:3000 -L 9090:127.0.0.1:9090 user@your.server

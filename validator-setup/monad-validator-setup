@@ -904,12 +904,10 @@ ${C_BOLD}Next steps (network: ${NETWORK:-?}, type: ${NODE_TYPE}):${C_RESET}
   5. Watch logs:
      journalctl -u monad-bft -f
 
-  6. Verify everything healthy:
+  6. Verify everything healthy (incl. Auth UDP config + runtime, VDP push):
      sudo $DOCTOR_PATH
 
-  7. Verify Auth UDP active:
-     sudo $(dirname "$DOCTOR_PATH")/../authudp-check/monad-authudp-check
-     # Foundation's official check:
+  7. Optional — Foundation's official Auth UDP check:
      curl -fsSL https://bucket.monadinfra.com/scripts/validate-auth-udp-config.sh | bash
 
   Logs:   $LOG_FILE

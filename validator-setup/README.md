@@ -84,7 +84,6 @@ sudo systemctl enable --now monad-execution monad-bft monad-rpc
 
 # 4. Verify health
 sudo /opt/monad-tools/doctor/monad-doctor
-sudo /opt/monad-tools/authudp-check/monad-authudp-check
 journalctl -u monad-bft -f
 ```
 
