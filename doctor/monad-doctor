@@ -801,9 +801,44 @@ check_firewall() {
       emit network "net.firewall" WARN "ufw active but missing rules for: $missing" \
            $'Quick fix:   '"$(for s in $missing; do printf 'sudo ufw allow %s; ' "$s"; done)"$'\nAuto:        monad-validator-setup → step_firewall adds all required rules.\nVerify:      sudo ufw status verbose\nWhy:         peers cannot reach this node on the missing port → desyncs, no votes.'
     fi
+
+    # Lockout guard: ufw is active — make sure SSH is whitelisted on whatever
+    # port sshd actually listens on. Hardcoded 22 isn't enough because operators
+    # commonly move SSH; if rules don't match the active port, ANY ufw reload
+    # locks the operator out of their own validator.
+    local _ssh_ports_detected=""
+    [[ -n "${SSH_CONNECTION:-}" ]] && _ssh_ports_detected=$(awk '{print $NF}' <<<"$SSH_CONNECTION")
+    if [[ -r /etc/ssh/sshd_config ]]; then
+      local _from_cfg
+      _from_cfg=$(sshd -T 2>/dev/null | awk '/^port / {print $2}')
+      [[ -n "$_from_cfg" ]] && _ssh_ports_detected="$_ssh_ports_detected $_from_cfg"
+    fi
+    _ssh_ports_detected=$(tr ' ' '\n' <<<"$_ssh_ports_detected" \
+                          | awk 'NF && /^[0-9]+$/' | sort -u | tr '\n' ' ')
+    _ssh_ports_detected="${_ssh_ports_detected% }"
+    if [[ -n "$_ssh_ports_detected" ]]; then
+      local _ssh_missing=""
+      for _p in $_ssh_ports_detected; do
+        if ! echo "$ufw_status" | grep -qE "^${_p}/tcp.*ALLOW|^${_p}[[:space:]].*ALLOW"; then
+          _ssh_missing+="$_p "
+        fi
+      done
+      if [[ -z "$_ssh_missing" ]]; then
+        emit network "ssh.firewall" PASS "SSH port(s) ${_ssh_ports_detected} whitelisted in ufw"
+      else
+        emit network "ssh.firewall" FAIL "ufw active but does NOT allow SSH port(s): ${_ssh_missing}" \
+             $'DANGER:      next `ufw reload` or rule change can drop your SSH session.\nQuick fix:   for p in '"${_ssh_missing}"$'; do sudo ufw allow ${p}/tcp comment "ssh ${p}"; done\nVerify:      sudo ufw status | grep -E "'"$(echo "$_ssh_missing" | tr ' ' '|')"$'"/tcp"\nWhy:         operators frequently move SSH off :22; if ufw whitelist is stale\n             (still allows only :22 while sshd moved to :2222), the next reload\n             locks the operator out — recovery requires console/KVM.'
+      fi
+    fi
   elif require_cmd ufw; then
+    # Suggest the *actual* SSH port (from this connection if available, else
+    # sshd_config). Hardcoding 22/tcp here would lock out operators on custom ports.
+    local _ssh_port=""
+    [[ -n "${SSH_CONNECTION:-}" ]] && _ssh_port=$(awk '{print $NF}' <<<"$SSH_CONNECTION")
+    [[ -z "$_ssh_port" && -r /etc/ssh/sshd_config ]] && _ssh_port=$(sshd -T 2>/dev/null | awk '/^port / {print $2; exit}')
+    [[ -z "$_ssh_port" ]] && _ssh_port="22"
     emit network "net.firewall" WARN "ufw installed but inactive — no firewall protection" \
-         $'Quick fix:   sudo ufw allow 22/tcp\n             sudo ufw allow 8000             # tcp+udp (consensus P2P)\n             sudo ufw allow 8001/udp         # authenticated UDP\n             sudo ufw --force enable\nAuto:        monad-validator-setup → step_firewall does this idempotently.\nVerify:      sudo ufw status verbose\nWhy:         a publicly reachable validator without a firewall exposes management/\n             OS services to the open internet. ufw default-deny is a one-line win.'
+         $'Quick fix:   sudo ufw allow '"$_ssh_port"$'/tcp     # SSH (detected — verify before enabling!)\n             sudo ufw allow 8000             # tcp+udp (consensus P2P)\n             sudo ufw allow 8001/udp         # authenticated UDP\n             sudo ufw --force enable\nAuto:        monad-validator-setup → step_firewall auto-detects SSH port and whitelists it.\nVerify:      sudo ufw status verbose\nDANGER:      double-check SSH port BEFORE `ufw enable`. Wrong port → lockout.\nWhy:         a publicly reachable validator without a firewall exposes management/\n             OS services to the open internet. ufw default-deny is a one-line win.'
   elif require_cmd nft || require_cmd iptables; then
     emit network "net.firewall" INFO "nftables/iptables in use (manual config) — ensure $NET_PORTS_REQUIRED open"
   else

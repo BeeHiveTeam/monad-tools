@@ -78,10 +78,13 @@ MONAD_PKG_VERSION_MAINNET="${MONAD_PKG_VERSION_MAINNET:-0.14.2}"
 MONAD_PKG_VERSION="${MONAD_PKG_VERSION-__auto__}"   # __auto__ = pick by NETWORK later
 
 # UFW ports per docs:
-#   - SSH (22/tcp)
+#   - SSH (default 22/tcp, but auto-detected — operators commonly move SSH)
 #   - 8000 (TCP+UDP — consensus P2P)
 #   - 8001/udp (Authenticated UDP)
-UFW_SSH_PORT="22"
+# UFW_SSH_PORT is a space-separated list, populated by detect_ssh_ports()
+# at runtime if empty. Override via env (e.g. UFW_SSH_PORT="22 2222") to
+# pin specific ports.
+UFW_SSH_PORT="${UFW_SSH_PORT:-}"
 UFW_P2P_PORT="8000"        # both TCP and UDP
 UFW_AUTHUDP_PORT="8001"    # UDP only
 
@@ -140,6 +143,47 @@ confirm() {
   local ans
   read -rp "${C_YELLOW}?${C_RESET} $1 [Y/n] " ans
   [[ ! "$ans" =~ ^[Nn]$ ]]
+}
+
+# Detect ports SSH actually listens on. We must NEVER hardcode 22/tcp into the
+# UFW rules — operators very commonly move SSH (`Port 2222`) as a defense
+# against bruteforce, and `ufw allow 22/tcp + ufw enable` would lock them out.
+# Sources (merged + deduped):
+#   1. $SSH_CONNECTION (when run inside an SSH session): the LAST field is the
+#      server port we're connected on right now. Guaranteed-not-locked-out port.
+#   2. sshd_config `Port` directive(s) — may have multiple.
+#   3. Live `ss -tlnp` output for the sshd process — handles non-standard configs.
+# Returns a space-separated list. Falls back to "22" only if all sources empty.
+detect_ssh_ports() {
+  local ports=""
+  # Source 1: current SSH session
+  if [[ -n "${SSH_CONNECTION:-}" ]]; then
+    local cur_port
+    cur_port=$(awk '{print $NF}' <<<"$SSH_CONNECTION")
+    [[ "$cur_port" =~ ^[0-9]+$ ]] && ports+="$cur_port "
+  fi
+  # Source 2: sshd_config (handle multiple Port lines + Include directives)
+  if [[ -r /etc/ssh/sshd_config ]]; then
+    local sshd_ports
+    sshd_ports=$(sshd -T 2>/dev/null | awk '/^port / {print $2}')
+    [[ -z "$sshd_ports" ]] && sshd_ports=$(grep -hE '^\s*Port\s+[0-9]+' \
+      /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null \
+      | awk '{print $2}')
+    ports+="$sshd_ports "
+  fi
+  # Source 3: live listening ports of sshd (catches setups where the daemon
+  # was reconfigured but config file lags reality).
+  if command -v ss >/dev/null 2>&1; then
+    local live
+    live=$(ss -tlnp 2>/dev/null | awk '/users:\(\("sshd"/ {split($4,a,":"); print a[length(a)]}')
+    ports+="$live "
+  fi
+  # Dedupe and validate
+  local unique
+  unique=$(tr ' ' '\n' <<<"$ports" | awk 'NF && /^[0-9]+$/' | sort -u | tr '\n' ' ')
+  unique="${unique% }"
+  [[ -z "$unique" ]] && unique="22"
+  echo "$unique"
 }
 
 # Ask the operator to choose network if not provided via --network=.
@@ -815,13 +859,32 @@ step_firewall() {
     run "installing ufw" apt-get install -y ufw
   fi
 
+  # Detect SSH port(s) at runtime if not pinned via env. Operators very commonly
+  # move SSH off :22; allowing only 22/tcp + ufw enable would lock them out.
+  if [[ -z "$UFW_SSH_PORT" ]]; then
+    UFW_SSH_PORT=$(detect_ssh_ports)
+    info "Detected SSH port(s): ${C_BOLD}${UFW_SSH_PORT}${C_RESET}"
+    if [[ "$UFW_SSH_PORT" == "22" ]]; then
+      info "(default — override with UFW_SSH_PORT=\"22 2222 ...\" if your config differs)"
+    fi
+  else
+    info "SSH port(s) from env: ${C_BOLD}${UFW_SSH_PORT}${C_RESET}"
+  fi
+
   if (( DRY_RUN )); then
-    echo "  ${C_DIM}[dry-run] configure UFW: allow ${UFW_SSH_PORT}/tcp, ${UFW_P2P_PORT} (tcp+udp), ${UFW_AUTHUDP_PORT}/udp${C_RESET}"
+    local p_dry
+    for p_dry in $UFW_SSH_PORT; do
+      echo "  ${C_DIM}[dry-run] ufw allow ${p_dry}/tcp${C_RESET}"
+    done
+    echo "  ${C_DIM}[dry-run] ufw allow ${UFW_P2P_PORT} (tcp+udp), ${UFW_AUTHUDP_PORT}/udp${C_RESET}"
     return 0
   fi
 
-  # SSH (avoid lockout!)
-  ufw allow "${UFW_SSH_PORT}/tcp" comment 'ssh' >>"$LOG_FILE" 2>&1 || true
+  # SSH (avoid lockout!) — allow EVERY detected port, not just the default 22.
+  local p
+  for p in $UFW_SSH_PORT; do
+    ufw allow "${p}/tcp" comment "ssh (port ${p})" >>"$LOG_FILE" 2>&1 || true
+  done
   # 8000: consensus P2P — both TCP and UDP per docs
   ufw allow "${UFW_P2P_PORT}/tcp" comment 'monad p2p (tcp)' >>"$LOG_FILE" 2>&1 || true
   ufw allow "${UFW_P2P_PORT}/udp" comment 'monad p2p (udp/raptorcast)' >>"$LOG_FILE" 2>&1 || true
@@ -829,14 +892,14 @@ step_firewall() {
   ufw allow "${UFW_AUTHUDP_PORT}/udp" comment 'monad authenticated udp' >>"$LOG_FILE" 2>&1 || true
 
   if ! ufw status | grep -q "Status: active"; then
-    if confirm "Enable UFW now?"; then
+    if confirm "Enable UFW now? (SSH allowed on: ${UFW_SSH_PORT})"; then
       ufw --force enable >>"$LOG_FILE" 2>&1
-      ok "UFW enabled"
+      ok "UFW enabled (SSH allowed on ${UFW_SSH_PORT})"
     else
       warn "UFW configured but not enabled — run 'sudo ufw enable' when ready"
     fi
   else
-    ok "UFW rules added"
+    ok "UFW rules added (SSH allowed on ${UFW_SSH_PORT})"
   fi
 }
 
