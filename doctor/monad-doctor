@@ -1117,6 +1117,41 @@ ${C_BOLD}${C_PURPLE}
 EOF
 }
 
+check_authudp_peers() {
+  # Runtime visibility into Auth UDP health: count unique peer endpoints that
+  # have sent keepalives recently. Complements monad.authudp (which only
+  # confirms the receiver is logging) and monad.authudp-cfg (which only
+  # confirms node.toml has the right keys).
+  #
+  # Thresholds chosen from operational experience:
+  #   ≥5 peers → healthy mesh
+  #   1-4 peers → restart artefact or NAT trouble — investigate
+  #   0 peers → Auth UDP not actually negotiating; service may be running
+  #             but isolated (firewall, missing self_name_record_sig, etc.)
+  if ! command -v journalctl >/dev/null; then
+    emit monad "monad.authudp-peers" INFO "journalctl unavailable — cannot count keepalive peers"
+    return
+  fi
+  if ! systemctl is-active --quiet monad-bft 2>/dev/null; then
+    emit monad "monad.authudp-peers" INFO "monad-bft not active — skipping peer count"
+    return
+  fi
+  # remote_addr may be IPv4 ("1.2.3.4:port") or IPv6 ("[::1]:port"). Match both.
+  local peers
+  peers=$(journalctl -u monad-bft -n 2000 --no-pager 2>/dev/null \
+    | grep 'sending keepalive packet' \
+    | grep -oE 'remote_addr":"[^"]+' \
+    | sort -u | wc -l)
+  if (( peers >= 5 )); then
+    emit monad "monad.authudp-peers" PASS "$peers unique peers in recent keepalives (healthy mesh)"
+  elif (( peers > 0 )); then
+    emit monad "monad.authudp-peers" WARN "only $peers peer(s) in keepalives — small set, check NAT/firewall" \
+         "Verify: journalctl -u monad-bft -n 2000 | grep 'sending keepalive packet'"
+  else
+    emit monad "monad.authudp-peers" INFO "no recent keepalive activity — Auth UDP may not be negotiating or DEBUG logs disabled"
+  fi
+}
+
 check_vdp_otel_collector() {
   # MF VDP (May 2026 email) requires every validator to push OTel metrics to
   # otel-external.monadinfra.com:443. That needs an active OTel collector.
@@ -1248,7 +1283,7 @@ main() {
                         check_nvme_cli
   run_section monad     check_monad_user check_triedb_device check_triedb_udev \
                         check_cruft_timer check_monad_install \
-                        check_github_release check_authudp_config \
+                        check_github_release check_authudp_config check_authudp_peers \
                         check_vdp_otel_collector check_vdp_otel_version \
                         check_vdp_secp_key_label check_vdp_mf_push
 

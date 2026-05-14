@@ -4,7 +4,7 @@ Operator tooling for Monad validator nodes, by [BeeHive](https://bee-hive.work).
 
 | Tool | What | Lines |
 |---|---|---|
-| **[monad-doctor](doctor/)** | Pre-flight readiness check — hardware/OS/network/security/monad/VDP. **54 checks** in 30 seconds, JSON output, exits 0/1/2. Auth UDP config + runtime verification included. | ~1330 |
+| **[monad-doctor](doctor/)** | Pre-flight readiness check — hardware/OS/network/security/monad/VDP. **55 checks** in 30 seconds, JSON output, exits 0/1/2. Auth UDP config + runtime verification included. | ~1330 |
 | **[monad-validator-setup](validator-setup/)** | One-shot host configuration — **14 steps**: deps → user → tuning → triedb → chrony → monad apt → bootstrap configs → UFW → iptables → (optional) VDP OTel push. Idempotent, `--dry-run`, `--network=testnet\|mainnet`. | ~1000 |
 
 Companion repo: [BeeHiveTeam/monad-grafana](https://github.com/BeeHiveTeam/monad-grafana) — Prometheus + Grafana monitoring stack with 47-panel dashboard, installs in one command.
@@ -18,7 +18,7 @@ Companion repo: [BeeHiveTeam/monad-grafana](https://github.com/BeeHiveTeam/monad
 git clone https://github.com/BeeHiveTeam/monad-tools.git
 cd monad-tools
 
-# 2. Check the server is ready (54 checks, 30 seconds)
+# 2. Check the server is ready (55 checks, 30 seconds)
 sudo ./doctor/monad-doctor
 
 # 3. If READY (no FAIL): configure host. Asks testnet/mainnet interactively,

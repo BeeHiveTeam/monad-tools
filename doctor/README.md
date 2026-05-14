@@ -2,7 +2,7 @@
 
 Pre-flight readiness check for Monad validator nodes. Single bash script, zero dependencies (except `fio` for the optional IOPS test, `ethtool` for bandwidth, `nvme-cli` for the LBA fix command), runs on any modern Ubuntu server.
 
-**54 checks across 5 sections** — tells you in 30 seconds whether your server is ready to be a Monad validator (incl. VDP OTel push compliance), and exactly what to fix if not.
+**55 checks across 5 sections** — tells you in 30 seconds whether your server is ready to be a Monad validator (incl. VDP OTel push compliance), and exactly what to fix if not.
 
 ```
 $ sudo ./monad-doctor --quick
@@ -104,7 +104,7 @@ sudo ./monad-doctor --no-color            # plain text (CI)
 
 `--section` validates against the allow-list (`hardware`, `os`, `network`, `security`, `monad`) — typos exit with code 64, never silent false PASS.
 
-## What it checks (54 checks)
+## What it checks (55 checks)
 
 | Section | Checks |
 |---|---|
@@ -112,7 +112,7 @@ sudo ./monad-doctor --no-color            # plain text (CI)
 | **OS** (8) | Distro **Ubuntu 24.04+** (apt repo only ships `noble`) · **kernel ≥6.8.0-60** + reject buggy `6.8.0-{56..59}` range · `LimitNOFILE` on monad-bft.service · `fs.file-max` · `net.core.rmem_max/wmem_max` · `vm.swappiness` · NTP (chrony preferred) |
 | **NETWORK** (8) | Public IP · NAT detect · **bandwidth ≥300 Mbit/s** (validator) / 100 Mbit/s (full-node) via ethtool · port 8000/tcp · 8000/udp · 8001/udp (proto-aware!) · ufw rules cover all required port/proto pairs |
 | **SECURITY** (10) | SSH `PasswordAuthentication` · `PermitRootLogin` (softened to INFO when PasswordAuth=no) · unattended-upgrades **with `Automatic-Reboot=false`** (not full disable — security patches still applied) · fail2ban · **`rpc.exposure`** (UFW 8080/8081 publicly open = VDP violation) · **`iptables.udp-filter`** (`-m length 0:1400` per docs) · **`cve.2026-31431`** (algif_aead blacklist per Foundation 4/30) · `deps.nvme-cli` (utility for fix commands) |
-| **MONAD** (12) | system user `monad` · `/dev/triedb` symlink · **`monad.triedb-udev`** (`/etc/udev/rules.d/99-triedb.rules` with `SYMLINK+="triedb"` so symlink survives reboot) · **`monad.cruft-timer`** (hourly artifact cleanup, ships with package) · package state (incl. apt hold) · current vs available version · **`monad.upstream`** (GitHub releases/latest, independent of apt cache) · Auth UDP active (wireauth log entries) · 4 Auth UDP keys in `node.toml` in **correct TOML sections** (`[peer_discovery]` and `[network]`) · **VDP**: `vdp.otel-collector` (otelcol or otelcol-contrib active) · `vdp.otel-version` (≥0.139.0 per MF setup) · `vdp.secp-key-label` (metrics tagged with `secp_key=` — actual MF compliance signal) · `vdp.mf-push` (live TLS to `otel-external.monadinfra.com:443`) |
+| **MONAD** (13) | system user `monad` · `/dev/triedb` symlink · **`monad.triedb-udev`** (`/etc/udev/rules.d/99-triedb.rules` with `SYMLINK+="triedb"` so symlink survives reboot) · **`monad.cruft-timer`** (hourly artifact cleanup, ships with package) · package state (incl. apt hold) · current vs available version · **`monad.upstream`** (GitHub releases/latest, independent of apt cache) · Auth UDP active (wireauth log entries) · 4 Auth UDP keys in `node.toml` in **correct TOML sections** (`[peer_discovery]` and `[network]`) · **`monad.authudp-peers`** (count unique peers in recent keepalives — ≥5 healthy, 1-4 WARN, 0 INFO) · **VDP**: `vdp.otel-collector` (otelcol or otelcol-contrib active) · `vdp.otel-version` (≥0.139.0 per MF setup) · `vdp.secp-key-label` (metrics tagged with `secp_key=` — actual MF compliance signal) · `vdp.mf-push` (live TLS to `otel-external.monadinfra.com:443`) |
 
 ## Exit codes
 
