@@ -76,6 +76,33 @@ $ sudo ./monad-doctor --quick
 
 Other validator install guides tell you the requirements. This script verifies you actually meet them.
 
+## Extended fix hints (FAIL / WARN)
+
+Every FAIL and WARN comes with a multi-line hint following a consistent format:
+
+```
+  ! sysctl.swappiness              vm.swappiness=60 — high
+    → Quick fix:   echo "vm.swappiness = 1" | sudo tee -a /etc/sysctl.d/99-monad-validator.conf
+    →              sudo sysctl --system
+    → Auto:        monad-validator-setup → step_sysctl sets vm.swappiness=1.
+    → Verify:      sysctl vm.swappiness   # 1
+    → Why:         default 60 swaps anonymous pages aggressively; for a validator with hot
+    →              working set this introduces 10-100ms read latency and missed votes.
+```
+
+| Field | Purpose |
+|---|---|
+| `Quick fix:` | One command to paste — the immediate remediation |
+| `Auto:` | The `monad-validator-setup` step that does this for you (when applicable) |
+| `Investigate:` | Diagnostic commands (when root cause must be found first) |
+| `Verify:` | How to confirm the fix worked |
+| `Why:` | The operational consequence of leaving it broken |
+| `DANGER:` | Lock-yourself-out / data-loss warnings (LBA reformat, sshd edits) |
+
+The same content is preserved in `--json` output (newlines round-trip via `\n` in the `fix` field), so CI / dashboards see the full hint, not a truncated single line.
+
+For non-automatable cases (BIOS access, destructive reformats, reinstalls), see [`docs/MANUAL_FIXES.md`](../docs/MANUAL_FIXES.md).
+
 ## Run
 
 ### One-liner

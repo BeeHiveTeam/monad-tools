@@ -9,7 +9,7 @@ curl -fsSL https://raw.githubusercontent.com/BeeHiveTeam/monad-tools/main/valida
 
 Replaces ~30 minutes of copy-pasting from docs with a single command. After it finishes, edit `node.toml`, place keys, start services, validator is online.
 
-## What it does (14 steps)
+## What it does (17 steps)
 
 1. **Pre-flight** — runs [`monad-doctor`](../doctor/) and aborts on FAIL (override with `--skip-preflight`)
 2. **Dependencies** — `apt install -y curl nvme-cli aria2 jq ethtool ufw iptables iptables-persistent` (per docs)
@@ -22,18 +22,19 @@ Replaces ~30 minutes of copy-pasting from docs with a single command. After it f
 9. **Monad apt package** — adds `https://pkg.category.xyz/` (Category Labs, official) using deb822 `.sources` format with signing key at `/etc/apt/keyrings/category-labs.gpg`. Installs `monad=$MONAD_PKG_VERSION`. Default is **per-network per docs**: testnet → `0.14.3`, mainnet → `0.14.2`. Override with `MONAD_PKG_VERSION=` env var (empty = install latest available).
 10. **Bootstrap configs** — downloads `.env` and `node.toml` from `$MF_BUCKET/config/<network>/latest/` per docs. Validator gets `node.toml`; full-node gets `full-node-node.toml` (toggle with `--full-node`). Idempotent: preserves existing files (no overwrite).
 11. **`monad-cruft.timer`** — auto-enables hourly cleanup (was previously left to operator)
-12. **UFW** — `22/tcp` (SSH), `8000/tcp+udp` (P2P), `8001/udp` (Auth UDP only — not TCP)
-13. **iptables UDP DDoS filter** — `iptables -I INPUT -p udp --dport 8000 -m length --length 0:1400 -j DROP` per docs, persisted via `netfilter-persistent save`
-14. **(optional)** `--with-monitoring` runs the BeeHive monad-grafana installer
-15. **(optional)** `--with-vdp-otel` runs the MF VDP setup script after sha256 verification (pinned default; override with `VDP_OTEL_SETUP_SHA256=` env if MF rotates). **Bails cleanly if you have `otelcol-contrib` instead of plain `otelcol`** (different config path) — apply the equivalent manually per [docs/vdp-otel-push.md](../docs/vdp-otel-push.md). Requires `KEYSTORE_PASSWORD` in `/home/monad/.env` (set when generating keys), so put your keys in place first.
-16. JSON post-install report at `/var/lib/monad-validator-setup/report-<ts>.json`
+12. **otelcol enable** — idempotently `systemctl enable --now otelcol` if the unit was shipped by the monad package and has a non-empty config. Skips cleanly when `otelcol-contrib` (custom collector) is active, or when no config file exists yet (use `--with-vdp-otel` to install MF config). Closes the gap where `monad-doctor` flagged `vdp.otel-collector` FAIL after a stock install.
+13. **UFW** — `22/tcp` (SSH), `8000/tcp+udp` (P2P), `8001/udp` (Auth UDP only — not TCP)
+14. **iptables UDP DDoS filter** — `iptables -I INPUT -p udp --dport 8000 -m length --length 0:1400 -j DROP` per docs, persisted via `netfilter-persistent save`
+15. **(optional)** `--with-monitoring` runs the BeeHive monad-grafana installer
+16. **(optional)** `--with-vdp-otel` runs the MF VDP setup script after sha256 verification (pinned default; override with `VDP_OTEL_SETUP_SHA256=` env if MF rotates). **Bails cleanly if you have `otelcol-contrib` instead of plain `otelcol`** (different config path) — apply the equivalent manually per [docs/vdp-otel-push.md](../docs/vdp-otel-push.md). Requires `KEYSTORE_PASSWORD` in `/home/monad/.env` (set when generating keys), so put your keys in place first.
+17. JSON post-install report at `/var/lib/monad-validator-setup/report-<ts>.json`
 
 ## What it does NOT do
 
 - **Does not generate or import validator keys.** Keys are sensitive — you place them yourself in `/home/monad/monad-bft/config/`.
 - **Does not start `monad-bft.service`.** Without keys this would just crash-loop.
 - **Does not modify any file without backup.** Existing files are copied to `<file>.bak.<timestamp>` before edit.
-- **Does not install OTEL collector by default.** Monad's apt package installs plain `otelcol` itself. With `--with-vdp-otel` (added 2026-05-14), the MF setup script is fetched + sha256-verified + run after key placement to satisfy VDP push compliance. Plain-otelcol setups get full automation; `otelcol-contrib` setups are detected and skipped with a pointer to manual instructions.
+- **Does not install OTEL collector.** Monad's apt package installs plain `otelcol` itself; step 12 (`step_otelcol_enable`) enables it if it has a config. With `--with-vdp-otel`, the MF setup script is fetched + sha256-verified + run after key placement to satisfy VDP push compliance. Plain-otelcol setups get full automation; `otelcol-contrib` setups are detected and skipped with a pointer to manual instructions.
 
 ## Run
 

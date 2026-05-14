@@ -4,8 +4,8 @@ Operator tooling for Monad validator nodes, by [BeeHive](https://bee-hive.work).
 
 | Tool | What | Lines |
 |---|---|---|
-| **[monad-doctor](doctor/)** | Pre-flight readiness check — hardware/OS/network/security/monad/VDP. **55 checks** in 30 seconds, JSON output, exits 0/1/2. Auth UDP config + runtime verification included. | ~1330 |
-| **[monad-validator-setup](validator-setup/)** | One-shot host configuration — **14 steps**: deps → user → tuning → triedb → chrony → monad apt → bootstrap configs → UFW → iptables → (optional) VDP OTel push. Idempotent, `--dry-run`, `--network=testnet\|mainnet`. | ~1000 |
+| **[monad-doctor](doctor/)** | Pre-flight readiness check — hardware/OS/network/security/monad/VDP. **55 checks** in 30 seconds, JSON output, exits 0/1/2. Extended fix hints (Quick fix / Auto / Verify / Why) on every FAIL & WARN. | ~1380 |
+| **[monad-validator-setup](validator-setup/)** | One-shot host configuration — **17 steps**: deps → user → tuning → triedb → chrony → monad apt → bootstrap configs → otelcol enable → UFW → iptables → (optional) VDP OTel push. Idempotent, `--dry-run`, `--network=testnet\|mainnet`. | ~1040 |
 
 Companion repo: [BeeHiveTeam/monad-grafana](https://github.com/BeeHiveTeam/monad-grafana) — Prometheus + Grafana monitoring stack with 47-panel dashboard, installs in one command.
 
