@@ -88,6 +88,22 @@ sudo /opt/monad-tools/doctor/monad-doctor
 journalctl -u monad-bft -f
 ```
 
+## Interactive prompts at risky steps
+
+Three steps interrupt and ask for confirmation, since each can hurt an operator who has a custom setup:
+
+| Step | What it asks | Why |
+|---|---|---|
+| `step_chrony` | "Replace systemd-timesyncd with chrony?" / "Install and enable chrony?" | You may already run `ntpd`, OpenNTPD, or a customized chrony build — silent replacement breaks that |
+| `step_firewall` | "Enable UFW now?" | A wrong rule (e.g. missing `22/tcp`) would lock you out of SSH |
+| `step_iptables_ddos` | "Add this iptables rule?" | An `iptables -I INPUT` inserts ahead of existing rules — operators with custom netfilter setups (frr/bird/k8s/wireguard) should review first |
+
+Answering `n` makes the step exit cleanly with a WARN — re-run later with `--non-interactive` or manually.
+
+`--non-interactive` auto-answers Yes to every prompt (intended for CI).
+
+`--dry-run` doesn't ask at all — it prints what would happen and exits.
+
 ## Idempotency
 
 Safe to re-run any number of times. Each step:

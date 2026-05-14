@@ -342,6 +342,15 @@ step_iptables_ddos() {
     echo "  ${C_DIM}[dry-run] netfilter-persistent save${C_RESET}"
     return
   fi
+  # An iptables INSERT runs ahead of any existing rules on the INPUT chain and
+  # can interact badly with custom netfilter setups (frr/bird/k8s/wireguard).
+  # Operators with their own firewall stack should review before we touch it.
+  info "Will add: iptables -I INPUT -p udp --dport 8000 -m length --length 0:1400 -j DROP"
+  info "(drops short UDP packets <1400B on :8000 — valid raptorcast traffic is larger)"
+  if ! confirm "Add this iptables rule?"; then
+    warn "Skipped — docs recommend this rule for UDP DDoS robustness"
+    return 0
+  fi
   run "adding UDP length 0:1400 DROP rule" \
     iptables -I INPUT -p udp --dport 8000 -m length --length 0:1400 -j DROP
   if command -v netfilter-persistent >/dev/null; then
@@ -662,9 +671,22 @@ step_chrony() {
     return 0
   fi
 
+  # If a non-default NTP setup is in place (ntpd, custom chrony build, OpenNTPD,
+  # whatever), replacing it silently can break time sync the operator carefully
+  # configured. We only get here if `chrony` isn't already the active service.
   if systemctl is-active --quiet systemd-timesyncd; then
-    info "Disabling systemd-timesyncd (drifts ~10–100ms, inflates vote_delay)"
+    info "systemd-timesyncd is active. It drifts ~10–100ms which inflates vote_delay."
+    if ! confirm "Replace systemd-timesyncd with chrony?"; then
+      warn "Keeping systemd-timesyncd — vote_delay metrics may be skewed"
+      return 0
+    fi
+    info "Disabling systemd-timesyncd"
     systemctl disable --now systemd-timesyncd >>"$LOG_FILE" 2>&1
+  else
+    if ! confirm "Install and enable chrony for NTP?"; then
+      warn "Skipping chrony install — ensure another NTP daemon is running"
+      return 0
+    fi
   fi
 
   run "installing chrony" apt-get install -y chrony
