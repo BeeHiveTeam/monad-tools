@@ -139,7 +139,7 @@ Override via environment variable:
 |---|---|---|
 | `MONAD_APT_REPO` | `https://pkg.category.xyz/` | Category Labs apt source URL (per docs) |
 | `MONAD_APT_SUITE` | `noble` | apt suite (only `noble` exists upstream) |
-| `MONAD_APT_KEY_URL` | `${MONAD_APT_REPO}/category-labs.gpg` | GPG signing key |
+| `MONAD_APT_KEY_URL` | `${MONAD_APT_REPO}keys/public-key.asc` | ASCII-armored GPG signing key (dearmored on install) |
 | `MONAD_APT_KEYRING` | `/etc/apt/keyrings/category-labs.gpg` | local keyring path |
 | `MONAD_PKG_VERSION_TESTNET` | `0.14.3` | pinned testnet version (per docs) |
 | `MONAD_PKG_VERSION_MAINNET` | `0.14.2` | pinned mainnet version (per docs) |

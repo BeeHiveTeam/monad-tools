@@ -65,7 +65,9 @@ ULIMIT_NOFILE=1048576
 # Source: https://docs.monad.xyz/node-ops/full-node-installation
 MONAD_APT_REPO="${MONAD_APT_REPO:-https://pkg.category.xyz/}"
 MONAD_APT_SUITE="${MONAD_APT_SUITE:-noble}"
-MONAD_APT_KEY_URL="${MONAD_APT_KEY_URL:-https://pkg.category.xyz/category-labs.gpg}"
+# Foundation moved the key 2026-05-14: was /category-labs.gpg (binary, now 403),
+# now /keys/public-key.asc (ASCII-armored — requires `gpg --dearmor`).
+MONAD_APT_KEY_URL="${MONAD_APT_KEY_URL:-https://pkg.category.xyz/keys/public-key.asc}"
 MONAD_APT_KEYRING="${MONAD_APT_KEYRING:-/etc/apt/keyrings/category-labs.gpg}"
 # Pin version per docs — testnet and mainnet currently ship different versions.
 # Source: https://docs.monad.xyz/node-ops/full-node-installation
@@ -266,7 +268,8 @@ step_preflight() {
 # Per docs (full-node-installation): apt install -y curl nvme-cli aria2 jq
 step_dependencies() {
   section "System dependencies (per docs)"
-  local pkgs=(curl nvme-cli aria2 jq ethtool ufw iptables iptables-persistent)
+  # gnupg: needed to dearmor the ASCII-armored apt signing key (since 2026-05-14).
+  local pkgs=(curl gnupg nvme-cli aria2 jq ethtool ufw iptables iptables-persistent)
   local missing=()
   for p in "${pkgs[@]}"; do
     dpkg -l "$p" 2>/dev/null | grep -qE '^.i  ' || missing+=("$p")
@@ -696,8 +699,9 @@ step_monad_install() {
     else
       info "Adding Monad apt repository: $MONAD_APT_REPO (suite=$MONAD_APT_SUITE)"
       mkdir -p "$(dirname "$MONAD_APT_KEYRING")"
-      run "fetching signing key" bash -c \
-        "curl -fsSL '${MONAD_APT_KEY_URL}' -o '$MONAD_APT_KEYRING'"
+      # ASCII-armored key (.asc) — dearmor to keyring binary format that apt expects.
+      run "fetching + dearmoring signing key" bash -c \
+        "curl -fsSL '${MONAD_APT_KEY_URL}' | gpg --dearmor --yes -o '$MONAD_APT_KEYRING'"
       cat > "$sources_file" <<EOF
 Types: deb
 URIs: ${MONAD_APT_REPO}
