@@ -62,6 +62,8 @@ Setting up a Monad validator means walking through 30+ steps from the official d
 
 These tools encode the lessons learned running a real Monad validator into runnable scripts. They don't replace the docs — they enforce them, with fix commands included for every WARN.
 
+For issues that `monad-validator-setup` cannot fix automatically (BIOS access, destructive operations, reinstall-required cases), see [`docs/MANUAL_FIXES.md`](docs/MANUAL_FIXES.md).
+
 ---
 
 ## Project status

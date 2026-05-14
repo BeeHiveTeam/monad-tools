@@ -10,10 +10,11 @@
 #   4. Set IO scheduler to mq-deadline on triedb device
 #   5. Install chrony (replace systemd-timesyncd if active)
 #   6. Add Monad apt repository and install `monad` package
-#   7. Configure UFW firewall (Monad ports + SSH)
-#   8. Optionally install BeeHive monad-grafana monitoring stack
-#   9. Optionally enable VDP OTel push to Monad Foundation (--with-vdp-otel)
-#  10. Print post-install report and next steps for keys + start
+#   7. Enable otelcol if shipped by monad pkg and has a config (skipped on contrib setups)
+#   8. Configure UFW firewall (Monad ports + SSH)
+#   9. Optionally install BeeHive monad-grafana monitoring stack
+#  10. Optionally enable VDP OTel push to Monad Foundation (--with-vdp-otel)
+#  11. Print post-install report and next steps for keys + start
 #
 # What it deliberately does NOT do:
 #   - Generate or import validator keys (you must do this manually)
@@ -730,6 +731,55 @@ EOF
   fi
 }
 
+# ===== Step: otelcol enable =====
+# The Monad apt package installs an otelcol systemd unit but does NOT enable it.
+# Without an active collector, doctor's `vdp.otel-collector` check FAILs and the
+# node cannot push metrics to MF — VDP rejects nodes that don't report.
+# We enable+start the plain `otelcol` only if:
+#   - the unit exists (i.e. monad package shipped it)
+#   - it is not already active
+#   - a custom otelcol-contrib is NOT active (operator may run their own stack)
+#   - it has a config file (skips clean-slate boxes where MF setup hasn't run yet)
+# --with-vdp-otel layers MF push config on top via step_vdp_otel_push.
+step_otelcol_enable() {
+  section "OTel collector (otelcol)"
+
+  if ! systemctl cat otelcol >/dev/null 2>&1; then
+    info "otelcol.service not installed (ships with monad package) — skipping"
+    return 0
+  fi
+
+  if systemctl is-active --quiet otelcol-contrib 2>/dev/null; then
+    info "otelcol-contrib.service active — leaving plain otelcol alone (operator runs custom collector)"
+    return 0
+  fi
+
+  if systemctl is-active --quiet otelcol; then
+    ok "otelcol already active"
+    return 0
+  fi
+
+  if [[ ! -s /etc/otelcol/config.yaml ]]; then
+    warn "otelcol unit exists but /etc/otelcol/config.yaml is empty/missing — not auto-starting"
+    warn "Run with --with-vdp-otel to install the MF push config, or write your own first."
+    return 0
+  fi
+
+  if (( DRY_RUN )); then
+    echo "  ${C_DIM}[dry-run] systemctl enable --now otelcol${C_RESET}"
+    return 0
+  fi
+
+  run "enabling otelcol" systemctl enable --now otelcol
+  sleep 2
+  if systemctl is-active --quiet otelcol; then
+    ok "otelcol active — local metrics collector running"
+  else
+    err "otelcol failed to start — check: journalctl -u otelcol -n 100"
+    return 1
+  fi
+}
+
 # ===== Step: firewall (UFW) =====
 step_firewall() {
   section "Firewall (UFW)"
@@ -967,6 +1017,7 @@ EOF
   step_monad_install    || failed+=("monad-install")
   step_config_files     || failed+=("config-files")
   step_cruft_timer      || failed+=("cruft-timer")
+  step_otelcol_enable   || failed+=("otelcol-enable")
   step_firewall         || failed+=("firewall")
   step_iptables_ddos    || failed+=("iptables-ddos")
   step_monitoring       || failed+=("monitoring")

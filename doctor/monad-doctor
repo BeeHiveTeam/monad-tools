@@ -104,6 +104,9 @@ declare -i COUNT_PASS=0 COUNT_WARN=0 COUNT_FAIL=0 COUNT_INFO=0
 
 emit() {
   # emit <section> <name> <status> <msg> [fix]
+  # The fix string may contain literal newlines (\n); each line is rendered as a
+  # separate hint line. Convention for extended hints:
+  #   $'Quick fix:  cmd\nVerify:     cmd\nWhy:        explanation'
   local section="$1" name="$2" status="$3" msg="$4" fix="${5:-}"
   RESULTS_SECTION+=("$section")
   RESULTS_NAME+=("$name")
@@ -128,7 +131,12 @@ emit() {
   esac
 
   printf "  ${color}%s${C_RESET} %-30s %s\n" "$sym" "$name" "$msg"
-  [[ -n "$fix" ]] && printf "    ${C_DIM}→ %s${C_RESET}\n" "$fix"
+  if [[ -n "$fix" ]]; then
+    local line
+    while IFS= read -r line; do
+      printf "    ${C_DIM}→ %s${C_RESET}\n" "$line"
+    done <<<"$fix"
+  fi
 }
 
 section_header() {
@@ -251,7 +259,7 @@ check_baremetal() {
   case "$virt" in
     none|"") emit hardware "host.bare-metal" PASS "running on bare metal" ;;
     *)       emit hardware "host.bare-metal" FAIL "running in '$virt' (virtualized) — docs require bare metal" \
-                  "Move to a bare-metal server. VDP/Foundation requires bare-metal per hardware-requirements." ;;
+                  $'Action:      Move to a bare-metal server (Hetzner AX/EX, OVH HG/Advance, Latitude.sh).\nVerify:      systemd-detect-virt → "none"\nWhy:         Foundation/VDP rejects KVM/cloud nodes per hardware-requirements.\n             Performance: virtualized IO collapses under triedb random-write load.' ;;
   esac
 }
 
@@ -271,7 +279,7 @@ check_cpu() {
     emit hardware "cpu.cores"   WARN "$phys_cores physical cores — meets min ($CPU_CORES_MIN), recommend $CPU_CORES_REC+ ($model)"
   else
     emit hardware "cpu.cores"   FAIL "$phys_cores physical cores — below minimum $CPU_CORES_MIN ($model)" \
-         "Validator needs ≥$CPU_CORES_MIN physical cores; current hardware insufficient"
+         $'Action:      Use a server with ≥'"$CPU_CORES_MIN"$' physical cores (AMD Ryzen 7950X/EPYC 4585PX, Intel Xeon W).\nWhy:         BLS sig verification + raptorcast + triedb compaction are CPU-bound;\n             undersized hosts miss vote deadlines and lose epochs.\nNote:        physical, not logical — count cores with SMT *off*.'
   fi
 
   # SMT/HyperThreading per docs: "Disabled HyperThreading (HT) or
@@ -282,7 +290,7 @@ check_cpu() {
   case "$smt_active" in
     0)     emit hardware "cpu.smt"  PASS "SMT/HyperThreading disabled (per docs)" ;;
     1)     emit hardware "cpu.smt"  FAIL "SMT/HyperThreading active — must be disabled in BIOS per docs" \
-                "Reboot into BIOS/UEFI and disable SMT (AMD) / HyperThreading (Intel)" ;;
+                $'Preferred:   Reboot → BIOS/UEFI → disable SMT (AMD) / HyperThreading (Intel) → save.\nWorkaround:  (when BIOS is unreachable, e.g. Hetzner dedicated)\n             sed -i \'s/GRUB_CMDLINE_LINUX="\\([^"]*\\)"/GRUB_CMDLINE_LINUX="\\1 nosmt"/\' /etc/default/grub\n             update-grub && reboot\nVerify:      cat /sys/devices/system/cpu/smt/active   # 0\n             cat /proc/cmdline | grep -o nosmt        # nosmt (workaround only)\nWhy:         SMT siblings share execution units → cache contention and tail-latency spikes\n             during raptorcast/consensus; docs explicitly call it out as degrading the node.' ;;
     *)     emit hardware "cpu.smt"  INFO "SMT state unknown — verify in BIOS (must be off)" ;;
   esac
 
@@ -324,7 +332,7 @@ check_ram() {
     emit hardware "ram.total"   WARN "${total_gb} GB — meets min ($RAM_GB_MIN), recommend ${RAM_GB_REC}+"
   else
     emit hardware "ram.total"   FAIL "${total_gb} GB — below minimum $RAM_GB_MIN GB" \
-         "Add RAM or use a server with ≥$RAM_GB_REC GB"
+         $'Action:      Add RAM or use a server with ≥'"$RAM_GB_REC"$' GB.\nWhy:         triedb mmap working set + raptorcast UDP buffers + BFT in-flight state\n             easily exceed '"$RAM_GB_MIN"$' GB under mainnet load; OOM kills are catastrophic.\nNote:        ECC RAM strongly recommended for validator longevity.'
   fi
 
   # Swap usage warning (validator should not be swapping)
@@ -332,7 +340,7 @@ check_ram() {
   swap_used_mb=$(awk '/SwapFree/ {sf=$2} /SwapTotal/ {st=$2} END {printf "%d", (st-sf)/1024}' /proc/meminfo)
   if (( swap_used_mb > 100 )); then
     emit hardware "ram.swap"    WARN "swap in use: ${swap_used_mb} MB — node may stall under load" \
-         "Investigate memory pressure: 'sudo swapoff -a && sudo swapon -a' to reset"
+         $'Quick fix:   sudo swapoff -a && sudo swapon -a   # resets swap, frees pressure now\nInvestigate: ps -eo pid,rss,cmd --sort=-rss | head   # who is using memory?\nLong-term:   set vm.swappiness=1 (validator-setup does this);\n             if RAM <64GB, upgrade — chronic swap = stalled votes.\nWhy:         swapped-out validator state introduces 10-100ms read latency,\n             missing vote deadlines and triggering re-elections.'
   else
     emit hardware "ram.swap"    PASS "swap not in use"
   fi
@@ -347,7 +355,7 @@ check_disks() {
 
   if (( nvme_count == 0 )); then
     emit hardware "disk.nvme"   FAIL "no NVMe drives detected" \
-         "Validator REQUIRES NVMe SSD — SATA/HDD will fail under triedb load"
+         $'Action:      Provision NVMe SSDs (datacenter-class: Samsung PM9A3, WD SN850X, Micron 7450).\nWhy:         triedb does sustained random 4K writes at 100k+ IOPS; SATA SSDs top out\n             around 80k and HDDs are 3 orders of magnitude too slow.\nVerify:      lsblk -d -o NAME,ROTA,TRAN | grep nvme'
     return
   fi
 
@@ -361,7 +369,7 @@ check_disks() {
       triedb)    emit hardware "disk.role.$dev" PASS "$dev ($size): triedb — $detail" ;;
       os-raid)   emit hardware "disk.role.$dev" PASS "$dev ($size): OS RAID — $detail" ;;
       os-single) emit hardware "disk.role.$dev" WARN "$dev ($size): OS on single disk (SPOF) — $detail" \
-                      "Consider RAID1 for OS to avoid single-disk failure" ;;
+                      $'Cause:       installimage was run with SWRAID 0, or only one NVMe was installed.\nFix (reinstall, destructive — back up keys first):\n             Hetzner: Reset → Rescue → installimage → SWRAID 1 + SWRAIDLEVEL 1\n             Other providers: re-run installer with software RAID1 enabled.\nAlternative: accept SPOF for a non-validator full-node, OR plan recovery via\n             key escrow + standby host (mainnet validators MUST plan for disk failure).\nWhy:         single-NVMe OS = one failed drive → node down, possible double-sign\n             risk if hot-recovered without care.' ;;
       unused)    emit hardware "disk.role.$dev" INFO "$dev ($size): unused — $detail" ;;
       swap-only) emit hardware "disk.role.$dev" INFO "$dev ($size): swap-only" ;;
       other)     emit hardware "disk.role.$dev" INFO "$dev ($size): $detail" ;;
@@ -386,7 +394,7 @@ check_disks() {
         emit hardware "disk.lba.$dev" PASS "triedb device $dev: 512-byte LBA (per docs)"
       else
         emit hardware "disk.lba.$dev" FAIL "triedb device $dev: ${lba}-byte LBA — docs require 512" \
-             "Reformat (DESTROYS DATA — backup keys first): nvme format /dev/$dev --lbaf=0 --force"
+             $'DANGER:      reformatting DESTROYS ALL DATA on /dev/'"$dev"$'. Back up keys first!\nQuick fix:   sudo umount /dev/'"$dev"$'* 2>/dev/null; \\\n             sudo nvme format /dev/'"$dev"$' --lbaf=0 --force\nList LBAFs:  sudo nvme id-ns /dev/'"$dev"$' -H | grep -i "LBA Format"\nVerify:      lsblk -dn -o NAME,LOG-SEC /dev/'"$dev"$'   # → 512\nWhy:         docs explicitly mandate 512-byte LBA on the triedb drive;\n             4096-byte sectors cause read-modify-write amplification and lower IOPS.'
       fi
     elif [[ "$role" == "unused" ]]; then
       # Unused disk — could become triedb. Inform if it would need reformat.
@@ -404,7 +412,7 @@ check_disks() {
     triedb_disk=$(lsblk -no PKNAME "/dev/${triedb_part}" 2>/dev/null | head -1)
     if [[ -n "$triedb_disk" ]] && grep -q "${triedb_disk}p" /proc/mdstat 2>/dev/null; then
       emit hardware "disk.triedb-raid" WARN "triedb device $triedb_disk is part of RAID — wasted writes" \
-           "Move /dev/triedb to a dedicated NVMe (no RAID, no other use)"
+           $'Action:      Provision a dedicated NVMe for triedb (no RAID, no other partitions).\n             Then re-point /dev/triedb udev rule at the new device PARTUUID.\nWhy:         triedb is already write-heavy; RAID1 doubles writes and shortens NVMe TBW;\n             RAID5/6 adds parity write amplification on top.'
     fi
   fi
 
@@ -422,7 +430,7 @@ check_disks() {
         emit hardware "disk.sched.$dev" PASS "triedb device on mq-deadline ✓"
       else
         emit hardware "disk.sched.$dev" FAIL "triedb device $dev on '$sched' — must be mq-deadline" \
-             "echo mq-deadline | sudo tee /sys/block/$dev/queue/scheduler"
+             $'Quick fix:   echo mq-deadline | sudo tee /sys/block/'"$dev"$'/queue/scheduler\nPersist:     validator-setup writes /etc/udev/rules.d/60-monad-triedb-scheduler.rules\n             (otherwise scheduler resets to "none" on reboot).\nVerify:      cat /sys/block/'"$dev"$'/queue/scheduler   # → [mq-deadline]\nWhy:         mq-deadline batches writes and prioritizes reads — critical for triedb\n             mixed-workload tail latency.'
       fi
     fi
   done <<<"$topo"
@@ -438,7 +446,7 @@ check_disks() {
       emit hardware "disk.triedb-candidate" INFO "candidate(s) for /dev/triedb: $(echo "$cand" | tr '\n' ',' )"
     else
       emit hardware "disk.triedb-candidate" WARN "no unused NVMe for /dev/triedb — every disk is RAID/mounted/swap; validator-setup will need --triedb-dev or fail" \
-           "Add a dedicated NVMe for triedb, or repartition to free one (triedb must NOT share with OS RAID)"
+           $'Option A:    Provision a dedicated NVMe for triedb (cleanest).\nOption B:    Reinstall with installimage placing the OS on ONE drive, leaving the\n             second NVMe untouched as the triedb candidate.\nWhy:         triedb sharing a disk with OS contends for IO; sharing with OS RAID\n             multiplies writes and breaks the "dedicated 2TB disk" docs spec.'
     fi
   fi
 
@@ -518,7 +526,7 @@ check_iops() {
     emit hardware "disk.iops"   WARN "${iops} IOPS — meets min ($NVME_IOPS_MIN), recommend $NVME_IOPS_REC+"
   else
     emit hardware "disk.iops"   FAIL "${iops} IOPS — below minimum $NVME_IOPS_MIN" \
-         "Replace with datacenter-class NVMe (Samsung PM9A3, WD SN850X, Micron 7450)"
+         $'Action:      Replace with datacenter-class NVMe (Samsung PM9A3, WD SN850X, Micron 7450,\n             Intel D7-P5520). Consumer NVMe slows to 50-80k IOPS under sustained load.\nVerify:      sudo fio --filename=/dev/triedb --rw=randread --bs=4k --iodepth=64 \\\n                  --runtime=30 --name=iops --direct=1\nWhy:         triedb random reads define the validator critical path; <'"$NVME_IOPS_MIN"$' IOPS\n             produces slow blocks, missed votes and eventual jail.'
   fi
 }
 
@@ -538,15 +546,15 @@ check_os() {
         # apt repo pkg.category.xyz only ships 'noble' (24.04). On 22.04 jammy
         # the install will fail with "Unable to find package" anyway.
         emit os "os.distro"     FAIL "$PRETTY_NAME — Ubuntu ${UBUNTU_VERSION_MIN}+ required (apt repo ships noble only)" \
-             "Reinstall with Ubuntu 24.04 LTS or newer"
+             $'Action:      Reinstall with Ubuntu 24.04 LTS (Hetzner: installimage → Ubuntu-2404-noble image).\nWhy:         Monad apt repo (pkg.category.xyz) only ships the "noble" suite;\n             apt install monad on older releases fails with "Unable to locate package".'
       fi ;;
     debian)
       emit os "os.distro"       FAIL "$PRETTY_NAME — Debian not supported by docs (only Ubuntu ${UBUNTU_VERSION_MIN}+)" \
-           "Reinstall with Ubuntu 24.04 LTS"
+           $'Action:      Reinstall with Ubuntu 24.04 LTS — Debian is not in the supported matrix.\nWhy:         libc/systemd versions and apt repo suite differ; package install will break.'
       ;;
     *)
       emit os "os.distro"       FAIL "$PRETTY_NAME — only Ubuntu ${UBUNTU_VERSION_MIN}+ supported per docs" \
-           "Reinstall with Ubuntu 24.04 LTS"
+           $'Action:      Reinstall with Ubuntu 24.04 LTS.\nWhy:         docs and Monad apt repo target Ubuntu noble exclusively.'
       ;;
   esac
 
@@ -557,7 +565,7 @@ check_os() {
     emit os "os.arch"           PASS "x86_64"
   else
     emit os "os.arch"           FAIL "$arch — only x86_64 supported" \
-         "Use a server with x86_64 (AMD64) CPU"
+         $'Action:      Provision a server with x86_64 (AMD64) CPU.\nWhy:         Monad ships binaries for amd64 only; arm64/aarch64 hosts have no\n             working monad-bft package.'
   fi
 }
 
@@ -571,9 +579,14 @@ kernel_upgrade_tip() {
     ver_id=$(. /etc/os-release && echo "${VERSION_ID:-}")
   fi
   if [[ -n "$ver_id" ]] && ver_ge "$ver_id" "$UBUNTU_VERSION_MIN"; then
-    echo "Upgrade: apt install --install-recommends linux-generic-hwe-24.04"
+    printf '%s\n' \
+      "Quick fix:   apt update && apt install --install-recommends linux-generic-hwe-${UBUNTU_VERSION_MIN} && reboot" \
+      "Verify:      uname -r   # → ≥${KERNEL_MIN}-${KERNEL_MIN_PATCH}-generic" \
+      "Why:         buggy 6.8.0-{56..59} kernels cause Monad client hangs (docs); HWE pulls a newer generic kernel."
   else
-    echo "Reinstall with Ubuntu ${UBUNTU_VERSION_MIN}+ first — HWE on older releases does not reach ${KERNEL_MIN}-${KERNEL_MIN_PATCH}"
+    printf '%s\n' \
+      "Action:      Reinstall with Ubuntu ${UBUNTU_VERSION_MIN}+ — HWE on older releases does not reach ${KERNEL_MIN}-${KERNEL_MIN_PATCH}." \
+      "Why:         apt repo is noble-only and docs target the noble HWE stack."
   fi
 }
 
@@ -620,7 +633,7 @@ check_ulimits() {
       emit os "ulimit.service"  PASS "monad-bft LimitNOFILE=$svc_limit"
     else
       emit os "ulimit.service"  WARN "monad-bft LimitNOFILE=$svc_limit — recommend ≥$ULIMIT_MIN" \
-           "Add to /etc/systemd/system/monad-bft.service.d/override.conf: [Service] LimitNOFILE=1048576"
+           $'Quick fix:   sudo mkdir -p /etc/systemd/system/monad-bft.service.d\n             printf \'[Service]\\nLimitNOFILE=1048576\\n\' | \\\n               sudo tee /etc/systemd/system/monad-bft.service.d/override.conf\n             sudo systemctl daemon-reload && sudo systemctl restart monad-bft\nVerify:      systemctl show monad-bft -p LimitNOFILE   # → 1048576\nWhy:         monad-bft opens many UDP sockets + log files; default 1024 ulimit causes\n             "too many open files" mid-epoch and crashes.'
     fi
   else
     # No service yet — fall back to /etc/security/limits.conf
@@ -632,7 +645,7 @@ check_ulimits() {
       emit os "ulimit.limits-conf" PASS "limits.conf hard nofile=$conf_limit"
     else
       emit os "ulimit.limits-conf" WARN "no high nofile limit set in /etc/security/limits.conf" \
-           "Add: '* soft nofile 1048576' and '* hard nofile 1048576' to /etc/security/limits.conf"
+           $'Auto:        monad-validator-setup → step_ulimits writes /etc/security/limits.d/99-monad-validator.conf\nManual:      sudo tee /etc/security/limits.d/99-monad-validator.conf <<EOF\n             * soft nofile 1048576\n             * hard nofile 1048576\n             EOF\nVerify:      ulimit -n   # in a fresh shell session\nWhy:         pre-empts the same FD exhaustion as ulimit.service, for non-service runs.'
     fi
   fi
 
@@ -643,7 +656,7 @@ check_ulimits() {
     emit os "ulimit.system"     PASS "fs.file-max = $sysmax"
   else
     emit os "ulimit.system"     WARN "fs.file-max = $sysmax — low" \
-         "Add to /etc/sysctl.conf: 'fs.file-max = 2097152' && sysctl -p"
+         $'Quick fix:   echo "fs.file-max = 2097152" | sudo tee -a /etc/sysctl.conf && sudo sysctl -p\nAuto:        monad-validator-setup → step_sysctl sets fs.file-max in 99-monad-validator.conf.\nVerify:      sysctl fs.file-max   # ≥ 2097152\nWhy:         system-wide cap above per-process; required for high LimitNOFILE to take effect.'
   fi
 }
 
@@ -657,7 +670,7 @@ check_sysctl() {
     emit os "sysctl.netbuf"     PASS "rmem_max=$rmem_max wmem_max=$wmem_max"
   else
     emit os "sysctl.netbuf"     WARN "rmem/wmem_max below ${need} — UDP raptorcast may drop" \
-         "Add to /etc/sysctl.conf: net.core.rmem_max=16777216, net.core.wmem_max=16777216 && sysctl -p"
+         $'Auto:        monad-validator-setup → step_sysctl writes /etc/sysctl.d/99-monad-validator.conf.\nManual:      sudo tee /etc/sysctl.d/99-monad-validator.conf <<EOF\n             net.core.rmem_max = 16777216\n             net.core.wmem_max = 16777216\n             EOF\n             sudo sysctl --system\nVerify:      sysctl net.core.rmem_max net.core.wmem_max   # both 16777216\nWhy:         raptorcast bursts UDP datagrams; small kernel buffers → packet drops →\n             missed proposal shreds → vote_delay spikes.'
   fi
 
   local swappiness
@@ -666,7 +679,7 @@ check_sysctl() {
     emit os "sysctl.swappiness" PASS "vm.swappiness=$swappiness"
   else
     emit os "sysctl.swappiness" WARN "vm.swappiness=$swappiness — high" \
-         "Set vm.swappiness=1 in /etc/sysctl.conf to avoid validator stalls"
+         $'Quick fix:   echo "vm.swappiness = 1" | sudo tee -a /etc/sysctl.d/99-monad-validator.conf\n             sudo sysctl --system\nAuto:        monad-validator-setup → step_sysctl sets vm.swappiness=1.\nVerify:      sysctl vm.swappiness   # 1\nWhy:         default 60 swaps anonymous pages aggressively; for a validator with hot\n             working set this introduces 10-100ms read latency and missed votes.'
   fi
 }
 
@@ -682,14 +695,14 @@ check_ntp() {
       emit os "ntp"             WARN "chrony, |offset|=${off_us}µs — slight drift"
     else
       emit os "ntp"             FAIL "chrony, |offset|=${off_us}µs — significant drift" \
-           "Investigate: chronyc sources -v"
+           $'Investigate: chronyc sources -v   # check selectability/reachability\n             chronyc tracking      # current offset/skew\nQuick fix:   sudo systemctl restart chrony; sleep 30; chronyc tracking\nIf persists: pool/server lines in /etc/chrony/chrony.conf reachable?\n             Add closer sources: pool 2.ubuntu.pool.ntp.org iburst maxsources 4\nWhy:         high clock offset distorts vote_delay metric and can cause MF jail decisions.'
     fi
   elif systemctl is-active --quiet systemd-timesyncd 2>/dev/null; then
     emit os "ntp"               WARN "systemd-timesyncd active — drifts ~10-100ms, inflates vote_delay" \
-         "Replace: apt install -y chrony && systemctl disable --now systemd-timesyncd"
+         $'Quick fix:   sudo apt install -y chrony   # auto-replaces timesyncd on Ubuntu\n             sudo systemctl disable --now systemd-timesyncd\nAuto:        monad-validator-setup → step_chrony does exactly this.\nVerify:      chronyc tracking   # tiny offset, leap status normal\nWhy:         timesyncd uses SNTP, no kernel discipline → drift accumulates between syncs,\n             distorts vote_delay; chrony slews continuously.'
   else
     emit os "ntp"               FAIL "no NTP daemon active" \
-         "Install: apt install -y chrony"
+         $'Quick fix:   sudo apt install -y chrony && sudo systemctl enable --now chrony\nVerify:      chronyc tracking   # source synced, offset <1ms\nWhy:         without time sync, vote_delay drifts, MF metrics become incorrect,\n             and operators chase phantom performance regressions.'
   fi
 }
 
@@ -765,7 +778,7 @@ check_ports_free() {
       emit network "net.port.$spec" PASS "port ${port}/${proto} owned by $who (node already running)"
     else
       emit network "net.port.$spec" WARN "port ${port}/${proto} occupied by ${who:-?} — must be free or owned by monad-*" \
-           "Stop conflicting service or rebind it to another port"
+           $'Investigate: sudo ss -'"$(case $proto in tcp) echo -n tlnp;; udp) echo -n ulnp;; esac)"$' | grep :'"$port"$'\nQuick fix:   stop conflicting service: sudo systemctl stop <service>; sudo systemctl disable <service>\n             or rebind it to another port in its config.\nWhy:         monad-bft will fail to bind '"$port/$proto"$' and exit on startup.'
     fi
   done
 }
@@ -786,16 +799,16 @@ check_firewall() {
       emit network "net.firewall" PASS "ufw active, all required port/proto pairs allowed"
     else
       emit network "net.firewall" WARN "ufw active but missing rules for: $missing" \
-           "Add: $(for s in $missing; do echo -n "ufw allow ${s%/*}/${s#*/}; "; done)"
+           $'Quick fix:   '"$(for s in $missing; do printf 'sudo ufw allow %s; ' "$s"; done)"$'\nAuto:        monad-validator-setup → step_firewall adds all required rules.\nVerify:      sudo ufw status verbose\nWhy:         peers cannot reach this node on the missing port → desyncs, no votes.'
     fi
   elif require_cmd ufw; then
     emit network "net.firewall" WARN "ufw installed but inactive — no firewall protection" \
-         "Enable: ufw allow 22/tcp; ufw allow 8000; ufw allow 8001/udp; ufw enable"
+         $'Quick fix:   sudo ufw allow 22/tcp\n             sudo ufw allow 8000             # tcp+udp (consensus P2P)\n             sudo ufw allow 8001/udp         # authenticated UDP\n             sudo ufw --force enable\nAuto:        monad-validator-setup → step_firewall does this idempotently.\nVerify:      sudo ufw status verbose\nWhy:         a publicly reachable validator without a firewall exposes management/\n             OS services to the open internet. ufw default-deny is a one-line win.'
   elif require_cmd nft || require_cmd iptables; then
     emit network "net.firewall" INFO "nftables/iptables in use (manual config) — ensure $NET_PORTS_REQUIRED open"
   else
     emit network "net.firewall" WARN "no firewall detected" \
-         "Install ufw: apt install -y ufw"
+         $'Quick fix:   sudo apt install -y ufw\n             then apply the rules above (or run monad-validator-setup → step_firewall).\nWhy:         see "ufw installed but inactive" above — default-deny is the cheapest hardening.'
   fi
 }
 
@@ -819,7 +832,7 @@ check_rpc_exposure() {
   done
   if (( ${#flagged[@]} > 0 )); then
     emit security "rpc.exposure" FAIL "RPC port(s) ${flagged[*]} publicly exposed — VDP forbids 'external RPC servicing on validator nodes'" \
-         "Restrict source: ufw delete allow ${flagged[0]}; ufw allow from <internal-ip> to any port ${flagged[0]}"
+         $'Quick fix:   for p in '"${flagged[*]}"$'; do sudo ufw delete allow $p; done\n             # then allow only trusted internal sources:\n             sudo ufw allow from <YOUR-RPC-PROXY-IP> to any port '"${flagged[0]}"$'\nVerify:      sudo ufw status numbered | grep -E "808[01]"\nWhy:         VDP eligibility (docs/validator-delegation-program) bans serving external\n             RPC traffic from a validator node — Foundation can exclude you for this.'
   else
     emit security "rpc.exposure" PASS "no RPC ports (8080/8081) publicly exposed"
   fi
@@ -837,7 +850,7 @@ check_iptables_udp_filter() {
     emit security "iptables.udp-filter" PASS "UDP length filter on :8000 active (per docs)"
   else
     emit security "iptables.udp-filter" WARN "no UDP length 0:1400 DROP rule on :8000 — robustness against UDP DDoS missing" \
-         "sudo iptables -I INPUT -p udp --dport 8000 -m length --length 0:1400 -j DROP && netfilter-persistent save"
+         $'Quick fix:   sudo iptables -I INPUT -p udp --dport 8000 -m length --length 0:1400 -j DROP\n             sudo netfilter-persistent save\nAuto:        monad-validator-setup → step_iptables_ddos installs and persists this rule.\nVerify:      sudo iptables -L INPUT -nv | grep "dpt:8000"\nWhy:         valid raptorcast UDP datagrams exceed 1400 bytes; small UDP packets on\n             :8000 are spoofed amplification / probing traffic. Docs recommend this rule.'
   fi
 }
 
@@ -851,10 +864,10 @@ check_cve_2026_31431() {
     emit security "cve.2026-31431" PASS "algif_aead blacklisted (CVE-2026-31431 mitigated)"
   elif ! lsmod 2>/dev/null | grep -q algif_aead; then
     emit security "cve.2026-31431" WARN "algif_aead not blacklisted — module not loaded now but can be loaded any time (CVE-2026-31431 LPE)" \
-         "echo 'install algif_aead /bin/false' | sudo tee /etc/modprobe.d/disable-algif.conf"
+         $'Quick fix:   echo \'install algif_aead /bin/false\' | sudo tee /etc/modprobe.d/disable-algif.conf\nVerify:      grep algif_aead /etc/modprobe.d/disable-algif.conf\nWhy:         Foundation Discord 2026-04-30 ACTION RECOMMENDED — local privilege escalation\n             via algif_aead; blacklist makes the module unloadable.'
   else
     emit security "cve.2026-31431" WARN "algif_aead loaded and not blacklisted — CVE-2026-31431 (LPE) unmitigated" \
-         "echo 'install algif_aead /bin/false' | sudo tee /etc/modprobe.d/disable-algif.conf"
+         $'Quick fix:   echo \'install algif_aead /bin/false\' | sudo tee /etc/modprobe.d/disable-algif.conf\n             sudo rmmod algif_aead   # unload now (or reboot)\nVerify:      lsmod | grep -v algif_aead   # gone\nWhy:         module is currently loaded AND not blacklisted — exploitable right now.'
   fi
 }
 
@@ -864,7 +877,7 @@ check_nvme_cli() {
     emit security "deps.nvme-cli" PASS "nvme-cli installed"
   else
     emit security "deps.nvme-cli" WARN "nvme-cli not installed — needed for LBA reformat command" \
-         "apt install -y nvme-cli"
+         $'Quick fix:   sudo apt install -y nvme-cli\nAuto:        monad-validator-setup installs nvme-cli in step_dependencies.\nWhy:         needed for `nvme format ... --lbaf=0` to satisfy the 512-byte LBA requirement.'
   fi
 }
 
@@ -879,7 +892,7 @@ check_ssh_hardening() {
   case "$pwauth" in
     no|No|NO)  emit security "ssh.passwordauth" PASS "PasswordAuthentication=no" ;;
     *)         emit security "ssh.passwordauth" WARN "PasswordAuthentication=$pwauth — bruteforce risk" \
-                  "Set 'PasswordAuthentication no' in /etc/ssh/sshd_config && systemctl reload ssh" ;;
+                  $'Quick fix:   sudo sed -i \'s/^[#[:space:]]*PasswordAuthentication.*/PasswordAuthentication no/\' /etc/ssh/sshd_config\n             sudo systemctl reload ssh\nDANGER:      ensure your SSH key is already in ~/.ssh/authorized_keys BEFORE reload,\n             or you will lock yourself out (no console fallback on some hosts).\nVerify:      sshd -T | grep -i passwordauthentication   # no\nWhy:         password auth is the primary bruteforce surface on a 22/tcp validator.' ;;
   esac
 
   # PermitRootLogin — but if PasswordAuth is already off, key-only root login
@@ -896,7 +909,7 @@ check_ssh_hardening() {
              "Optional tightening: set 'PermitRootLogin prohibit-password'"
       else
         emit security "ssh.rootlogin" WARN "PermitRootLogin=yes with password auth — risky" \
-             "Set 'PermitRootLogin prohibit-password' or disable password auth first"
+             $'Quick fix:   sudo sed -i \'s/^[#[:space:]]*PermitRootLogin.*/PermitRootLogin prohibit-password/\' /etc/ssh/sshd_config\n             sudo systemctl reload ssh\nDANGER:      ensure root\'s authorized_keys is set BEFORE reload.\nWhy:         allows password bruteforce directly against root — historically the\n             #1 vector for compromised validators.'
       fi ;;
     *)
       emit security "ssh.rootlogin" INFO "PermitRootLogin=$rootlogin" ;;
@@ -919,7 +932,7 @@ check_unattended_upgrades() {
       emit security "auto-upgrades" PASS "unattended-upgrades active, Automatic-Reboot=false (safe for validator)"
     else
       emit security "auto-upgrades" WARN "unattended-upgrades active but may auto-reboot mid-epoch" \
-           "Configure no-reboot: echo 'Unattended-Upgrade::Automatic-Reboot \"false\";' | sudo tee /etc/apt/apt.conf.d/52monad-no-reboot"
+           $'Quick fix:   echo \'Unattended-Upgrade::Automatic-Reboot "false";\' | \\\n               sudo tee /etc/apt/apt.conf.d/52monad-no-reboot\nVerify:      apt-config dump | grep -i Automatic-Reboot   # "false"\nWhy:         unattended-upgrades CAN trigger reboot during a kernel update — if it lands\n             mid-epoch your validator is jailed. Keep patches flowing, disable reboot.'
     fi
   else
     emit security "auto-upgrades" INFO "unattended-upgrades installed but disabled — security patches not auto-applied"
@@ -970,12 +983,12 @@ check_triedb_udev() {
       emit monad "monad.triedb-udev" PASS "$rule present with SYMLINK+=\"triedb\" rule"
     else
       emit monad "monad.triedb-udev" WARN "$rule exists but no SYMLINK+=\"triedb\" entry — /dev/triedb may not appear on reboot" \
-           "Re-create the rule per docs: udev rule must contain SYMLINK+=\"triedb\""
+           $'Action:      Find the triedb partition PARTUUID: blkid -s PARTUUID -o value /dev/<part>\n             Write the rule:\n               ENV{ID_PART_ENTRY_UUID}=="<PARTUUID>", MODE="0666", SYMLINK+="triedb"\n             to /etc/udev/rules.d/99-triedb.rules\n             udevadm control --reload && udevadm trigger\nVerify:      ls -l /dev/triedb   # after reboot too\nWhy:         disk enumeration is not stable across reboots; udev SYMLINK pins\n             /dev/triedb to a specific partition by PARTUUID.'
     fi
   else
     if [[ -L /dev/triedb ]]; then
       emit monad "monad.triedb-udev" WARN "no $rule — /dev/triedb may disappear after reboot if created manually" \
-           "Create per docs: ENV{ID_PART_ENTRY_UUID}==\"<PARTUUID>\", MODE=\"0666\", SYMLINK+=\"triedb\""
+           $'Auto:        monad-validator-setup → step_triedb_symlink writes this rule.\nManual:      see "monad.triedb-udev exists but missing SYMLINK" above.\nWhy:         a manually-created /dev/triedb symlink does not persist across reboots;\n             udev rule by PARTUUID is the only way to make it stable.'
     else
       emit monad "monad.triedb-udev" INFO "$rule not present (created during validator-setup)"
     fi
@@ -991,7 +1004,7 @@ check_cruft_timer() {
       emit monad "monad.cruft-timer" PASS "monad-cruft.timer enabled (hourly artifact cleanup)"
     else
       emit monad "monad.cruft-timer" WARN "monad-cruft.timer present but not enabled — old artifacts will accumulate" \
-           "systemctl enable --now monad-cruft.timer"
+           $'Quick fix:   sudo systemctl enable --now monad-cruft.timer\nAuto:        monad-validator-setup → step_cruft_timer does exactly this.\nVerify:      systemctl list-timers monad-cruft.timer\nWhy:         old WAL/triedb artifacts otherwise grow unbounded and eventually fill /.'
     fi
   else
     emit monad "monad.cruft-timer" INFO "monad-cruft.timer not installed (ships with monad package)"
@@ -1030,7 +1043,7 @@ check_authudp_config() {
     emit monad "monad.authudp-cfg" PASS "node.toml has all Auth UDP keys in correct sections"
   else
     emit monad "monad.authudp-cfg" FAIL "node.toml missing Auth UDP keys: $missing" \
-         "Add to [peer_discovery] and [network] per docs: https://docs.monad.xyz/node-ops/upgrade-instructions/auth-udp"
+         $'Action:      Edit '"$MONAD_NODE_TOML"$' and add the missing keys:\n               [peer_discovery]\n               self_auth_port = 8001\n               self_record_seq_num = 1\n               self_name_record_sig = "<run monad-sign-name-record>"\n               [network]\n               authenticated_bind_address_port = 8001\nGenerate sig: sudo -u monad monad-sign-name-record --help   # see docs for exact CLI\nDocs:        https://docs.monad.xyz/node-ops/upgrade-instructions/auth-udp\nWhy:         Auth UDP is mandatory ≥ v0.12.6; without these keys the node will not\n             join the authenticated mesh and peers will reject it.'
   fi
 }
 
@@ -1059,7 +1072,7 @@ check_github_release() {
       emit monad "monad.upstream" INFO "installed v$installed > GitHub latest stable v$latest (RC or pre-release?)"
     else
       emit monad "monad.upstream" WARN "GitHub stable v$latest > installed v$installed" \
-           "Upgrade: apt-mark unhold monad; apt update; apt install --only-upgrade monad; apt-mark hold monad"
+           $'Quick fix:   sudo apt-mark unhold monad\n             sudo apt update && sudo apt install --only-upgrade monad\n             sudo apt-mark hold monad   # re-hold to prevent surprise upgrades\nVerify:      dpkg-query -W -f=\'${Version}\\n\' monad\nWhy:         lagging behind stable carries CVE and consensus-bug exposure;\n             release notes often include mandatory upgrades for network compatibility.\nNote:        upgrade during a low-stakes window — monad-bft restarts mid-epoch.'
     fi
   fi
 }
@@ -1085,7 +1098,7 @@ check_monad_install() {
 
   if [[ -n "$available" && "$available" != "$installed" ]]; then
     emit monad "monad.version"   WARN "installed=$installed, available=$available" \
-         "Update: apt update && apt install --only-upgrade monad (or unhold first: apt-mark unhold monad)"
+         $'Quick fix:   sudo apt-mark unhold monad   # if on hold\n             sudo apt update && sudo apt install --only-upgrade monad\n             sudo apt-mark hold monad     # re-hold\nVerify:      dpkg-query -W -f=\'${Version}\\n\' monad\nWhy:         apt has a newer version pinned in your suite (noble); the gap may include\n             consensus-affecting fixes. Don\'t lag.'
   else
     emit monad "monad.version"   PASS "installed=$installed (latest)"
   fi
@@ -1097,7 +1110,7 @@ check_monad_install() {
       emit monad "monad.authudp" PASS "Auth UDP active (wireauth sessions in logs)"
     else
       emit monad "monad.authudp" WARN "no wireauth log entries — Auth UDP may not be active or DEBUG logs disabled" \
-           "Verify: journalctl -u monad-bft -n 1000 | grep wireauth"
+           $'Investigate: journalctl -u monad-bft -n 2000 | grep -E "wireauth|monad_wireauth"\n             # if no matches: confirm node.toml has [peer_discovery] keys (monad.authudp-cfg)\nLog level:   monad-bft default log level may exclude DEBUG; check RUST_LOG / log filter.\nWhy:         no wireauth activity means peer authentication is not negotiating —\n             node may be running but isolated from the authenticated mesh.'
     fi
   fi
 }
@@ -1146,7 +1159,7 @@ check_authudp_peers() {
     emit monad "monad.authudp-peers" PASS "$peers unique peers in recent keepalives (healthy mesh)"
   elif (( peers > 0 )); then
     emit monad "monad.authudp-peers" WARN "only $peers peer(s) in keepalives — small set, check NAT/firewall" \
-         "Verify: journalctl -u monad-bft -n 2000 | grep 'sending keepalive packet'"
+         $'Investigate: journalctl -u monad-bft -n 2000 | grep "sending keepalive packet" | \\\n               grep -oE \'remote_addr":"[^"]+\' | sort -u\n             # expected: ≥5 unique remote endpoints\nCheck:       firewall 8001/udp inbound? NAT (net.nat-detect)? port already in use?\nWhy:         <5 keepalive peers usually means partial mesh: firewall blocks inbound\n             Auth UDP, or NAT drops return path; raptorcast efficiency suffers.'
   else
     emit monad "monad.authudp-peers" INFO "no recent keepalive activity — Auth UDP may not be negotiating or DEBUG logs disabled"
   fi
@@ -1167,7 +1180,7 @@ check_vdp_otel_collector() {
   done
   if [[ -z "$active" ]]; then
     emit monad "vdp.otel-collector" FAIL "no active OTel collector — VDP requires metrics push to MF" \
-         "Monad apt package installs otelcol; ensure: sudo systemctl enable --now otelcol"
+         $'Quick fix:   sudo systemctl enable --now otelcol   # if already installed by `monad` pkg\nIf missing:  sudo apt install -y monad   # otelcol is bundled with the monad package\nVDP setup:   sudo ./monad-validator-setup --with-vdp-otel   # downloads & runs MF script\nVerify:      systemctl is-active otelcol && curl -s localhost:8888/metrics | head\nWhy:         VDP eligibility requires push of monad_* metrics to\n             otel-external.monadinfra.com:443. No collector → no metrics → excluded.'
     return
   fi
   emit monad "vdp.otel-collector" PASS "$active.service active"
@@ -1198,7 +1211,7 @@ check_vdp_otel_version() {
     emit monad "vdp.otel-version" PASS "$bin v$ver (>= $required required by MF setup script)"
   else
     emit monad "vdp.otel-version" WARN "$bin v$ver < $required — MF setup script targets $required" \
-         "MF setup script auto-installs the right version; or upgrade manually: apt install otelcol=$required-1"
+         $'Quick fix:   sudo ./monad-validator-setup --with-vdp-otel   # MF script installs required version\nManual:      sudo apt install -y '"$bin"$'='"$required"$'-1   # if MF script unavailable\nVerify:      '"$bin"$' --version   # ≥ '"$required"$'\nWhy:         MF VDP config (resource processor + attributes) uses features only in\n             '"$bin"$' ≥ '"$required"$'; older versions silently fail to apply config.'
   fi
 }
 
@@ -1214,7 +1227,7 @@ check_vdp_secp_key_label() {
   local payload
   payload=$(curl -sf --max-time 5 "$metrics_url" 2>/dev/null) || {
     emit monad "vdp.secp-key-label" WARN "could not reach $metrics_url — OTel collector may not be exposing :8889" \
-         "Check binding: ss -tln | grep 8889 (Monad apt config or MF setup script should bind it)"
+         $'Investigate: ss -tln | grep 8889                          # is anything bound?\n             systemctl status otelcol otelcol-contrib        # which collector?\n             journalctl -u otelcol -n 100 --no-pager         # config errors?\nQuick fix:   sudo ./monad-validator-setup --with-vdp-otel    # apply MF config\nWhy:         MF VDP setup binds Prometheus receiver on :8889 — required for resource\n             attribute injection. Missing binding = no metrics flow.'
     return
   }
   local secp
@@ -1262,7 +1275,7 @@ check_vdp_mf_push() {
     emit monad "vdp.mf-push" PASS "OTel collector has $conns active TLS connection(s) to :443 — push to MF appears active"
   else
     emit monad "vdp.mf-push" WARN "no ESTABLISHED :443 connections from otelcol — push to MF may not be configured" \
-         "Verify exporter 'otlp/monadinfra' → https://otel-external.monadinfra.com:443; check: journalctl -u <svc> | grep -i monadinfra"
+         $'Investigate: journalctl -u otelcol -u otelcol-contrib -n 200 --no-pager | grep -iE "monadinfra|export|tls"\n             grep -r monadinfra /etc/otelcol* 2>/dev/null   # is the MF exporter defined?\nQuick fix:   sudo ./monad-validator-setup --with-vdp-otel   # MF script writes exporter config\nVerify:      ss -tnp | grep "pid=$(systemctl show otelcol --property=MainPID --value)" | grep :443\nWhy:         no outbound :443 from otelcol = metrics not reaching otel-external.monadinfra.com.\n             Without this push, MF cannot count your validator for VDP.'
   fi
 }
 
