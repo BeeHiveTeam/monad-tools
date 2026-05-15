@@ -1491,27 +1491,42 @@ step_start_services() {
   fi
 
   if (( DRY_RUN )); then
-    for s in "${services[@]}"; do
-      echo "  ${C_DIM}[dry-run] systemctl enable --now $s${C_RESET}"
-    done
+    echo "  ${C_DIM}[dry-run] chown -R monad:monad /home/monad/${C_RESET}"
+    echo "  ${C_DIM}[dry-run] systemctl enable ${services[*]}${C_RESET}"
+    echo "  ${C_DIM}[dry-run] systemctl start  ${services[*]}${C_RESET}"
     return 0
   fi
 
-  for s in "${services[@]}"; do
-    if ! run "enabling+starting $s" systemctl enable --now "$s"; then
-      err "$s failed to start — check: journalctl -u $s -n 50"
-      return 1
-    fi
-  done
+  # Per docs (step 49 of full-node-installation): chown entire /home/monad
+  # before service start. We've been chown'ing piecemeal (config files, keys)
+  # in their respective steps, but a final blanket chown catches anything
+  # we missed and matches the docs flow exactly.
+  chown -R monad:monad /home/monad 2>>"$LOG_FILE" || \
+    warn "chown -R monad:monad /home/monad/ returned non-zero (some files may stay root-owned)"
+
+  # Per docs (steps 50 + 51): enable then start, all three services in
+  # one command each. Docs do this for a reason — systemd starts the
+  # full target in one batch with proper After= ordering applied.
+  if ! run "enabling ${services[*]}" systemctl enable "${services[@]}"; then
+    err "systemctl enable failed — see $LOG_FILE"
+    return 1
+  fi
+  if ! run "starting ${services[*]}" systemctl start "${services[@]}"; then
+    err "systemctl start failed — check: journalctl -u monad-bft -n 50"
+    return 1
+  fi
+
   sleep 3
+  local any_failed=0
   for s in "${services[@]}"; do
     if systemctl is-active --quiet "$s"; then
       ok "$s active"
     else
-      err "$s not active after start — check journal"
-      return 1
+      err "$s not active after start — check: journalctl -u $s -n 50"
+      any_failed=1
     fi
   done
+  (( any_failed )) && return 1
   ok "All services started. Validator is now online."
 }
 
