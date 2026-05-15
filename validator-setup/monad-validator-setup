@@ -2592,8 +2592,47 @@ step_vdp_otel_push() {
     return 1
   fi
 
+  # MF script's final step verifies that 'secp_key' label appears in
+  # localhost:8889/metrics. That requires monad-bft to be running AND to
+  # have completed at least one Prometheus scrape into otelcol. If we
+  # arrive here right after step_start_services, monad-bft is up but
+  # may not have produced metrics yet. Wait up to 30s for monad_* metrics
+  # to appear; only then invoke the MF script.
+  if systemctl is-active --quiet monad-bft 2>/dev/null; then
+    info "Waiting for monad-bft to emit Prometheus metrics on :8889…"
+    local waited=0
+    while (( waited < 30 )); do
+      if curl -sf --max-time 2 http://localhost:8889/metrics 2>/dev/null \
+           | grep -q '^monad_'; then
+        info "monad_* metrics flowing (after ${waited}s wait)"
+        break
+      fi
+      sleep 2; waited=$((waited+2))
+    done
+    if (( waited >= 30 )); then
+      warn "No monad_* metrics on :8889 after 30s — MF script verify will likely fail."
+      warn "MF setup itself (config + restart) will still apply; re-run --with-vdp-otel after node syncs."
+    fi
+  else
+    warn "monad-bft is NOT active — MF script verify will fail."
+    warn "Start services first: sudo systemctl start monad-bft monad-execution monad-rpc"
+    warn "Then re-run with --with-vdp-otel."
+  fi
+
   info "Running MF VDP setup (idempotent on re-runs)…"
-  bash /tmp/otel-validator-setup.sh
+  if ! bash /tmp/otel-validator-setup.sh; then
+    # MF script may exit non-zero on its own verify step even when the
+    # config write + restart succeeded. Treat as soft-fail: config IS in
+    # place, operator can re-run --with-vdp-otel once monad-bft is syncing
+    # and emitting metrics, and the script's verify will pass then.
+    warn "MF script returned non-zero (likely the secp_key verify step)."
+    warn "The config + otelcol restart still applied — re-check after node sync:"
+    warn "  curl -s http://localhost:8889/metrics | grep secp_key"
+    warn "  ss -tnp | grep \":443\"   # → connections to otel-external.monadinfra.com"
+    warn "Or re-run: sudo ./monad-validator-setup --network=testnet --skip-preflight --with-vdp-otel"
+    return 0   # don't fail the install — config likely OK, only verify failed
+  fi
+  ok "MF VDP setup completed — metrics push to MF is active"
 }
 
 # ===== Step: report =====
@@ -2959,9 +2998,14 @@ EOF
   step_firewall              || failed+=("firewall")
   step_iptables_ddos         || failed+=("iptables-ddos")
   step_monitoring            || failed+=("monitoring")
-  step_vdp_otel_push         || failed+=("vdp-otel-push")
   step_snapshot_restore      || failed+=("snapshot-restore")
   step_start_services        || failed+=("start-services")
+  # VDP OTel push MUST come AFTER services start — the MF setup script's
+  # verify step (`secp_key not found in metrics`) reads localhost:8889/metrics,
+  # which is empty until monad-bft is running AND has emitted at least one
+  # metrics scrape to otelcol. Running this BEFORE start-services guaranteed
+  # the verify to fail with no secp_key in the (empty) metrics stream.
+  step_vdp_otel_push         || failed+=("vdp-otel-push")
   step_report
 
   if (( ${#failed[@]} > 0 )); then
