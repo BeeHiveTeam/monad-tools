@@ -911,8 +911,12 @@ step_generate_keys() {
   chmod 0600 /opt/monad/backup/keystore-password-backup
   ok "Wrote KEYSTORE_PASSWORD to $envfile (mode 0600) + backup in /opt/monad/backup/"
 
-  # Generate keys as 'monad' user
-  if ! sudo -u monad bash -c "
+  # Generate keys. Docs run this as root (not as monad user) — keystore files
+  # land in /home/monad/monad-bft/config/ owned by root, then a chown to
+  # monad:monad at the end. /opt/monad/backup is also a root-owned dir per
+  # docs. Running as 'monad' fails because /opt/monad/backup is 0755 root —
+  # the user can't write there.
+  if ! bash -c "
     set -e
     source /home/monad/.env
     monad-keystore create --key-type secp \
@@ -925,8 +929,18 @@ step_generate_keys() {
       > /home/monad/pubkey-secp-bls
   " 2>>"$LOG_FILE"; then
     err "monad-keystore create failed — see $LOG_FILE"
+    err "Common causes:"
+    err "  - monad-keystore binary not found (monad pkg not installed?)"
+    err "  - KEYSTORE_PASSWORD contains chars that broke shell escaping"
+    err "  - /opt/monad/backup not writable"
+    err "Last 20 lines of log:"
+    tail -20 "$LOG_FILE" | sed 's/^/  /' >&2
     return 1
   fi
+  # chown the new files to monad (per docs at end of install).
+  chown monad:monad /home/monad/monad-bft/config/id-secp /home/monad/monad-bft/config/id-bls 2>/dev/null || true
+  chmod 0600 /home/monad/monad-bft/config/id-secp /home/monad/monad-bft/config/id-bls 2>/dev/null || true
+  chown monad:monad /home/monad/pubkey-secp-bls 2>/dev/null || true
   chmod 0600 /opt/monad/backup/*-backup 2>/dev/null || true
   ok "Generated SECP + BLS keys in /home/monad/monad-bft/config/"
   ok "Public keys recorded in /home/monad/pubkey-secp-bls"
@@ -996,7 +1010,10 @@ step_sign_name_record() {
 
   info "Public IP: $pubip"
   local sig_output
-  if ! sig_output=$(sudo -u monad bash -c "
+  # Run as root (not monad) — monad-sign-name-record reads the keystore which
+  # is now monad-owned 0600, but root can read it anyway. Avoids the
+  # /opt/monad/backup permission pitfall that hit step_generate_keys.
+  if ! sig_output=$(bash -c "
     source /home/monad/.env
     monad-sign-name-record \
       --address ${pubip}:8000 \
@@ -1072,6 +1089,31 @@ step_start_services() {
     info "Skipped — services not installed yet: ${missing[*]}"
     info "(Install monad package first via step_monad_install)"
     return 0
+  fi
+
+  # Hard prerequisite checks — refuse to start if obvious dealbreakers are
+  # missing. monad-bft will crash-loop on missing keys / unformatted triedb /
+  # placeholder node.toml, leaving systemd in "failed" state and the operator
+  # debugging from scratch. Better to bail loudly here.
+  local blockers=()
+  [[ -f /home/monad/monad-bft/config/id-secp ]] || blockers+=("missing /home/monad/monad-bft/config/id-secp (run --generate-keys)")
+  [[ -f /home/monad/monad-bft/config/id-bls ]]  || blockers+=("missing /home/monad/monad-bft/config/id-bls (run --generate-keys)")
+  [[ -L /dev/triedb ]] || blockers+=("/dev/triedb symlink missing (run --triedb-partition= or partition manually)")
+  if [[ -f /home/monad/monad-bft/config/node.toml ]]; then
+    local ben
+    ben=$(awk -F\" '/^[[:space:]]*beneficiary[[:space:]]*=/ {print $2; exit}' /home/monad/monad-bft/config/node.toml)
+    if [[ -z "$ben" || "$ben" == "0x0000000000000000000000000000000000000000" \
+          || "$ben" =~ BENEFICIARY ]]; then
+      blockers+=("node.toml beneficiary not set (run --beneficiary= or edit node.toml)")
+    fi
+  else
+    blockers+=("node.toml missing (run step_config_files)")
+  fi
+  if (( ${#blockers[@]} > 0 )); then
+    err "Refusing to start services — preconditions not met:"
+    for b in "${blockers[@]}"; do err "  - $b"; done
+    err "Fix the above and re-run with --start-services (or systemctl start manually)."
+    return 1
   fi
 
   # Skip if all already active
