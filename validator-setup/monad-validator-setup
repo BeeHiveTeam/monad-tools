@@ -181,7 +181,71 @@ while [[ $# -gt 0 ]]; do
     --full-node)       NODE_TYPE="full" ;;
     --uninstall)       ACTION="uninstall" ;;
     -h|--help)
-      sed -n '2,/^$/p' "$0" | sed 's/^# \?//'
+      cat <<'HELP'
+monad-validator-setup — one-shot Monad validator host configuration.
+
+USAGE
+  sudo ./monad-validator-setup                        # interactive walkthrough
+  sudo ./monad-validator-setup --network=testnet      # skip network prompt
+  sudo ./monad-validator-setup --non-interactive ...  # CI mode (see below)
+
+QUICK START (interactive, recommended for first install)
+  sudo ./monad-validator-setup
+    → script asks: testnet or mainnet, disk to partition, beneficiary
+      address, password mode. Walks through 24 steps with progress.
+
+FULL AUTOMATION (zero prompts — CI / re-installs)
+  sudo ./monad-validator-setup --non-interactive \
+    --network=testnet \
+    --triedb-partition=nvme1n1 --allow-nvme-reformat \
+    --beneficiary=0x<YOUR_REWARDS_ADDRESS> \
+    --node-name=<UNIQUE_MONIKER> \
+    --generate-keys --keys-password=auto \
+    --snapshot-restore --start-services
+
+OPERATOR INPUT NEEDED (cannot be auto-detected)
+  --beneficiary=0x...   Ethereum address where staking rewards land.
+                        For full-nodes you can use 0x000…000 (burn).
+  --node-name=NAME      Unique moniker, displayed in Monad's validator list.
+
+FLAGS (all optional)
+  --network=testnet|mainnet         Which Monad network. Asked interactively.
+  --full-node                       Full-node template (default: validator).
+  --triedb-partition=DEV            DESTRUCTIVE: partition this NVMe for triedb.
+  --triedb-dev=DEV                  IO-scheduler target (no partitioning).
+  --allow-nvme-reformat             Allow nvme format --lbaf=0 under --non-interactive.
+  --beneficiary=0x...               Rewards address; written into node.toml.
+  --node-name=NAME                  Unique moniker; written into node.toml.
+  --generate-keys                   monad-keystore create SECP + BLS keys.
+  --keys-password=auto|prompt       auto = generate + show; prompt = type twice.
+  --sign-name-record                (no-op flag — Auth UDP sig auto-generated)
+  --triedb-format                   (no-op flag — monad-mpt format auto-runs)
+  --snapshot-restore                Download docs hard-reset snapshot. ~10s GB.
+  --with-monitoring                 Install BeeHive monad-grafana stack.
+  --with-vdp-otel                   Run MF VDP OTel push setup (VDP enrollment).
+  --start-services                  systemctl enable+start monad-* at end.
+  --skip-preflight                  Skip monad-doctor pre-check.
+  --non-interactive                 No prompts; missing flags use safe defaults.
+  --dry-run                         Show what would change; no system modifications.
+  --uninstall                       Remove config files (best-effort).
+  -h, --help                        This message.
+
+ENVIRONMENT OVERRIDES
+  MONAD_PKG_VERSION=X.Y.Z           Pin exact monad version (otherwise auto-detected
+                                    from GitHub releases/latest, falls back to apt).
+  MF_BUCKET=URL                     Monad Foundation config bucket
+                                    (default: https://bucket.monadinfra.com).
+  UFW_SSH_PORT="22 2222"            Override auto-detected SSH port list.
+
+AFTER THIS SCRIPT FINISHES (per docs.monad.xyz)
+  1. Wait for sync to network tip:    sudo monad-doctor   # sync.gap should reach 0
+  2. addValidator() on-chain — needs your wallet + 100k MON self-stake
+     (https://github.com/monad-developers/staking-sdk-cli)
+  3. Submit metadata PR:
+     https://github.com/monad-developers/validator-info
+  4. Apply for VDP delegation:
+     https://docs.monad.xyz/node-ops/validator-delegation-program
+HELP
       exit 0 ;;
     *) fatal "Unknown option: $1 (try --help)" ;;
   esac
@@ -230,6 +294,25 @@ confirm() {
   local ans=""
   prompt_read ans "${C_YELLOW}?${C_RESET} $1 [Y/n] "
   [[ ! "$ans" =~ ^[Nn]$ ]]
+}
+
+# Like confirm() but for DESTRUCTIVE actions (data loss possible): requires
+# the operator to type 'y' or 'yes' explicitly — Enter / empty input is
+# treated as 'no'. Prevents accidentally wiping a disk by hitting Enter.
+confirm_destructive() {
+  if (( NON_INTERACTIVE == 1 )); then
+    # Non-interactive auto-Yes only when the operator explicitly enables it
+    # via the optional second arg (e.g. ALLOW_NVME_REFORMAT for nvme format).
+    if [[ "${2:-0}" == "1" ]]; then
+      info "(non-interactive + opt-in: assuming Yes for: $1)"
+      return 0
+    fi
+    err "DESTRUCTIVE action skipped in --non-interactive: $1"
+    return 1
+  fi
+  local ans=""
+  prompt_read ans "${C_RED}${C_BOLD}!${C_RESET} $1 (type 'yes' to proceed) "
+  [[ "$ans" == "yes" || "$ans" == "y" ]]
 }
 
 # Detect ports SSH actually listens on. We must NEVER hardcode 22/tcp into the
@@ -644,7 +727,7 @@ EOF
 
   echo
   warn "${C_BOLD}DESTRUCTIVE${C_RESET}: this will WIPE $dev. Any data on it is lost."
-  if ! confirm "Partition $dev as 'triedb' (single full-disk partition)?"; then
+  if ! confirm_destructive "Partition $dev as 'triedb' (single full-disk partition)?"; then
     info "Skipped by operator"
     return 0
   fi
@@ -661,7 +744,7 @@ EOF
       if (( NON_INTERACTIVE )) && (( ALLOW_NVME_REFORMAT == 0 )); then
         warn "Skipping nvme format in --non-interactive (use --allow-nvme-reformat to opt in)"
         warn "Continuing with ${lba}-byte LBA — triedb performance will suffer (per docs)"
-      elif confirm "Run 'nvme format $dev --lbaf=0 --force' now?"; then
+      elif confirm_destructive "Run 'nvme format $dev --lbaf=0 --force' now?" "$ALLOW_NVME_REFORMAT"; then
         if (( DRY_RUN )); then
           echo "  ${C_DIM}[dry-run] nvme format $dev --lbaf=0 --force${C_RESET}"
         else
@@ -2625,7 +2708,32 @@ do_install() {
   ╚══════════════════════════════════════════════╝
 EOF
   echo "${C_RESET}"
+
+  cat <<EOF
+${C_BOLD}This script will install a Monad node end-to-end (24 steps, ~5–10 min):${C_RESET}
+
+  ${C_BLUE}①${C_RESET} Verify hardware/OS (monad-doctor preflight)
+  ${C_BLUE}②${C_RESET} Install OS packages (curl, gnupg, ufw, parted, python3, …)
+  ${C_BLUE}③${C_RESET} Create 'monad' user + /home/monad/monad-bft directory tree
+  ${C_BLUE}④${C_RESET} Partition a free NVMe disk for /dev/triedb ${C_YELLOW}(destructive — asks first)${C_RESET}
+  ${C_BLUE}⑤${C_RESET} Tune ulimits, IO scheduler (mq-deadline), chrony (NTP)
+  ${C_BLUE}⑥${C_RESET} Add Monad apt repo + install + hold the 'monad' package
+  ${C_BLUE}⑦${C_RESET} Run one-shot triedb format (systemctl start monad-mpt)
+  ${C_BLUE}⑧${C_RESET} Download .env + node.toml from Monad Foundation bucket
+  ${C_BLUE}⑨${C_RESET} ${C_BOLD}Ask you for: beneficiary address (0x…) + node name${C_RESET}
+  ${C_BLUE}⑩${C_RESET} Generate validator keys (SECP + BLS) — ${C_BOLD}saves password to /opt/monad/backup${C_RESET}
+  ${C_BLUE}⑪${C_RESET} Sign Auth UDP name-record + inject into node.toml
+  ${C_BLUE}⑫${C_RESET} Install + enable otelcol (metrics collector)
+  ${C_BLUE}⑬${C_RESET} Configure UFW firewall + iptables UDP-DDoS filter
+  ${C_BLUE}⑭${C_RESET} (Optional, --snapshot-restore) Download recent DB snapshot
+  ${C_BLUE}⑮${C_RESET} ${C_BOLD}Ask you: start services now? (FINAL — goes live on the network)${C_RESET}
+
+${C_BOLD}You'll be prompted ONLY at destructive / operator-specific steps.${C_RESET}
+Other actions just happen with [✓] / [!] / [✗] markers.
+
+EOF
   info "Log file: $LOG_FILE"
+  info "Re-run with --help for all flags"
   (( DRY_RUN )) && warn "DRY-RUN MODE: no changes will be made"
   echo
 
