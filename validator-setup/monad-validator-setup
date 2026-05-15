@@ -18,10 +18,11 @@
 #              VDP OTel push (--with-vdp-otel)
 #              start services (--start-services; prompts otherwise — FINAL go-live)
 #
-# What it deliberately does NOT do:
-#   - Generate or import validator keys (you must do this manually)
-#   - Start monad-bft.service (you start it after placing keys)
-#   - Touch existing files without backup (.bak.<timestamp>)
+# Safety properties:
+#   - Touches no existing file without first saving .bak.<timestamp>
+#   - Destructive operations (disk partition, nvme reformat, key gen, service
+#     start) are gated behind --flags or confirm() prompts — never silent
+#   - --non-interactive auto-Yes confirms only; preflight FAIL still aborts
 #
 # Usage:
 #   sudo ./monad-validator-setup                       # interactive (asks network + prompts for optionals)
@@ -31,11 +32,11 @@
 #   sudo ./monad-validator-setup --dry-run             # show what would change
 #   sudo ./monad-validator-setup --triedb-dev=nvme1n1  # pin IO-scheduler target
 #   sudo ./monad-validator-setup --triedb-partition=nvme1n1   # DESTRUCTIVE: partition this disk for triedb
-#   sudo ./monad-validator-setup --triedb-format       # systemctl start monad-mpt (first-time triedb format)
+#   sudo ./monad-validator-setup --triedb-format       # (kept for back-compat — triedb format now AUTO-runs)
 #   sudo ./monad-validator-setup --beneficiary=0x... --node-name=BeeHive-1   # write into node.toml
 #   sudo ./monad-validator-setup --generate-keys --keys-password=auto        # auto-gen + show password
 #   sudo ./monad-validator-setup --generate-keys --keys-password=prompt      # prompt for password
-#   sudo ./monad-validator-setup --sign-name-record    # auto-sign + inject into node.toml
+#   sudo ./monad-validator-setup --sign-name-record    # (kept for back-compat — name-record sign now AUTO-runs)
 #   sudo ./monad-validator-setup --start-services      # systemctl enable+start monad-* (FINAL, opt-in)
 #   sudo ./monad-validator-setup --with-monitoring     # also install monad-grafana
 #   sudo ./monad-validator-setup --with-vdp-otel       # run MF VDP OTel push setup (testnet first!)
@@ -677,7 +678,7 @@ EOF
 # is already formatted (monad-mpt is a one-shot — second run is a no-op but
 # we don't want to look like we're "re-formatting" needlessly).
 step_triedb_format() {
-  section "Triedb partition format (one-shot, optional)"
+  section "Triedb partition format (one-shot, auto)"
 
   if ! systemctl cat monad-mpt >/dev/null 2>&1; then
     info "monad-mpt service not installed (ships with monad package) — skipping"
@@ -733,6 +734,15 @@ step_node_toml_customize() {
   cur_ben=$(awk -F\" '/^[[:space:]]*beneficiary[[:space:]]*=/ {print $2; exit}' "$node_toml")
   cur_name=$(awk -F\" '/^[[:space:]]*node_name[[:space:]]*=/ {print $2; exit}' "$node_toml")
 
+  # Track whether we've already backed up (we may edit twice — beneficiary
+  # then node_name — but want a single backup of the pre-edit state).
+  local backed_up=0
+  _backup_once() {
+    (( backed_up )) && return
+    backup_file "$node_toml"
+    backed_up=1
+  }
+
   # --- Beneficiary ---
   # A valid beneficiary is ^0x[0-9a-fA-F]{40}$ (Ethereum address). Anything
   # else — empty, the zero address, `<INSERT_ADDRESS>` placeholder, partial
@@ -773,7 +783,7 @@ step_node_toml_customize() {
     if (( DRY_RUN )); then
       echo "  ${C_DIM}[dry-run] set beneficiary = \"$ben_target\" in $node_toml${C_RESET}"
     else
-      backup_file "$node_toml"
+      _backup_once
       sed -i "s|^[[:space:]]*beneficiary[[:space:]]*=.*|beneficiary = \"$ben_target\"|" "$node_toml"
       ok "Set beneficiary = $ben_target"
     fi
@@ -818,7 +828,7 @@ step_node_toml_customize() {
     if (( DRY_RUN )); then
       echo "  ${C_DIM}[dry-run] set node_name = \"$name_target\" in $node_toml${C_RESET}"
     else
-      backup_file "$node_toml"
+      _backup_once
       sed -i "s|^[[:space:]]*node_name[[:space:]]*=.*|node_name = \"$name_target\"|" "$node_toml"
       ok "Set node_name = $name_target"
     fi
@@ -996,7 +1006,7 @@ step_generate_keys() {
 # Inject into node.toml's [peer_discovery] section. Skip if signature already
 # present or keys missing.
 step_sign_name_record() {
-  section "Auth UDP name-record signature (optional)"
+  section "Auth UDP name-record signature (auto)"
 
   if ! command -v monad-sign-name-record >/dev/null 2>&1; then
     info "monad-sign-name-record not installed (ships with monad package) — skipping"
@@ -1031,12 +1041,20 @@ step_sign_name_record() {
   # above prevents that on re-run.
   info "Generating name-record signature (auto — prerequisites are met)"
 
-  # Need public IP
+  # Need public IP. Force IPv4 on BOTH probes — monad-bft binds IPv4 by
+  # default for raptorcast/consensus, and a v6 self_address would break peer
+  # discovery silently.
   local pubip=""
   if command -v curl >/dev/null 2>&1; then
     pubip=$(curl -fsS -m 5 -4 https://ifconfig.me 2>/dev/null \
-            || curl -fsS -m 5 https://api.ipify.org 2>/dev/null \
+            || curl -fsS -m 5 -4 https://api.ipify.org 2>/dev/null \
+            || curl -fsS -m 5 -4 https://icanhazip.com 2>/dev/null \
             || true)
+  fi
+  # Validate looks like IPv4 (defence against ifconfig.me returning HTML/error page)
+  if [[ -n "$pubip" && ! "$pubip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+    warn "Detected '$pubip' doesn't look like an IPv4 address — discarding"
+    pubip=""
   fi
   if [[ -z "$pubip" ]]; then
     err "Could not auto-detect public IP — skipping. Run manually:"
@@ -1243,6 +1261,7 @@ step_iptables_ddos() {
   local rule_marker="# monad-bft UDP raptorcast: drop short packets (per docs)"
   local ufw_before=/etc/ufw/before.rules
   local rule_args=(-p udp --dport 8000 -m length --length 0:1400 -j DROP)
+  local needs_persistence_only=0
 
   # Already in the live ruleset? (matches either via INPUT or ufw-before-input)
   if iptables -C INPUT "${rule_args[@]}" 2>/dev/null \
@@ -1251,7 +1270,8 @@ step_iptables_ddos() {
     # not in before.rules, it'll vanish on next `ufw reload` / reboot.
     if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active" \
        && [[ -f "$ufw_before" ]] && ! grep -qF "$rule_marker" "$ufw_before"; then
-      info "rule is live but not in $ufw_before — will be lost on reboot. Adding…"
+      info "Rule is live but not in $ufw_before — needs persistence only."
+      needs_persistence_only=1
     else
       ok "rule already present (and persistent)"
       return
@@ -1259,19 +1279,32 @@ step_iptables_ddos() {
   fi
 
   if (( DRY_RUN )); then
-    echo "  ${C_DIM}[dry-run] iptables -I INPUT ${rule_args[*]}${C_RESET}"
-    echo "  ${C_DIM}[dry-run] persist rule (via netfilter-persistent or UFW before.rules)${C_RESET}"
+    if (( needs_persistence_only )); then
+      echo "  ${C_DIM}[dry-run] persist rule via UFW before.rules${C_RESET}"
+    else
+      echo "  ${C_DIM}[dry-run] iptables -I INPUT ${rule_args[*]}${C_RESET}"
+      echo "  ${C_DIM}[dry-run] persist rule (via netfilter-persistent or UFW before.rules)${C_RESET}"
+    fi
     return
   fi
 
-  # An iptables INSERT runs ahead of any existing rules on the INPUT chain and
-  # can interact badly with custom netfilter setups (frr/bird/k8s/wireguard).
-  # Operators with their own firewall stack should review before we touch it.
-  info "Will add: iptables -I INPUT ${rule_args[*]}"
-  info "(drops short UDP packets <1400B on :8000 — valid raptorcast traffic is larger)"
-  if ! confirm "Add this iptables rule?"; then
-    warn "Skipped — docs recommend this rule for UDP DDoS robustness"
-    return 0
+  # Decide the prompt based on what we're actually about to do.
+  if (( needs_persistence_only )); then
+    info "iptables UDP-length filter is already in the live ruleset but not in"
+    info "$ufw_before — without persisting, it vanishes on the next ufw reload/reboot."
+    if ! confirm "Persist the existing rule via $ufw_before?"; then
+      warn "Skipped — rule will be lost on next reboot"
+      return 0
+    fi
+  else
+    # An iptables INSERT runs ahead of any existing rules on the INPUT chain and
+    # can interact badly with custom netfilter setups (frr/bird/k8s/wireguard).
+    info "Will add: iptables -I INPUT ${rule_args[*]}"
+    info "(drops short UDP packets <1400B on :8000 — valid raptorcast traffic is larger)"
+    if ! confirm "Add this iptables rule?"; then
+      warn "Skipped — docs recommend this rule for UDP DDoS robustness"
+      return 0
+    fi
   fi
 
   # Apply the rule live (idempotent thanks to the -C check above).
