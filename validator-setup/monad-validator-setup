@@ -75,6 +75,8 @@ WITH_KEYS=0                 # if 1, run monad-keystore create with KEYSTORE_PASS
 KEYSTORE_PASSWORD_INPUT=""  # "auto" | "prompt" | "" (interactive picks)
 WITH_SIGN_NAME_RECORD=0     # if 1, run monad-sign-name-record + inject into node.toml
 WITH_START_SERVICES=0       # if 1, systemctl enable+start monad-* services (FINAL)
+NODE_RECONFIGURED=0         # set to 1 when a step modifies node.toml or keys
+ROLE_TRANSITION=""          # "full→validator" / "validator→full" / "" when changed
 NETWORK=""                  # testnet | mainnet — asked interactively if empty
 NODE_TYPE="validator"       # validator | full — affects which node.toml to fetch
 ACTION="install"
@@ -195,6 +197,24 @@ QUICK START (interactive, recommended for first install)
   sudo ./monad-validator-setup
     → script asks: testnet or mainnet, disk to partition, beneficiary
       address, password mode. Walks through 24 steps with progress.
+
+TWO-PHASE FLOW (recommended for VDP delegation candidates)
+  Phase 1 — install as full-node first (sync the chain, build uptime):
+    sudo ./monad-validator-setup --network=testnet --full-node \
+      --triedb-partition=nvme1n1 --start-services
+    (no keys, no MON needed; nodes uses 0x000…000 burn beneficiary)
+
+  Phase 2 — when you have 100k MON ready, PROMOTE to validator:
+    sudo ./monad-validator-setup --network=testnet \
+      --beneficiary=0x<YOUR_REAL_REWARDS_ADDRESS> \
+      --node-name=<UNIQUE_MONIKER> \
+      --generate-keys --keys-password=auto
+    (re-running detects full→validator transition; patches node.toml,
+     generates keys, signs name-record, hot-reloads monad-bft config —
+     no service restart needed when monad-debug-node reload-config works)
+
+  After Phase 2: addValidator() on-chain via staking-sdk-cli + 100k MON
+  self-stake (see github.com/monad-developers/staking-sdk-cli).
 
 FULL AUTOMATION (zero prompts — CI / re-installs)
   sudo ./monad-validator-setup --non-interactive \
@@ -959,6 +979,15 @@ step_node_toml_customize() {
       _backup_once
       sed -i "s|^[[:space:]]*beneficiary[[:space:]]*=.*|beneficiary = \"$ben_target\"|" "$node_toml"
       ok "Set beneficiary = $ben_target"
+      NODE_RECONFIGURED=1
+      # Detect full→validator transition: previous beneficiary was zero address
+      # (full-node default) and new one is a real Ethereum address.
+      if [[ "$cur_ben" == "0x0000000000000000000000000000000000000000" \
+            && "$ben_target" != "0x0000000000000000000000000000000000000000" ]]; then
+        ROLE_TRANSITION="full→validator"
+        info "${C_BOLD}Detected role transition: full-node → validator-ready${C_RESET}"
+        info "  (beneficiary moved from 0x000…000 to your reward address)"
+      fi
     fi
   elif (( ben_is_valid == 0 )); then
     # Operator declined to provide a beneficiary AND current value is a
@@ -1005,6 +1034,7 @@ step_node_toml_customize() {
       # Use # as sed delimiter — node_name may contain | or / chars
       sed -i "s#^[[:space:]]*node_name[[:space:]]*=.*#node_name = \"${name_target//\#/\\#}\"#" "$node_toml"
       ok "Set node_name = $name_target"
+      NODE_RECONFIGURED=1
     fi
   fi
 
@@ -1246,6 +1276,7 @@ step_generate_keys() {
   ok "Generated SECP + BLS keys in /home/monad/monad-bft/config/"
   ok "Public keys recorded in /home/monad/pubkey-secp-bls"
   warn "${C_BOLD}BACK UP THE PASSWORD NOW. Without it the keys are unrecoverable.${C_RESET}"
+  NODE_RECONFIGURED=1
 }
 
 # ===== Step: sign node-name record (optional) =====
@@ -1416,6 +1447,7 @@ with open(path, 'w') as f:
 print("Injected name-record signature into node.toml")
 PYEOF
   ok "self_name_record_sig injected into node.toml [peer_discovery]"
+  NODE_RECONFIGURED=1
 }
 
 # ===== Step: snapshot restore (optional, per docs hard-reset) =====
@@ -1559,13 +1591,48 @@ step_start_services() {
     return 1
   fi
 
-  # Skip if all already active
+  # Skip if all already active — BUT if we just modified node.toml or keys
+  # this run (e.g. full→validator promotion), the running services don't
+  # know about the change. Try monad-debug-node reload-config first (hot
+  # reload, no service downtime); fall back to `systemctl restart monad-bft`.
   local active_all=1
   for s in "${services[@]}"; do
     systemctl is-active --quiet "$s" || { active_all=0; break; }
   done
   if (( active_all )); then
-    ok "All services already active: ${services[*]}"
+    if (( NODE_RECONFIGURED == 0 )); then
+      ok "All services already active: ${services[*]}"
+      return 0
+    fi
+    # Reconfigured in this run — propagate changes.
+    if [[ -n "$ROLE_TRANSITION" ]]; then
+      info "Applying role transition ($ROLE_TRANSITION) to running monad-bft…"
+    else
+      info "node.toml / keys changed this run — reloading monad-bft config…"
+    fi
+    if (( DRY_RUN )); then
+      echo "  ${C_DIM}[dry-run] monad-debug-node reload-config OR systemctl restart monad-bft${C_RESET}"
+      return 0
+    fi
+    local sock=/home/monad/monad-bft/controlpanel.sock
+    if command -v monad-debug-node >/dev/null 2>&1 && [[ -e "$sock" ]]; then
+      if sudo -u monad monad-debug-node --control-panel-ipc-path "$sock" reload-config 2>>"$LOG_FILE"; then
+        ok "monad-bft reloaded config without restart (no downtime)"
+        return 0
+      fi
+      warn "reload-config failed — falling back to systemctl restart monad-bft"
+    fi
+    if ! run "restarting monad-bft to pick up new config" systemctl restart monad-bft; then
+      err "monad-bft restart failed — check journal"
+      return 1
+    fi
+    sleep 3
+    if systemctl is-active --quiet monad-bft; then
+      ok "monad-bft restarted with new config"
+    else
+      err "monad-bft not active after restart — check: journalctl -u monad-bft -n 50"
+      return 1
+    fi
     return 0
   fi
 
@@ -2578,6 +2645,23 @@ ${C_BOLD}Status (network: ${NETWORK:-?}, type: ${NODE_TYPE}):${C_RESET}
 EOF
 
   if (( svc_already_running )); then
+    if [[ -n "$ROLE_TRANSITION" ]]; then
+      cat <<EOF
+
+${C_BOLD}${C_GREEN}═══════════════════════════════════════════════════
+  Role transition: ${ROLE_TRANSITION} applied.
+═══════════════════════════════════════════════════${C_RESET}
+
+  Your node is now ${C_BOLD}validator-ready${C_RESET} (software side).
+  On-chain registration is still needed to actually validate blocks.
+
+  Next on-chain step (off-server, needs your EVM wallet + MON):
+       https://github.com/monad-developers/staking-sdk-cli
+       addValidator(secp_pubkey, bls_pubkey, ...)   # with 100k MON self-stake
+       cat /home/monad/pubkey-secp-bls              # ← pubkeys for the call
+
+EOF
+    fi
     cat <<EOF
 
   ${C_GREEN}✓${C_RESET} Services are running. Watch logs to confirm sync:
