@@ -394,12 +394,16 @@ step_preflight() {
 step_dependencies() {
   section "System dependencies (per docs)"
   # gnupg: needed to dearmor the ASCII-armored apt signing key (since 2026-05-14).
+  # parted: needed by step_triedb_partition for mklabel/mkpart.
+  # python3: needed by step_sign_name_record for TOML injection (usually
+  #          pre-installed via python3-minimal essential, but minimal images
+  #          sometimes lack it).
   # On Ubuntu 24.04 `ufw` and `iptables-persistent` declare Conflicts at the
   # Debian metadata level — installing both in one apt call (or installing ufw
   # after iptables-persistent) silently removes iptables-persistent. We do NOT
   # bundle iptables-persistent here. The iptables UDP DROP rule is persisted
   # via UFW's /etc/ufw/before.rules instead (handled by step_iptables_ddos).
-  local pkgs=(curl gnupg nvme-cli aria2 jq ethtool ufw iptables)
+  local pkgs=(curl gnupg nvme-cli aria2 jq ethtool ufw iptables parted python3)
   local missing=()
   for p in "${pkgs[@]}"; do
     dpkg -l "$p" 2>/dev/null | grep -qE '^.i  ' || missing+=("$p")
@@ -622,9 +626,13 @@ step_triedb_partition() {
 
   run "parted: mklabel gpt on $dev" parted -s "$dev" mklabel gpt || return 1
   run "parted: mkpart triedb on $dev" parted -s "$dev" mkpart triedb 0% 100% || return 1
-  sleep 2  # udev settle
+  # Wait for kernel to re-read the partition table and for udev to create
+  # device nodes. Without an explicit settle, slow boxes race: lsblk returns
+  # only the parent disk, no partition, and step bails with "could not detect
+  # new partition." partprobe nudges the kernel; udevadm settle waits for
+  # all queued events to drain.
   partprobe "$dev" 2>/dev/null || true
-  sleep 1
+  udevadm settle --timeout=10 2>/dev/null || sleep 2
 
   # Detect new partition name (nvme0n1 → nvme0n1p1, sda → sda1)
   local part_name
@@ -890,23 +898,39 @@ step_generate_keys() {
     return 0
   fi
 
+  # Escape single quotes for bash single-quoted-string syntax: ' → '\''
+  # Auto-generated base64 passwords don't contain ', but operator-typed
+  # ones might — without this escape, a password like  abc'def  would
+  # produce  KEYSTORE_PASSWORD='abc'def'  which is a parse error in `source`.
+  local password_esc="${password//\'/\'\\\'\'}"
+
   # Write to /home/monad/.env (replace existing line or append).
   local envfile=/home/monad/.env
   if [[ -f "$envfile" ]] && grep -q '^KEYSTORE_PASSWORD=' "$envfile"; then
     backup_file "$envfile"
-    # Use awk + temp file for safety (escapes don't need to be perfect because
-    # password is base64 or operator-typed; we always single-quote it).
-    awk -v pw="$password" '
+    # Use awk + temp file for safety. password_esc is pre-escaped so the
+    # resulting `KEYSTORE_PASSWORD='...'` is parseable by `source`.
+    awk -v pw="$password_esc" '
       /^KEYSTORE_PASSWORD=/ { print "KEYSTORE_PASSWORD='\''" pw "'\''"; next }
       { print }
     ' "$envfile" >"${envfile}.tmp" && mv "${envfile}.tmp" "$envfile"
   else
-    echo "KEYSTORE_PASSWORD='${password}'" >>"$envfile"
+    echo "KEYSTORE_PASSWORD='${password_esc}'" >>"$envfile"
   fi
   chown monad:monad "$envfile"
   chmod 0600 "$envfile"
 
-  # Backup directory per docs
+  # Sanity-check the resulting .env actually sources cleanly. If we
+  # corrupted it (escape bug), monad-keystore below will fail in a
+  # confusing way — better catch it here.
+  if ! ( set +u; source "$envfile" >/dev/null 2>&1; [[ -n "${KEYSTORE_PASSWORD:-}" ]] ); then
+    err "$envfile became un-sourceable after writing KEYSTORE_PASSWORD."
+    err "Likely a quoting/escape bug in the password — review and restore from:"
+    err "  ${envfile}.bak.${TS}"
+    return 1
+  fi
+
+  # Backup directory per docs (root-owned, operator-readable only).
   mkdir -p /opt/monad/backup
   echo "Keystore password: $password" >/opt/monad/backup/keystore-password-backup
   chmod 0600 /opt/monad/backup/keystore-password-backup
@@ -1430,7 +1454,12 @@ net.ipv4.tcp_fastopen = 3
   fi
   echo "$content" >"$conf"
   ok "Wrote $conf"
-  run "applying sysctl" sysctl --system
+  # `sysctl --system` may warn about unrelated drop-ins on the box but still
+  # apply our settings. Don't fail the whole step on its rc, just surface it.
+  if ! run "applying sysctl" sysctl --system; then
+    warn "sysctl --system returned non-zero — values from $conf may still be in effect."
+    warn "Check: sysctl net.core.rmem_max vm.swappiness fs.file-max"
+  fi
 }
 
 # ===== Step: ulimits =====
@@ -1565,7 +1594,8 @@ ACTION==\"add|change\", SUBSYSTEM==\"block\", KERNEL==\"nvme*\", \\
   fi
   echo "$rule_content" >"$rule"
   ok "Wrote udev rule (persists across reboots)"
-  run "reloading udev" udevadm control --reload-rules
+  run "reloading udev" udevadm control --reload-rules || \
+    warn "udev rule written but reload failed — will apply on next boot"
 }
 
 # ===== Step: chrony =====
@@ -1600,13 +1630,19 @@ step_chrony() {
     fi
   fi
 
-  run "installing chrony" apt-get install -y chrony
-  run "starting chrony" systemctl enable --now chrony
+  if ! run "installing chrony" apt-get install -y chrony; then
+    err "chrony install failed — see $LOG_FILE"
+    return 1
+  fi
+  if ! run "starting chrony" systemctl enable --now chrony; then
+    err "chrony failed to enable/start — see $LOG_FILE"
+    return 1
+  fi
   sleep 2
   if systemctl is-active --quiet chrony; then
     ok "chrony installed and active"
   else
-    err "chrony failed to start"
+    err "chrony unit not active after start — check: systemctl status chrony"
     return 1
   fi
 }
@@ -1868,7 +1904,10 @@ step_otelcol_enable() {
     return 0
   fi
 
-  run "enabling otelcol" systemctl enable --now otelcol
+  if ! run "enabling otelcol" systemctl enable --now otelcol; then
+    err "systemctl enable --now otelcol failed — check $LOG_FILE"
+    return 1
+  fi
   sleep 2
   if systemctl is-active --quiet otelcol; then
     ok "otelcol active — local metrics collector running"
@@ -2038,48 +2077,96 @@ EOF
 
 # ===== Print next steps =====
 print_next_steps() {
+  # Detect what's already done so we don't tell the operator to re-do steps
+  # that opt-in flags already handled.
+  local svc_already_running=0
+  if systemctl is-active --quiet monad-bft 2>/dev/null \
+     && systemctl is-active --quiet monad-execution 2>/dev/null; then
+    svc_already_running=1
+  fi
+  local keys_already_present=0
+  if [[ -f /home/monad/monad-bft/config/id-secp && -f /home/monad/monad-bft/config/id-bls ]]; then
+    keys_already_present=1
+  fi
+  local triedb_already_set=0
+  [[ -L /dev/triedb ]] && triedb_already_set=1
+
   cat <<EOF
 
 ${C_GREEN}${C_BOLD}═══════════════════════════════════════════════════
   Validator host configured.
 ═══════════════════════════════════════════════════${C_RESET}
 
-${C_BOLD}Next steps (network: ${NETWORK:-?}, type: ${NODE_TYPE}):${C_RESET}
+${C_BOLD}Status (network: ${NETWORK:-?}, type: ${NODE_TYPE}):${C_RESET}
+EOF
 
-  1. Customize /home/monad/monad-bft/config/node.toml (template downloaded from
+  if (( svc_already_running )); then
+    cat <<EOF
+
+  ${C_GREEN}✓${C_RESET} Services are running. Watch logs to confirm sync:
+       journalctl -u monad-bft -u monad-execution -u monad-rpc -f
+  ${C_GREEN}✓${C_RESET} Final health check:
+       sudo $DOCTOR_PATH
+  ${C_GREEN}✓${C_RESET} Optional — Foundation's Auth UDP check:
+       curl -fsSL https://bucket.monadinfra.com/scripts/validate-auth-udp-config.sh | bash
+EOF
+  else
+    # Build a checklist of what still needs doing
+    echo
+    echo "${C_BOLD}Remaining manual steps:${C_RESET}"
+    echo
+    local step_n=1
+    # node.toml editing — always relevant unless explicitly set via flags
+    cat <<EOF
+  ${step_n}. Review /home/monad/monad-bft/config/node.toml (from
      ${MF_BUCKET}/config/${NETWORK:-<network>}/latest/):
-     - beneficiary = "0x<your-reward-address>"
-     - node_name   = "<unique-moniker>"
+     - beneficiary = "0x<your-reward-address>"   ${BENEFICIARY:+(already set: $BENEFICIARY)}
+     - node_name   = "<unique-moniker>"          ${NODE_NAME:+(already set: $NODE_NAME)}
      - For Auth UDP: self_auth_port = 8001, authenticated_bind_address_port = 8001
-       Run monad-sign-name-record to generate self_name_record_sig
-       (see docs.monad.xyz/node-ops/upgrade-instructions/auth-udp).
+EOF
+    step_n=$((step_n+1))
 
-  2. Place validator keys in /home/monad/monad-bft/config/
-     (owner=monad:monad, mode 0600). Refer to:
-     https://docs.monad.xyz/node-ops/validator-installation
+    if (( keys_already_present == 0 )); then
+      cat <<EOF
 
-  3. TrieDB device: /dev/triedb must symlink to a dedicated 512-byte LBA NVMe
-     partition. step_triedb_symlink wrote /etc/udev/rules.d/99-triedb.rules
-     if a partition was already present. If you partition a new disk later,
-     re-run this step.
+  ${step_n}. Generate or place validator keys in /home/monad/monad-bft/config/
+     (owner=monad:monad, mode 0600). Either:
+        sudo $0 --generate-keys --keys-password=auto
+     OR follow docs.monad.xyz/node-ops/validator-installation
+EOF
+      step_n=$((step_n+1))
+    fi
 
-     First-time only: format the triedb partition (one-shot, per docs):
-       sudo systemctl start monad-mpt
-       sudo journalctl -u monad-mpt -n 14 -o cat
+    if (( triedb_already_set == 0 )); then
+      cat <<EOF
 
-  4. Start services (in order):
-     sudo systemctl enable --now monad-execution
-     sudo systemctl enable --now monad-bft
-     sudo systemctl enable --now monad-rpc
+  ${step_n}. Partition + format triedb device. Either:
+        sudo $0 --triedb-partition=<DEV> --triedb-format
+     OR per docs.monad.xyz/node-ops/full-node-installation (manual parted+udev)
+EOF
+      step_n=$((step_n+1))
+    fi
 
-  5. Watch logs:
-     journalctl -u monad-bft -f
+    cat <<EOF
 
-  6. Verify everything healthy (incl. Auth UDP config + runtime, VDP push):
-     sudo $DOCTOR_PATH
+  ${step_n}. Sign the Auth UDP name-record (after keys + node.toml are set):
+        sudo $0 --sign-name-record
+     OR run monad-sign-name-record manually (see docs/upgrade-instructions/auth-udp).
+EOF
+    step_n=$((step_n+1))
 
-  7. Optional — Foundation's official Auth UDP check:
-     curl -fsSL https://bucket.monadinfra.com/scripts/validate-auth-udp-config.sh | bash
+    cat <<EOF
+
+  ${step_n}. Start services (when everything above is done):
+        sudo $0 --start-services
+     OR sudo systemctl enable --now monad-execution monad-bft monad-rpc
+
+  ${step_n}. Verify everything healthy:
+        sudo $DOCTOR_PATH
+EOF
+  fi
+
+  cat <<EOF
 
   Logs:   $LOG_FILE
   Report: $REPORT_FILE
