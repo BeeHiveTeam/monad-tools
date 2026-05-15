@@ -741,18 +741,26 @@ step_node_toml_customize() {
   cur_name=$(awk -F\" '/^[[:space:]]*node_name[[:space:]]*=/ {print $2; exit}' "$node_toml")
 
   # --- Beneficiary ---
+  # A valid beneficiary is ^0x[0-9a-fA-F]{40}$ (Ethereum address). Anything
+  # else — empty, the zero address, `<INSERT_ADDRESS>` placeholder, partial
+  # hex, stray angle brackets — must be treated as "not set", otherwise
+  # monad-bft panics at startup with `InvalidDigit('<')` (seen on real
+  # deployments where the operator answered the prompt but the regex above
+  # accepted a placeholder).
   local ben_target="$BENEFICIARY"
-  local ben_placeholder='0x[0-9a-fA-F]*BENEFICIARY[0-9a-fA-F]*'
+  local ben_is_valid=0
+  if [[ "$cur_ben" =~ ^0x[0-9a-fA-F]{40}$ \
+        && "$cur_ben" != "0x0000000000000000000000000000000000000000" ]]; then
+    ben_is_valid=1
+  fi
   if [[ -z "$ben_target" ]]; then
-    # Only prompt if current is empty or looks like a placeholder
-    if [[ -z "$cur_ben" || "$cur_ben" == "0x0000000000000000000000000000000000000000" \
-          || "$cur_ben" =~ $ben_placeholder ]]; then
+    if (( ben_is_valid == 0 )); then
       if (( NON_INTERACTIVE )); then
-        warn "Beneficiary placeholder in node.toml and no --beneficiary= provided"
-        warn "Edit $node_toml manually before starting services."
+        warn "Beneficiary in node.toml is invalid/placeholder: '${cur_ben:-(empty)}'"
+        warn "Pass --beneficiary=0x... or edit $node_toml manually before starting services."
       else
         echo
-        info "Current beneficiary: ${cur_ben:-(empty)}"
+        info "Current beneficiary: ${cur_ben:-(empty)}  ← NOT a valid Ethereum address"
         info "This is the address where staking rewards are sent. Must be 0x + 40 hex."
         local input=""
         prompt_read input "${C_YELLOW}?${C_RESET} Beneficiary address (Enter to skip): "
@@ -779,9 +787,20 @@ step_node_toml_customize() {
   fi
 
   # --- node_name ---
+  # A valid node_name is anything that doesn't look like a placeholder.
+  # The default node.toml from MF ships with `node_name = "<NODE_NAME>"` —
+  # the angle brackets are the tell. Treat any value containing `<` or `>`
+  # as a placeholder; also catch common manual placeholders.
   local name_target="$NODE_NAME"
+  local name_is_valid=1
+  if [[ -z "$cur_name" \
+        || "$cur_name" =~ [\<\>] \
+        || "$cur_name" == "PLACEHOLDER" \
+        || "$cur_name" == "REPLACE_ME" ]]; then
+    name_is_valid=0
+  fi
   if [[ -z "$name_target" ]]; then
-    if [[ -z "$cur_name" || "$cur_name" == "PLACEHOLDER" || "$cur_name" == "REPLACE_ME" ]]; then
+    if (( name_is_valid == 0 )); then
       local default_name="BeeHive-$(hostname -s)"
       if (( NON_INTERACTIVE )); then
         name_target="$default_name"
@@ -992,10 +1011,16 @@ step_sign_name_record() {
     info "node.toml not present — run step_config_files first"
     return 0
   fi
-  # Skip if signature already in node.toml (avoid bumping self_record_seq_num)
-  if awk '/^\[peer_discovery\]/ {in_pd=1} /^\[/ && !/^\[peer_discovery\]/ {in_pd=0}
-          in_pd && /^[[:space:]]*self_name_record_sig[[:space:]]*=/ && !/= *""/ {found=1; exit}
-          END {exit !found}' "$node_toml" 2>/dev/null; then
+  # Skip ONLY if signature is already set to a REAL value (avoid bumping
+  # self_record_seq_num for a re-sign that would break Auth UDP with cached
+  # peers). The default MF template ships `self_name_record_sig = "<NAME_RECORD_SIG>"`
+  # — that's NOT a valid signature, treat as missing.
+  local existing_sig
+  existing_sig=$(awk -F\" '/^\[peer_discovery\]/ {in_pd=1; next}
+                           /^\[/ && !/^\[peer_discovery\]/ {in_pd=0}
+                           in_pd && /^[[:space:]]*self_name_record_sig[[:space:]]*=/ {print $2; exit}' \
+                 "$node_toml" 2>/dev/null)
+  if [[ -n "$existing_sig" && ! "$existing_sig" =~ [\<\>] ]]; then
     ok "self_name_record_sig already in node.toml — skipping (avoids seq_num bump)"
     return 0
   fi
@@ -1125,11 +1150,28 @@ step_start_services() {
   [[ -f /home/monad/monad-bft/config/id-bls ]]  || blockers+=("missing /home/monad/monad-bft/config/id-bls (run --generate-keys)")
   [[ -L /dev/triedb ]] || blockers+=("/dev/triedb symlink missing (run --triedb-partition= or partition manually)")
   if [[ -f /home/monad/monad-bft/config/node.toml ]]; then
-    local ben
+    local ben name self_addr self_sig
     ben=$(awk -F\" '/^[[:space:]]*beneficiary[[:space:]]*=/ {print $2; exit}' /home/monad/monad-bft/config/node.toml)
-    if [[ -z "$ben" || "$ben" == "0x0000000000000000000000000000000000000000" \
-          || "$ben" =~ BENEFICIARY ]]; then
-      blockers+=("node.toml beneficiary not set (run --beneficiary= or edit node.toml)")
+    name=$(awk -F\" '/^[[:space:]]*node_name[[:space:]]*=/ {print $2; exit}' /home/monad/monad-bft/config/node.toml)
+    self_addr=$(awk -F\" '/^[[:space:]]*self_address[[:space:]]*=/ {print $2; exit}' /home/monad/monad-bft/config/node.toml)
+    self_sig=$(awk -F\" '/^[[:space:]]*self_name_record_sig[[:space:]]*=/ {print $2; exit}' /home/monad/monad-bft/config/node.toml)
+
+    # Beneficiary must be a real Ethereum address. ANYTHING with < or > or
+    # non-hex chars makes monad-bft panic with InvalidDigit('<') at startup.
+    if [[ ! "$ben" =~ ^0x[0-9a-fA-F]{40}$ ]] \
+       || [[ "$ben" == "0x0000000000000000000000000000000000000000" ]]; then
+      blockers+=("node.toml beneficiary invalid/placeholder: '$ben' (run --beneficiary=0x... or edit node.toml)")
+    fi
+    # node_name placeholder check (angle brackets are the tell)
+    if [[ -z "$name" || "$name" =~ [\<\>] || "$name" == "PLACEHOLDER" ]]; then
+      blockers+=("node.toml node_name is placeholder: '$name' (run --node-name=... or edit node.toml)")
+    fi
+    # Auth UDP: self_address + self_name_record_sig must be set (not placeholder)
+    if [[ -z "$self_addr" || "$self_addr" =~ [\<\>] ]]; then
+      blockers+=("node.toml self_address placeholder: '$self_addr' (run --sign-name-record or edit node.toml)")
+    fi
+    if [[ -z "$self_sig" || "$self_sig" =~ [\<\>] ]]; then
+      blockers+=("node.toml self_name_record_sig placeholder: '$self_sig' (run --sign-name-record or edit node.toml)")
     fi
   else
     blockers+=("node.toml missing (run step_config_files)")
