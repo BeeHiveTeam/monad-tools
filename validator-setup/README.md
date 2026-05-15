@@ -9,25 +9,28 @@ curl -fsSL https://raw.githubusercontent.com/BeeHiveTeam/monad-tools/main/valida
 
 Replaces ~30 minutes of copy-pasting from docs with a single command. After it finishes, edit `node.toml`, place keys, start services, validator is online.
 
-## What it does (17 steps)
+## What it does (18 steps)
 
-1. **Pre-flight** — runs [`monad-doctor`](../doctor/) and aborts on FAIL (override with `--skip-preflight`)
-2. **Dependencies** — `apt install -y curl nvme-cli aria2 jq ethtool ufw iptables iptables-persistent` (per docs)
+Aligned with [docs.monad.xyz/node-ops/full-node-installation](https://docs.monad.xyz/node-ops/full-node-installation) (verified 2026-05-15).
+
+1. **Pre-flight** — runs [`monad-doctor`](../doctor/) and aborts on FAIL (override with `--skip-preflight`; `--non-interactive` + FAIL = hard abort)
+2. **Dependencies** — `apt install -y curl gnupg nvme-cli aria2 jq ethtool ufw iptables` (per docs; `iptables-persistent` excluded — Conflicts with `ufw` on Ubuntu 24.04)
 3. **Monad user + dirs** — `useradd -m -s /bin/bash monad` and the 4 directories under `/home/monad/monad-bft/` listed in docs (`config`, `ledger`, `config/forkpoint`, `config/validators`)
 4. **`/etc/sysctl.d/99-monad-validator.conf`** — `rmem_max`, `wmem_max`, `netdev_max_backlog`, `file-max=2097152`, `swappiness=1`, `tcp_fastopen=3`
 5. **`/etc/security/limits.d/99-monad-validator.conf`** — `nofile=1048576`
 6. **IO scheduler** — `mq-deadline` on the triedb device. Selection priority: `--triedb-dev=` flag → `/dev/triedb` symlink → unused NVMe (largest, never picks an OS-RAID member). Persisted via udev rule that matches by attribute (`rotational=0`, `nvme*`) so swapping the disk doesn't silently regress.
 7. **TriedB SYMLINK udev rule** — writes `/etc/udev/rules.d/99-triedb.rules` with `ENV{ID_PART_ENTRY_UUID}==<PARTUUID>, MODE="0666", SYMLINK+="triedb"` exactly per docs format. Skips gracefully if no triedb partition exists yet.
-8. **chrony** — replaces `systemd-timesyncd` (sub-millisecond NTP for accurate `vote_delay`)
-9. **Monad apt package** — adds `https://pkg.category.xyz/` (Category Labs, official) using deb822 `.sources` format with signing key at `/etc/apt/keyrings/category-labs.gpg`. Installs `monad=$MONAD_PKG_VERSION`. Default is **per-network per docs**: testnet → `0.14.3`, mainnet → `0.14.2`. Override with `MONAD_PKG_VERSION=` env var (empty = install latest available).
+8. **chrony** — replaces `systemd-timesyncd` (sub-millisecond NTP for accurate `vote_delay`); prompts before replacing
+9. **Monad apt package** — adds `https://pkg.category.xyz/` (Category Labs, official) using deb822 `.sources` format with ASCII-armored key (`/keys/public-key.asc`) dearmored to `/etc/apt/keyrings/category-labs.gpg`. Installs `monad=$MONAD_PKG_VERSION` then **`apt-mark hold monad`** (per docs) so unattended-upgrades don't bump mid-epoch. Default is per docs: **testnet → 0.14.3, mainnet → 0.14.3** (both as of 2026-05-15). Override with `MONAD_PKG_VERSION=` env var.
 10. **Bootstrap configs** — downloads `.env` and `node.toml` from `$MF_BUCKET/config/<network>/latest/` per docs. Validator gets `node.toml`; full-node gets `full-node-node.toml` (toggle with `--full-node`). Idempotent: preserves existing files (no overwrite).
-11. **`monad-cruft.timer`** — auto-enables hourly cleanup (was previously left to operator)
-12. **otelcol enable** — idempotently `systemctl enable --now otelcol` if the unit was shipped by the monad package and has a non-empty config. Skips cleanly when `otelcol-contrib` (custom collector) is active, or when no config file exists yet (use `--with-vdp-otel` to install MF config). Closes the gap where `monad-doctor` flagged `vdp.otel-collector` FAIL after a stock install.
-13. **UFW** — `22/tcp` (SSH), `8000/tcp+udp` (P2P), `8001/udp` (Auth UDP only — not TCP)
-14. **iptables UDP DDoS filter** — `iptables -I INPUT -p udp --dport 8000 -m length --length 0:1400 -j DROP` per docs, persisted via `netfilter-persistent save`
-15. **(optional)** `--with-monitoring` runs the BeeHive monad-grafana installer
-16. **(optional)** `--with-vdp-otel` runs the MF VDP setup script after sha256 verification (pinned default; override with `VDP_OTEL_SETUP_SHA256=` env if MF rotates). **Bails cleanly if you have `otelcol-contrib` instead of plain `otelcol`** (different config path) — apply the equivalent manually per [docs/vdp-otel-push.md](../docs/vdp-otel-push.md). Requires `KEYSTORE_PASSWORD` in `/home/monad/.env` (set when generating keys), so put your keys in place first.
-17. JSON post-install report at `/var/lib/monad-validator-setup/report-<ts>.json`
+11. **`monad-cruft.timer`** — auto-enables hourly cleanup (per docs)
+12. **otelcol install** — downloads otelcol_${OTEL_VERSION}_linux_amd64.deb from GitHub releases, **sha256-verified against the pinned hash from docs** (currently `1a1576dde7d…6f8acd9` for v0.139.0). Skips cleanly if `otelcol-contrib` already active or `otelcol ≥ ${OTEL_VERSION}` already installed.
+13. **otelcol enable** — idempotently `systemctl enable --now otelcol` if config is present. Skips cleanly when `otelcol-contrib` is the active collector.
+14. **UFW** — `<auto-detected-SSH-port>/tcp` (typically 22 + any custom port from `sshd_config` or `$SSH_CONNECTION`), `8000/tcp+udp` (P2P), `8001/udp` (Auth UDP only — not TCP). Prompts before `ufw enable`.
+15. **iptables UDP length filter** — `-p udp --dport 8000 -m length --length 0:1400 -j DROP` per docs. Persisted via `netfilter-persistent` if present, else added to `/etc/ufw/before.rules` (`ufw` and `iptables-persistent` Conflict on Ubuntu 24.04). Prompts before insert.
+16. **(optional)** `--with-monitoring` runs the BeeHive monad-grafana installer
+17. **(optional)** `--with-vdp-otel` runs the MF VDP setup script after sha256 verification (pinned default; override with `VDP_OTEL_SETUP_SHA256=` env if MF rotates). **Bails cleanly if you have `otelcol-contrib` instead of plain `otelcol`** — apply manually per [docs/vdp-otel-push.md](../docs/vdp-otel-push.md). Requires `KEYSTORE_PASSWORD` in `/home/monad/.env`, so place keys first.
+18. JSON post-install report at `/var/lib/monad-validator-setup/report-<ts>.json`
 
 ## What it does NOT do
 

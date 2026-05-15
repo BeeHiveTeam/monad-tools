@@ -9,12 +9,14 @@
 #   3. Tune ulimits: /etc/security/limits.conf
 #   4. Set IO scheduler to mq-deadline on triedb device
 #   5. Install chrony (replace systemd-timesyncd if active)
-#   6. Add Monad apt repository and install `monad` package
-#   7. Enable otelcol if shipped by monad pkg and has a config (skipped on contrib setups)
-#   8. Configure UFW firewall (Monad ports + SSH)
-#   9. Optionally install BeeHive monad-grafana monitoring stack
-#  10. Optionally enable VDP OTel push to Monad Foundation (--with-vdp-otel)
-#  11. Print post-install report and next steps for keys + start
+#   6. Add Monad apt repository and install `monad` package (apt-mark hold)
+#   7. Install otelcol .deb from GitHub release (per docs, sha256-verified)
+#   8. Enable otelcol systemd unit (or skip cleanly on contrib setups)
+#   9. Configure UFW firewall (Monad ports + auto-detected SSH port)
+#  10. Add iptables UDP length filter (per docs) — persisted via UFW before.rules
+#  11. Optionally install BeeHive monad-grafana monitoring stack
+#  12. Optionally enable VDP OTel push to Monad Foundation (--with-vdp-otel)
+#  13. Print post-install report and next steps for keys + start
 #
 # What it deliberately does NOT do:
 #   - Generate or import validator keys (you must do this manually)
@@ -61,6 +63,14 @@ SYSCTL_FILE_MAX=2097152
 SYSCTL_SWAPPINESS=1
 ULIMIT_NOFILE=1048576
 
+# OpenTelemetry collector .deb from upstream (per Monad docs — they pin
+# this version + sha256 in full-node-installation page). The Monad apt
+# package does NOT include otelcol; it must be installed separately.
+# Verified 2026-05-15.
+OTEL_VERSION="${OTEL_VERSION:-0.139.0}"
+OTEL_CHECKSUM="${OTEL_CHECKSUM:-1a1576dde7d51fa7094f4963ceaff37c91ac7b9c9593ba735a3a328ec6f8acd9}"
+OTEL_DEB_URL="${OTEL_DEB_URL:-https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v${OTEL_VERSION}/otelcol_${OTEL_VERSION}_linux_amd64.deb}"
+
 # Official Monad apt repo (Category Labs).
 # Source: https://docs.monad.xyz/node-ops/full-node-installation
 MONAD_APT_REPO="${MONAD_APT_REPO:-https://pkg.category.xyz/}"
@@ -73,8 +83,11 @@ MONAD_APT_KEYRING="${MONAD_APT_KEYRING:-/etc/apt/keyrings/category-labs.gpg}"
 # Source: https://docs.monad.xyz/node-ops/full-node-installation
 # Resolved after --network=/choose_network. Set MONAD_PKG_VERSION explicitly to override
 # both defaults, or set it empty to install "latest" available in the apt repo.
+# Per docs.monad.xyz/node-ops/full-node-installation (verified 2026-05-15):
+# both testnet and mainnet currently pin to 0.14.3. Mainnet was 0.14.2 earlier
+# in May 2026; docs were updated to 0.14.3 around the same time we bumped testnet.
 MONAD_PKG_VERSION_TESTNET="${MONAD_PKG_VERSION_TESTNET:-0.14.3}"
-MONAD_PKG_VERSION_MAINNET="${MONAD_PKG_VERSION_MAINNET:-0.14.2}"
+MONAD_PKG_VERSION_MAINNET="${MONAD_PKG_VERSION_MAINNET:-0.14.3}"
 MONAD_PKG_VERSION="${MONAD_PKG_VERSION-__auto__}"   # __auto__ = pick by NETWORK later
 
 # UFW ports per docs:
@@ -948,12 +961,84 @@ EOF
   fi
 }
 
+# ===== Step: otelcol install (per docs) =====
+# Docs explicitly install otelcol from the OpenTelemetry GitHub release with a
+# pinned sha256, then copy the bundled config from /opt/monad/scripts/.
+# We do the same — skipping cleanly when:
+#   - otelcol-contrib is the active collector (operator has custom setup)
+#   - otelcol is already installed at the pinned (or newer) version
+step_otelcol_install() {
+  section "OTel collector install (per docs, v${OTEL_VERSION})"
+
+  if systemctl is-active --quiet otelcol-contrib 2>/dev/null; then
+    info "otelcol-contrib.service is active — leaving plain otelcol untouched"
+    info "(operator runs a custom collector; see docs/vdp-otel-push.md for VDP setup)"
+    return 0
+  fi
+
+  if command -v otelcol >/dev/null 2>&1; then
+    local cur
+    cur=$(otelcol --version 2>/dev/null | awk '{print $NF; exit}' | tr -d 'v')
+    if [[ -n "$cur" ]] && dpkg --compare-versions "$cur" ge "$OTEL_VERSION" 2>/dev/null; then
+      ok "otelcol $cur already installed (≥ $OTEL_VERSION required)"
+      return 0
+    fi
+    info "otelcol $cur present but < $OTEL_VERSION — will upgrade"
+  fi
+
+  if (( DRY_RUN )); then
+    echo "  ${C_DIM}[dry-run] download $OTEL_DEB_URL${C_RESET}"
+    echo "  ${C_DIM}[dry-run] sha256 verify against $OTEL_CHECKSUM${C_RESET}"
+    echo "  ${C_DIM}[dry-run] dpkg -i otelcol .deb${C_RESET}"
+    echo "  ${C_DIM}[dry-run] cp /opt/monad/scripts/otel-config.yaml /etc/otelcol/config.yaml${C_RESET}"
+    return 0
+  fi
+
+  local deb=/tmp/otelcol_linux_amd64.deb
+  if ! run "downloading otelcol .deb" curl -fsSL --max-time 120 -o "$deb" "$OTEL_DEB_URL"; then
+    err "Could not download otelcol from $OTEL_DEB_URL"
+    err "Check network reachability to github.com."
+    return 1
+  fi
+
+  if ! echo "${OTEL_CHECKSUM}  ${deb}" | sha256sum --check --quiet; then
+    err "OTel collector .deb sha256 mismatch — refusing to install"
+    err "Expected: ${OTEL_CHECKSUM}"
+    err "Actual:   $(sha256sum "$deb" | awk '{print $1}')"
+    err "Either GitHub serves a tampered file (very unlikely) or upstream rotated"
+    err "the release. Verify against docs.monad.xyz and update OTEL_CHECKSUM."
+    rm -f "$deb"
+    return 1
+  fi
+
+  if ! run "installing otelcol via dpkg" dpkg -i "$deb"; then
+    err "dpkg -i failed — see $LOG_FILE"
+    return 1
+  fi
+  rm -f "$deb"
+
+  # Docs: cp /opt/monad/scripts/otel-config.yaml /etc/otelcol/config.yaml
+  # The bundled config comes from the monad apt package. If monad isn't
+  # installed yet (operator hasn't reached step_monad_install), or used a
+  # split setup, skip the copy and let step_otelcol_enable warn about
+  # the missing config.
+  if [[ -f /opt/monad/scripts/otel-config.yaml ]]; then
+    mkdir -p /etc/otelcol
+    cp /opt/monad/scripts/otel-config.yaml /etc/otelcol/config.yaml
+    ok "Wrote /etc/otelcol/config.yaml (from monad-bundled template)"
+  else
+    warn "/opt/monad/scripts/otel-config.yaml not found — config not seeded"
+    warn "(monad package may not be installed yet; step_otelcol_enable will warn)"
+  fi
+
+  ok "otelcol $OTEL_VERSION installed"
+}
+
 # ===== Step: otelcol enable =====
-# The Monad apt package installs an otelcol systemd unit but does NOT enable it.
-# Without an active collector, doctor's `vdp.otel-collector` check FAILs and the
-# node cannot push metrics to MF — VDP rejects nodes that don't report.
-# We enable+start the plain `otelcol` only if:
-#   - the unit exists (i.e. monad package shipped it)
+# The OTel collector binary is installed by step_otelcol_install above (or by
+# an operator's custom flow). This step enables + starts the systemd unit if
+# everything is in place. We enable+start plain `otelcol` only if:
+#   - the unit exists
 #   - it is not already active
 #   - a custom otelcol-contrib is NOT active (operator may run their own stack)
 #   - it has a config file (skips clean-slate boxes where MF setup hasn't run yet)
@@ -1182,6 +1267,10 @@ ${C_BOLD}Next steps (network: ${NETWORK:-?}, type: ${NODE_TYPE}):${C_RESET}
      if a partition was already present. If you partition a new disk later,
      re-run this step.
 
+     First-time only: format the triedb partition (one-shot, per docs):
+       sudo systemctl start monad-mpt
+       sudo journalctl -u monad-mpt -n 14 -o cat
+
   4. Start services (in order):
      sudo systemctl enable --now monad-execution
      sudo systemctl enable --now monad-bft
@@ -1253,6 +1342,7 @@ EOF
   step_monad_install    || failed+=("monad-install")
   step_config_files     || failed+=("config-files")
   step_cruft_timer      || failed+=("cruft-timer")
+  step_otelcol_install  || failed+=("otelcol-install")
   step_otelcol_enable   || failed+=("otelcol-enable")
   step_firewall         || failed+=("firewall")
   step_iptables_ddos    || failed+=("iptables-ddos")
