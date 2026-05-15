@@ -310,7 +310,12 @@ step_preflight() {
 step_dependencies() {
   section "System dependencies (per docs)"
   # gnupg: needed to dearmor the ASCII-armored apt signing key (since 2026-05-14).
-  local pkgs=(curl gnupg nvme-cli aria2 jq ethtool ufw iptables iptables-persistent)
+  # On Ubuntu 24.04 `ufw` and `iptables-persistent` declare Conflicts at the
+  # Debian metadata level — installing both in one apt call (or installing ufw
+  # after iptables-persistent) silently removes iptables-persistent. We do NOT
+  # bundle iptables-persistent here. The iptables UDP DROP rule is persisted
+  # via UFW's /etc/ufw/before.rules instead (handled by step_iptables_ddos).
+  local pkgs=(curl gnupg nvme-cli aria2 jq ethtool ufw iptables)
   local missing=()
   for p in "${pkgs[@]}"; do
     dpkg -l "$p" 2>/dev/null | grep -qE '^.i  ' || missing+=("$p")
@@ -386,32 +391,84 @@ step_iptables_ddos() {
     warn "iptables not installed — skipping (install via step_dependencies)"
     return
   fi
-  if iptables -C INPUT -p udp --dport 8000 -m length --length 0:1400 -j DROP 2>/dev/null; then
-    ok "rule already present"
-    return
+
+  local rule_marker="# monad-bft UDP raptorcast: drop short packets (per docs)"
+  local ufw_before=/etc/ufw/before.rules
+  local rule_args=(-p udp --dport 8000 -m length --length 0:1400 -j DROP)
+
+  # Already in the live ruleset? (matches either via INPUT or ufw-before-input)
+  if iptables -C INPUT "${rule_args[@]}" 2>/dev/null \
+     || iptables -C ufw-before-input "${rule_args[@]}" 2>/dev/null; then
+    # Verify it will also survive reboot — if UFW is active but the rule is
+    # not in before.rules, it'll vanish on next `ufw reload` / reboot.
+    if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active" \
+       && [[ -f "$ufw_before" ]] && ! grep -qF "$rule_marker" "$ufw_before"; then
+      info "rule is live but not in $ufw_before — will be lost on reboot. Adding…"
+    else
+      ok "rule already present (and persistent)"
+      return
+    fi
   fi
+
   if (( DRY_RUN )); then
-    echo "  ${C_DIM}[dry-run] iptables -I INPUT -p udp --dport 8000 -m length --length 0:1400 -j DROP${C_RESET}"
-    echo "  ${C_DIM}[dry-run] netfilter-persistent save${C_RESET}"
+    echo "  ${C_DIM}[dry-run] iptables -I INPUT ${rule_args[*]}${C_RESET}"
+    echo "  ${C_DIM}[dry-run] persist rule (via netfilter-persistent or UFW before.rules)${C_RESET}"
     return
   fi
+
   # An iptables INSERT runs ahead of any existing rules on the INPUT chain and
   # can interact badly with custom netfilter setups (frr/bird/k8s/wireguard).
   # Operators with their own firewall stack should review before we touch it.
-  info "Will add: iptables -I INPUT -p udp --dport 8000 -m length --length 0:1400 -j DROP"
+  info "Will add: iptables -I INPUT ${rule_args[*]}"
   info "(drops short UDP packets <1400B on :8000 — valid raptorcast traffic is larger)"
   if ! confirm "Add this iptables rule?"; then
     warn "Skipped — docs recommend this rule for UDP DDoS robustness"
     return 0
   fi
-  run "adding UDP length 0:1400 DROP rule" \
-    iptables -I INPUT -p udp --dport 8000 -m length --length 0:1400 -j DROP
+
+  # Apply the rule live (idempotent thanks to the -C check above).
+  if ! iptables -C INPUT "${rule_args[@]}" 2>/dev/null; then
+    run "adding UDP length 0:1400 DROP rule" iptables -I INPUT "${rule_args[@]}"
+  fi
+
+  # Persistence: choose one of two paths.
+  #   1. netfilter-persistent (saves to /etc/iptables/rules.v4 on shutdown)
+  #   2. UFW before.rules     (loaded by ufw.service on boot)
+  # On Ubuntu 24.04 these packages Conflict — only one will be installed.
+  # We prefer netfilter-persistent when present (classic path); fall back to
+  # UFW's before.rules, which is the canonical way to add custom iptables
+  # rules when UFW is the firewall.
   if command -v netfilter-persistent >/dev/null; then
     run "persisting iptables rules" netfilter-persistent save
+    ok "UDP length filter active and persisted via netfilter-persistent"
+  elif [[ -f "$ufw_before" ]]; then
+    if grep -qF "$rule_marker" "$ufw_before"; then
+      ok "rule already in $ufw_before"
+    else
+      cp "$ufw_before" "${ufw_before}.bak.${TS}"
+      info "backup: ${ufw_before}.bak.${TS}"
+      # Insert in the *filter table, before the COMMIT line, as a
+      # ufw-before-input rule (runs alongside UFW's own pre-input rules).
+      # We use awk so we hit the COMMIT inside the *filter section specifically.
+      awk -v marker="$rule_marker" '
+        /^\*filter/ { in_filter = 1 }
+        in_filter && /^COMMIT/ {
+          print ""
+          print marker
+          print "-A ufw-before-input -p udp --dport 8000 -m length --length 0:1400 -j DROP"
+          in_filter = 0
+        }
+        { print }
+      ' "$ufw_before" >"${ufw_before}.tmp" && mv "${ufw_before}.tmp" "$ufw_before"
+      if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
+        run "reloading ufw to load before.rules" ufw reload
+      fi
+      ok "UDP length filter persisted via $ufw_before"
+    fi
   else
-    warn "netfilter-persistent not available — rule will be lost on reboot"
+    warn "no persistence mechanism (no netfilter-persistent, no $ufw_before) — rule will be lost on reboot"
+    warn "Install one: apt install -y netfilter-persistent  OR  enable UFW first."
   fi
-  ok "UDP length filter active and persisted"
 }
 
 # ===== Step: /dev/triedb SYMLINK udev rule =====

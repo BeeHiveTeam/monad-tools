@@ -881,11 +881,14 @@ check_iptables_udp_filter() {
     emit security "iptables.udp-filter" INFO "iptables not installed — skipping check"
     return
   fi
-  if iptables -C INPUT -p udp --dport 8000 -m length --length 0:1400 -j DROP 2>/dev/null; then
+  # Rule may live in either INPUT (classic netfilter-persistent setup) or
+  # ufw-before-input (when UFW manages persistence via /etc/ufw/before.rules).
+  if iptables -C INPUT -p udp --dport 8000 -m length --length 0:1400 -j DROP 2>/dev/null \
+     || iptables -C ufw-before-input -p udp --dport 8000 -m length --length 0:1400 -j DROP 2>/dev/null; then
     emit security "iptables.udp-filter" PASS "UDP length filter on :8000 active (per docs)"
   else
     emit security "iptables.udp-filter" WARN "no UDP length 0:1400 DROP rule on :8000 — robustness against UDP DDoS missing" \
-         $'Quick fix:   sudo iptables -I INPUT -p udp --dport 8000 -m length --length 0:1400 -j DROP\n             sudo netfilter-persistent save\nAuto:        monad-validator-setup → step_iptables_ddos installs and persists this rule.\nVerify:      sudo iptables -L INPUT -nv | grep "dpt:8000"\nWhy:         valid raptorcast UDP datagrams exceed 1400 bytes; small UDP packets on\n             :8000 are spoofed amplification / probing traffic. Docs recommend this rule.'
+         $'Quick fix:   sudo iptables -I INPUT -p udp --dport 8000 -m length --length 0:1400 -j DROP\n             # then persist: sudo netfilter-persistent save\n             # OR (if UFW replaced iptables-persistent): add to /etc/ufw/before.rules\nAuto:        monad-validator-setup → step_iptables_ddos applies + persists this rule.\n             Auto-detects whether netfilter-persistent or UFW before.rules is the\n             right persistence path (ufw + iptables-persistent Conflict on Ubuntu 24.04).\nVerify:      sudo iptables -L INPUT -nv -L ufw-before-input -nv 2>/dev/null | grep "dpt:8000"\nWhy:         valid raptorcast UDP datagrams exceed 1400 bytes; small UDP packets on\n             :8000 are spoofed amplification / probing traffic. Docs recommend this rule.'
   fi
 }
 
