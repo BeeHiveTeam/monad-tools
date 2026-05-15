@@ -1220,11 +1220,11 @@ step_start_services() {
     fi
     # TOML int fields must NOT be strings — monad-bft parser rejects
     # self_auth_port = "8001" (quoted). Detect by checking the line content.
-    local toml="$node_toml"
-    if grep -qE '^[[:space:]]*self_auth_port[[:space:]]*=[[:space:]]*"' "$toml" 2>/dev/null; then
+    local node_toml_path=/home/monad/monad-bft/config/node.toml
+    if grep -qE '^[[:space:]]*self_auth_port[[:space:]]*=[[:space:]]*"' "$node_toml_path" 2>/dev/null; then
       blockers+=("node.toml self_auth_port is quoted (must be integer): edit to 'self_auth_port = 8001' (no quotes)")
     fi
-    if grep -qE '^[[:space:]]*self_record_seq_num[[:space:]]*=[[:space:]]*"' "$toml" 2>/dev/null; then
+    if grep -qE '^[[:space:]]*self_record_seq_num[[:space:]]*=[[:space:]]*"' "$node_toml_path" 2>/dev/null; then
       blockers+=("node.toml self_record_seq_num is quoted (must be integer): edit to 'self_record_seq_num = 1' (no quotes)")
     fi
   else
@@ -2220,6 +2220,53 @@ EOF
        sudo $DOCTOR_PATH
   ${C_GREEN}✓${C_RESET} Optional — Foundation's Auth UDP check:
        curl -fsSL https://bucket.monadinfra.com/scripts/validate-auth-udp-config.sh | bash
+
+${C_BOLD}═══════════════════════════════════════════════════
+  Becoming a validator — what's next (OFF-SERVER)
+═══════════════════════════════════════════════════${C_RESET}
+
+  The script set up the node software. To actually become a validator
+  in the active set you still need to do these on your laptop / wallet:
+
+  ${C_BOLD}1) Wait for sync${C_RESET} (1–4 h on testnet):
+       sudo $DOCTOR_PATH   # confirms sync.gap = 0 and block.age low
+
+  ${C_BOLD}2) Call addValidator() on-chain${C_RESET} (needs your wallet + MON tokens):
+     Thresholds (per docs):
+       MIN_VALIDATE_STAKE      = 100_000 MON   (self-stake to register)
+       ACTIVE_VALIDATOR_STAKE  = 10_000_000 MON (total stake to enter set)
+       ACTIVE_VALSET_SIZE      = 200 validators (rank by stake weight)
+     Tool: https://github.com/monad-developers/staking-sdk-cli
+     Or:   testnet staking dApp (when published)
+     SECP pubkey for the call: cat /home/monad/pubkey-secp-bls
+     BLS  pubkey for the call: cat /home/monad/pubkey-secp-bls
+
+  ${C_BOLD}3) Submit metadata to monad-developers/validator-info${C_RESET} (GitHub PR):
+       PR: validators/<your-secp-pubkey>.yaml
+       Fields: moniker, website, description, contact, location
+     Required for Foundation visibility, delegation, VDP listing.
+
+  ${C_BOLD}4) (Optional) Enroll in VDP — Validator Delegation Program${C_RESET}:
+     Eligibility (per docs/validator-delegation-program):
+       - testnet uptime ≥ 4 weeks before applying
+       - 98% uptime minimum (3 weekly violations in 3 months → removal)
+       - KYC/KYB completed
+       - commission cap ≤ 10% (currently 15% transitional)
+       - allow Foundation access to node metrics (--with-vdp-otel sets this up)
+       - no external RPC, no LST/LRT building
+     Then: apply via form at docs.monad.xyz/node-ops/validator-delegation-program
+     Tiers grant 25M–90M MON delegation.
+
+  ${C_BOLD}5) Apply config changes without restart${C_RESET} (when editing node.toml later):
+       sudo -u monad monad-debug-node \\
+         --control-panel-ipc-path /home/monad/monad-bft/controlpanel.sock \\
+         reload-config
+
+  ${C_BOLD}6) Long-term operational hygiene${C_RESET}:
+     - Monitor sync.gap / vote_delay (BeeHive monad-grafana stack)
+     - chrony offset < 1ms (already configured)
+     - apt-mark hold monad — bumps only during planned maintenance
+     - Backup KEYSTORE_PASSWORD + /home/monad/monad-bft/config/id-{secp,bls}
 EOF
   else
     # Build a checklist of what still needs doing
