@@ -9,35 +9,56 @@ curl -fsSL https://raw.githubusercontent.com/BeeHiveTeam/monad-tools/main/valida
 
 Replaces ~30 minutes of copy-pasting from docs with a single command. After it finishes, edit `node.toml`, place keys, start services, validator is online.
 
-## What it does (18 steps)
+## What it does (24 steps — many optional)
 
 Aligned with [docs.monad.xyz/node-ops/full-node-installation](https://docs.monad.xyz/node-ops/full-node-installation) (verified 2026-05-15).
 
-1. **Pre-flight** — runs [`monad-doctor`](../doctor/) and aborts on FAIL (override with `--skip-preflight`; `--non-interactive` + FAIL = hard abort)
-2. **Dependencies** — `apt install -y curl gnupg nvme-cli aria2 jq ethtool ufw iptables` (per docs; `iptables-persistent` excluded — Conflicts with `ufw` on Ubuntu 24.04)
-3. **Monad user + dirs** — `useradd -m -s /bin/bash monad` and the 4 directories under `/home/monad/monad-bft/` listed in docs (`config`, `ledger`, `config/forkpoint`, `config/validators`)
-4. **`/etc/sysctl.d/99-monad-validator.conf`** — `rmem_max`, `wmem_max`, `netdev_max_backlog`, `file-max=2097152`, `swappiness=1`, `tcp_fastopen=3`
-5. **`/etc/security/limits.d/99-monad-validator.conf`** — `nofile=1048576`
-6. **IO scheduler** — `mq-deadline` on the triedb device. Selection priority: `--triedb-dev=` flag → `/dev/triedb` symlink → unused NVMe (largest, never picks an OS-RAID member). Persisted via udev rule that matches by attribute (`rotational=0`, `nvme*`) so swapping the disk doesn't silently regress.
-7. **TriedB SYMLINK udev rule** — writes `/etc/udev/rules.d/99-triedb.rules` with `ENV{ID_PART_ENTRY_UUID}==<PARTUUID>, MODE="0666", SYMLINK+="triedb"` exactly per docs format. Skips gracefully if no triedb partition exists yet.
-8. **chrony** — replaces `systemd-timesyncd` (sub-millisecond NTP for accurate `vote_delay`); prompts before replacing
-9. **Monad apt package** — adds `https://pkg.category.xyz/` (Category Labs, official) using deb822 `.sources` format with ASCII-armored key (`/keys/public-key.asc`) dearmored to `/etc/apt/keyrings/category-labs.gpg`. **Auto-detects target version**: queries `github.com/category-labs/monad-bft/releases/latest` (excludes pre-releases by design), falls back to `apt-cache policy monad` Candidate if GitHub is unreachable. Refuses to auto-install `~rc/~alpha/~beta/~dev` suffixes — operator must opt in explicitly via `MONAD_PKG_VERSION=`. After install: **`apt-mark hold monad`** so unattended-upgrades don't bump mid-epoch.
-10. **Bootstrap configs** — downloads `.env` and `node.toml` from `$MF_BUCKET/config/<network>/latest/` per docs. Validator gets `node.toml`; full-node gets `full-node-node.toml` (toggle with `--full-node`). Idempotent: preserves existing files (no overwrite).
-11. **`monad-cruft.timer`** — auto-enables hourly cleanup (per docs)
-12. **otelcol install** — downloads otelcol_${OTEL_VERSION}_linux_amd64.deb from GitHub releases, **sha256-verified against the pinned hash from docs** (currently `1a1576dde7d…6f8acd9` for v0.139.0). Skips cleanly if `otelcol-contrib` already active or `otelcol ≥ ${OTEL_VERSION}` already installed.
-13. **otelcol enable** — idempotently `systemctl enable --now otelcol` if config is present. Skips cleanly when `otelcol-contrib` is the active collector.
-14. **UFW** — `<auto-detected-SSH-port>/tcp` (typically 22 + any custom port from `sshd_config` or `$SSH_CONNECTION`), `8000/tcp+udp` (P2P), `8001/udp` (Auth UDP only — not TCP). Prompts before `ufw enable`.
-15. **iptables UDP length filter** — `-p udp --dport 8000 -m length --length 0:1400 -j DROP` per docs. Persisted via `netfilter-persistent` if present, else added to `/etc/ufw/before.rules` (`ufw` and `iptables-persistent` Conflict on Ubuntu 24.04). Prompts before insert.
-16. **(optional)** `--with-monitoring` runs the BeeHive monad-grafana installer
-17. **(optional)** `--with-vdp-otel` runs the MF VDP setup script after sha256 verification (pinned default; override with `VDP_OTEL_SETUP_SHA256=` env if MF rotates). **Bails cleanly if you have `otelcol-contrib` instead of plain `otelcol`** — apply manually per [docs/vdp-otel-push.md](../docs/vdp-otel-push.md). Requires `KEYSTORE_PASSWORD` in `/home/monad/.env`, so place keys first.
-18. JSON post-install report at `/var/lib/monad-validator-setup/report-<ts>.json`
+**Mandatory steps run on every install. "Optional" steps prompt the operator interactively (default: skip) or activate via a flag — they cover destructive/operator-specific operations the script can't safely auto-decide.**
+
+### End-to-end install in one command
+
+```bash
+sudo MONAD_PKG_VERSION=0.14.3 ./monad-validator-setup --non-interactive \
+  --network=testnet \
+  --triedb-partition=nvme1n1 --triedb-format \
+  --beneficiary=0x<your-address> --node-name=BeeHive-1 \
+  --generate-keys --keys-password=auto \
+  --sign-name-record --start-services
+```
+Zero prompts, fresh-server-to-running-validator in a single invocation.
+
+1. **Pre-flight** — runs [`monad-doctor`](../doctor/) and aborts on FAIL (`--skip-preflight` overrides; `--non-interactive` + FAIL = hard abort)
+2. **Dependencies** — `apt install -y curl gnupg nvme-cli aria2 jq ethtool ufw iptables` (`iptables-persistent` excluded — Conflicts with `ufw` on Ubuntu 24.04)
+3. **Monad user + dirs** — `useradd -m -s /bin/bash monad` + 4 directories under `/home/monad/monad-bft/`
+4. **🔧 OPTIONAL — Triedb partitioning** — lists free NVMe disks, operator picks (or `--triedb-partition=DEV`). Checks LBA, offers `nvme format --lbaf=0` if not 512-byte. Runs `parted mklabel gpt` + `mkpart triedb 0% 100%`, writes `/etc/udev/rules.d/99-triedb.rules` with PARTUUID, triggers udev → `/dev/triedb` symlink appears. **DESTRUCTIVE: confirm() before each step.**
+5. **`/etc/sysctl.d/99-monad-validator.conf`** — `rmem_max`, `wmem_max`, `netdev_max_backlog`, `file-max=2097152`, `swappiness=1`, `tcp_fastopen=3`
+6. **`/etc/security/limits.d/99-monad-validator.conf`** — `nofile=1048576`
+7. **IO scheduler** — `mq-deadline` on triedb device. Priority: `--triedb-dev=` → `/dev/triedb` symlink → unused NVMe. Persisted via udev rule (attribute-match, not by name).
+8. **TriedB SYMLINK udev rule** — `ENV{ID_PART_ENTRY_UUID}==<PARTUUID>, MODE="0666", SYMLINK+="triedb"`. Idempotent: skipped if step 4 already created it.
+9. **chrony** — replaces `systemd-timesyncd` (prompts before).
+10. **Monad apt package** — repo + key (auto-dearmor). **Auto-detects version**: GitHub releases/latest (stable only, не RC) → apt-cache fallback (refuses pre-releases). After install: **`apt-mark hold monad`**.
+11. **🔧 OPTIONAL — Triedb format** — `systemctl start monad-mpt` (one-shot, per docs). Prompts unless `--triedb-format`. Skipped if `/dev/triedb` missing or monad-mpt already ran successfully.
+12. **Bootstrap configs** — `.env` + `node.toml` from `$MF_BUCKET/config/<network>/latest/`. Preserves existing files.
+13. **🔧 OPTIONAL — node.toml customize** — prompts for `beneficiary` (0x-validated) + `node_name` (default `BeeHive-<hostname>`), sed-replaces in node.toml. Or `--beneficiary=` / `--node-name=` flags. Auto-skipped if values already set.
+14. **🔧 OPTIONAL — Validator key generation** — `monad-keystore create` for SECP + BLS keys. Password mode prompts: **1) auto-generate** (32-byte random, shown ONCE — must back up) or **2) keyboard input** (typed twice, masked). Or `--generate-keys --keys-password=auto|prompt`. Writes `KEYSTORE_PASSWORD` to `/home/monad/.env` (mode 0600) + backup in `/opt/monad/backup/`.
+15. **🔧 OPTIONAL — Sign name-record** — `monad-sign-name-record` with auto-detected public IP (`ifconfig.me`). Injects `self_address`, `self_auth_port`, `self_record_seq_num`, `self_name_record_sig` into `[peer_discovery]`. Skipped if signature already present (avoids `self_record_seq_num` bump).
+16. **`monad-cruft.timer`** — auto-enables hourly cleanup
+17. **otelcol install** — otelcol .deb from GitHub releases, **sha256-verified** against pinned hash. Skips on `otelcol-contrib` setups.
+18. **otelcol enable** — `systemctl enable --now otelcol` (if config present)
+19. **UFW** — auto-detected SSH port(s) + 8000/tcp+udp + 8001/udp. Prompts before `ufw enable`.
+20. **iptables UDP length filter** — persisted via `netfilter-persistent` OR `/etc/ufw/before.rules`. Prompts before insert.
+21. **(optional)** `--with-monitoring` → BeeHive monad-grafana installer
+22. **(optional)** `--with-vdp-otel` → MF VDP setup script (sha256-verified)
+23. **🔧 OPTIONAL — Start services** — `systemctl enable --now monad-execution monad-bft monad-rpc`. Prompts with explicit warnings: "node.toml correct? keys placed? triedb formatted?". Or `--start-services`.
+24. **JSON post-install report** at `/var/lib/monad-validator-setup/report-<ts>.json`
+
+🔧 = optional steps (default skip / prompts for opt-in). Six of them turn the script from "configure host" into "fresh-server-to-running-validator in one command."
 
 ## What it does NOT do
 
-- **Does not generate or import validator keys.** Keys are sensitive — you place them yourself in `/home/monad/monad-bft/config/`.
-- **Does not start `monad-bft.service`.** Without keys this would just crash-loop.
 - **Does not modify any file without backup.** Existing files are copied to `<file>.bak.<timestamp>` before edit.
-- **Does not install OTEL collector.** Monad's apt package installs plain `otelcol` itself; step 12 (`step_otelcol_enable`) enables it if it has a config. With `--with-vdp-otel`, the MF setup script is fetched + sha256-verified + run after key placement to satisfy VDP push compliance. Plain-otelcol setups get full automation; `otelcol-contrib` setups are detected and skipped with a pointer to manual instructions.
+- **Does not auto-bump `self_record_seq_num`.** If signature already in node.toml, step 15 is a no-op. Re-signing with bumped seq breaks peers that cached the old signature.
+- **Does not install monad-grafana / VDP OTel push by default.** Those are opt-in via `--with-monitoring` / `--with-vdp-otel`.
 
 ## Run
 

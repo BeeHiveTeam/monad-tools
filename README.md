@@ -5,7 +5,7 @@ Operator tooling for Monad validator nodes, by [BeeHive](https://bee-hive.work).
 | Tool | What | Lines |
 |---|---|---|
 | **[monad-doctor](doctor/)** | Pre-flight readiness check — hardware/OS/network/security/monad/VDP. **55 checks** in 30 seconds, JSON output, exits 0/1/2. Extended fix hints (Quick fix / Auto / Verify / Why) on every FAIL & WARN. | ~1380 |
-| **[monad-validator-setup](validator-setup/)** | One-shot host configuration — **18 steps** matching docs.monad.xyz/node-ops/full-node-installation verbatim: deps → user → tuning → triedb → chrony → monad apt (with hold) → bootstrap configs → otelcol install (sha256-verified) → otelcol enable → UFW → iptables → (optional) VDP OTel push. Idempotent, `--dry-run`, `--network=testnet\|mainnet`. | ~1100 |
+| **[monad-validator-setup](validator-setup/)** | **Fresh-server-to-running-validator** in one command — **24 steps**, 6 of them opt-in for destructive/operator-specific ops (disk partitioning, key generation, name-record signing, service startup). Auto-detects monad version from GitHub releases/latest, otelcol sha256-verified, UFW SSH-port auto-detect. `--non-interactive` mode supports zero-prompt CI install. | ~2100 |
 
 Companion repo: [BeeHiveTeam/monad-grafana](https://github.com/BeeHiveTeam/monad-grafana) — Prometheus + Grafana monitoring stack with 47-panel dashboard, installs in one command.
 

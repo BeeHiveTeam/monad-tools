@@ -3,20 +3,20 @@
 # Project: BeeHive monad-tools
 # Repo: https://github.com/BeeHiveTeam/monad-tools
 #
-# What it does (idempotent, safe to re-run):
-#   1. Run monad-doctor preflight (abort on FAIL unless --skip-preflight)
-#   2. Tune kernel (sysctl): network buffers, swappiness, file-max
-#   3. Tune ulimits: /etc/security/limits.conf
-#   4. Set IO scheduler to mq-deadline on triedb device
-#   5. Install chrony (replace systemd-timesyncd if active)
-#   6. Add Monad apt repository and install `monad` package (apt-mark hold)
-#   7. Install otelcol .deb from GitHub release (per docs, sha256-verified)
-#   8. Enable otelcol systemd unit (or skip cleanly on contrib setups)
-#   9. Configure UFW firewall (Monad ports + auto-detected SSH port)
-#  10. Add iptables UDP length filter (per docs) — persisted via UFW before.rules
-#  11. Optionally install BeeHive monad-grafana monitoring stack
-#  12. Optionally enable VDP OTel push to Monad Foundation (--with-vdp-otel)
-#  13. Print post-install report and next steps for keys + start
+# What it does (idempotent, safe to re-run; many steps optional with explicit
+# opt-in via prompt or flag — defaults preserve manual-control workflow):
+#   Mandatory: preflight, deps, monad user/dirs, sysctl/ulimits, IO scheduler,
+#              triedb udev SYMLINK, chrony, monad apt+pkg, otelcol install+enable,
+#              UFW, iptables UDP filter, post-install report.
+#   Optional (prompts or --flags):
+#              triedb partitioning (--triedb-partition=DEV)
+#              triedb format (--triedb-format)
+#              node.toml customize (--beneficiary=, --node-name=)
+#              key generation (--generate-keys, --keys-password=auto|prompt)
+#              name-record signing (--sign-name-record)
+#              monad-grafana monitoring (--with-monitoring)
+#              VDP OTel push (--with-vdp-otel)
+#              start services (--start-services)
 #
 # What it deliberately does NOT do:
 #   - Generate or import validator keys (you must do this manually)
@@ -24,16 +24,30 @@
 #   - Touch existing files without backup (.bak.<timestamp>)
 #
 # Usage:
-#   sudo ./monad-validator-setup                       # interactive (asks network)
-#   sudo ./monad-validator-setup --network=testnet     # skip prompt
+#   sudo ./monad-validator-setup                       # interactive (asks network + prompts for optionals)
+#   sudo ./monad-validator-setup --network=testnet     # skip network prompt
 #   sudo ./monad-validator-setup --network=mainnet --non-interactive
 #   sudo ./monad-validator-setup --full-node           # full-node template (default: validator)
 #   sudo ./monad-validator-setup --dry-run             # show what would change
-#   sudo ./monad-validator-setup --triedb-dev=nvme1n1
+#   sudo ./monad-validator-setup --triedb-dev=nvme1n1  # pin IO-scheduler target
+#   sudo ./monad-validator-setup --triedb-partition=nvme1n1   # DESTRUCTIVE: partition this disk for triedb
+#   sudo ./monad-validator-setup --triedb-format       # systemctl start monad-mpt (first-time triedb format)
+#   sudo ./monad-validator-setup --beneficiary=0x... --node-name=BeeHive-1   # write into node.toml
+#   sudo ./monad-validator-setup --generate-keys --keys-password=auto        # auto-gen + show password
+#   sudo ./monad-validator-setup --generate-keys --keys-password=prompt      # prompt for password
+#   sudo ./monad-validator-setup --sign-name-record    # auto-sign + inject into node.toml
+#   sudo ./monad-validator-setup --start-services      # systemctl enable+start monad-* (FINAL, opt-in)
 #   sudo ./monad-validator-setup --with-monitoring     # also install monad-grafana
 #   sudo ./monad-validator-setup --with-vdp-otel       # run MF VDP OTel push setup (testnet first!)
 #   sudo ./monad-validator-setup --skip-preflight      # skip monad-doctor
 #   sudo ./monad-validator-setup --uninstall           # remove (best-effort)
+#
+# Full end-to-end automated install (zero-prompt CI):
+#   sudo MONAD_PKG_VERSION=0.14.3 ./monad-validator-setup --non-interactive \
+#     --network=testnet --triedb-partition=nvme1n1 --triedb-format \
+#     --beneficiary=0x... --node-name=BeeHive-1 \
+#     --generate-keys --keys-password=auto \
+#     --sign-name-record --start-services
 
 set -u
 
@@ -44,6 +58,14 @@ SKIP_PREFLIGHT=0
 WITH_MONITORING=0
 WITH_VDP_OTEL=0
 TRIEDB_DEV=""
+TRIEDB_PARTITION_DEV=""     # if set, step_triedb_partition uses this disk non-interactively
+WITH_TRIEDB_FORMAT=0        # if 1, systemctl start monad-mpt (one-shot triedb format)
+BENEFICIARY=""              # 0x... address — auto-injected into node.toml if set
+NODE_NAME=""                # unique moniker — auto-injected into node.toml if set
+WITH_KEYS=0                 # if 1, run monad-keystore create with KEYSTORE_PASSWORD source
+KEYSTORE_PASSWORD_INPUT=""  # "auto" | "prompt" | "" (interactive picks)
+WITH_SIGN_NAME_RECORD=0     # if 1, run monad-sign-name-record + inject into node.toml
+WITH_START_SERVICES=0       # if 1, systemctl enable+start monad-* services (FINAL)
 NETWORK=""                  # testnet | mainnet — asked interactively if empty
 NODE_TYPE="validator"       # validator | full — affects which node.toml to fetch
 ACTION="install"
@@ -131,6 +153,14 @@ while [[ $# -gt 0 ]]; do
     --with-monitoring) WITH_MONITORING=1 ;;
     --with-vdp-otel)   WITH_VDP_OTEL=1 ;;
     --triedb-dev=*)    TRIEDB_DEV="${1#*=}" ;;
+    --triedb-partition=*) TRIEDB_PARTITION_DEV="${1#*=}" ;;
+    --triedb-format)   WITH_TRIEDB_FORMAT=1 ;;
+    --beneficiary=*)   BENEFICIARY="${1#*=}" ;;
+    --node-name=*)     NODE_NAME="${1#*=}" ;;
+    --generate-keys)   WITH_KEYS=1 ;;
+    --keys-password=*) KEYSTORE_PASSWORD_INPUT="${1#*=}" ;;
+    --sign-name-record) WITH_SIGN_NAME_RECORD=1 ;;
+    --start-services)  WITH_START_SERVICES=1 ;;
     --network=*)       NETWORK="${1#*=}" ;;
     --node-type=*)     NODE_TYPE="${1#*=}" ;;
     --full-node)       NODE_TYPE="full" ;;
@@ -152,6 +182,16 @@ case "$NODE_TYPE" in
   validator|full) ;;
   *) fatal "Invalid --node-type='$NODE_TYPE' (must be 'validator' or 'full')" ;;
 esac
+if [[ -n "$BENEFICIARY" ]]; then
+  [[ "$BENEFICIARY" =~ ^0x[0-9a-fA-F]{40}$ ]] \
+    || fatal "Invalid --beneficiary='$BENEFICIARY' (must be 0x + 40 hex chars)"
+fi
+if [[ -n "$KEYSTORE_PASSWORD_INPUT" ]]; then
+  case "$KEYSTORE_PASSWORD_INPUT" in
+    auto|prompt) ;;
+    *) fatal "Invalid --keys-password='$KEYSTORE_PASSWORD_INPUT' (must be 'auto' or 'prompt')" ;;
+  esac
+fi
 
 # ===== Pre-checks =====
 [[ $EUID -eq 0 ]] || fatal "Run as root: sudo $0 $*"
@@ -431,6 +471,662 @@ step_monad_user() {
     chown -R monad:monad /home/monad/monad-bft 2>/dev/null || true
   fi
   ok "Directory tree under /home/monad/monad-bft/ ready"
+}
+
+# Enumerate NVMe disks that look genuinely free (not in OS RAID, no mounts,
+# no swap, no partitions at all). Returns a newline-separated list of disk
+# basenames (e.g. "nvme1n1").
+list_free_nvme_disks() {
+  local root_src root_dev
+  root_src=$(findmnt -no SOURCE / 2>/dev/null)
+  root_dev="${root_src##*/}"
+
+  # Build set of partitions that belong to the root md array (if any).
+  local parts_under_root=()
+  if [[ -n "$root_dev" && -e "/sys/block/$root_dev/md" ]]; then
+    while IFS= read -r m; do
+      parts_under_root+=("$m")
+    done < <(ls "/sys/block/$root_dev/md/" 2>/dev/null | sed -n 's/^dev-//p')
+  fi
+
+  while IFS= read -r disk; do
+    [[ -z "$disk" ]] && continue
+    # Skip if in OS root md array
+    local skip=0
+    for m in "${parts_under_root[@]}"; do
+      if lsblk -ln -o NAME "/dev/$disk" 2>/dev/null | grep -qx "$m"; then skip=1; break; fi
+    done
+    (( skip )) && continue
+    # Skip if anything under this disk is mounted at /
+    if lsblk -ln -o MOUNTPOINT "/dev/$disk" 2>/dev/null | grep -qx "/"; then continue; fi
+    # Skip if any non-swap mount on this disk (already in use)
+    if lsblk -ln -o MOUNTPOINT "/dev/$disk" 2>/dev/null \
+       | grep -vE '^$|^\[SWAP\]$' | grep -q .; then continue; fi
+    echo "$disk"
+  done < <(lsblk -dn -o NAME,TYPE 2>/dev/null | awk '$2=="disk" && $1 ~ /^nvme/ {print $1}')
+}
+
+# ===== Step: partition triedb disk (optional, destructive) =====
+# Per docs:
+#   parted $DRIVE mklabel gpt
+#   parted $DRIVE mkpart triedb 0% 100%
+#   PARTUUID=$(lsblk -o PARTUUID $DRIVE | tail -n 1)
+#   echo "ENV{ID_PART_ENTRY_UUID}==..." > /etc/udev/rules.d/99-triedb.rules
+#   udevadm trigger
+# Also: nvme format --lbaf=0 if LBA != 512 (DESTROYS disk, before parted).
+step_triedb_partition() {
+  section "Triedb disk partitioning (optional, DESTRUCTIVE)"
+
+  # Already done? Skip silently.
+  if [[ -L /dev/triedb ]]; then
+    ok "/dev/triedb already exists — skipping partition step"
+    return 0
+  fi
+
+  # Find candidates
+  local -a candidates=()
+  while IFS= read -r d; do
+    [[ -n "$d" ]] && candidates+=("$d")
+  done < <(list_free_nvme_disks)
+
+  if (( ${#candidates[@]} == 0 )); then
+    info "No free NVMe disks found (all are in OS RAID / mounted / partitioned)"
+    info "If you want to partition a specific disk, pass --triedb-partition=DEV"
+    return 0
+  fi
+
+  # Decide target: --triedb-partition flag wins, else interactive prompt.
+  local target=""
+  if [[ -n "$TRIEDB_PARTITION_DEV" ]]; then
+    target="${TRIEDB_PARTITION_DEV#/dev/}"
+    info "Using --triedb-partition=$target (operator-specified)"
+  elif (( NON_INTERACTIVE )); then
+    info "No --triedb-partition= and --non-interactive — skipping"
+    info "(operator will partition manually; re-run with --triedb-partition=DEV to automate)"
+    return 0
+  else
+    echo
+    echo "${C_BOLD}Free NVMe disks detected (safe to partition for triedb):${C_RESET}"
+    local i=1
+    for d in "${candidates[@]}"; do
+      local size_h model
+      size_h=$(lsblk -dn -o SIZE "/dev/$d" 2>/dev/null | xargs)
+      model=$(lsblk -dn -o MODEL "/dev/$d" 2>/dev/null | xargs)
+      printf "  %d) /dev/%s  %-8s  %s\n" "$i" "$d" "$size_h" "$model"
+      ((i++))
+    done
+    echo "  0) Skip — partition manually later"
+    echo
+    local ans=""
+    prompt_read ans "${C_YELLOW}?${C_RESET} Choose disk for triedb [0-${#candidates[@]}]: "
+    if [[ -z "$ans" || "$ans" == "0" ]]; then
+      info "Skipped — operator will partition manually"
+      return 0
+    fi
+    if [[ ! "$ans" =~ ^[0-9]+$ ]] || (( ans < 1 || ans > ${#candidates[@]} )); then
+      warn "Invalid choice '$ans' — skipping"
+      return 0
+    fi
+    target="${candidates[$((ans-1))]}"
+  fi
+
+  local dev="/dev/$target"
+  if [[ ! -b "$dev" ]]; then
+    err "$dev is not a block device — aborting"
+    return 1
+  fi
+
+  echo
+  warn "${C_BOLD}DESTRUCTIVE${C_RESET}: this will WIPE $dev. Any data on it is lost."
+  if ! confirm "Partition $dev as 'triedb' (single full-disk partition)?"; then
+    info "Skipped by operator"
+    return 0
+  fi
+
+  # LBA check (per docs: must be 512-byte).
+  if command -v nvme >/dev/null 2>&1; then
+    local lba
+    lba=$(lsblk -dn -o LOG-SEC "$dev" 2>/dev/null | tr -d ' ')
+    if [[ -n "$lba" && "$lba" != "512" ]]; then
+      warn "$dev currently has ${lba}-byte LBA — docs require 512 for triedb."
+      warn "Reformatting at the NVMe level (lbaf=0) destroys the disk entirely."
+      if confirm "Run 'nvme format $dev --lbaf=0 --force' now?"; then
+        if (( DRY_RUN )); then
+          echo "  ${C_DIM}[dry-run] nvme format $dev --lbaf=0 --force${C_RESET}"
+        else
+          run "nvme format $dev --lbaf=0" nvme format "$dev" --lbaf=0 --force || {
+            err "nvme format failed — see $LOG_FILE"
+            return 1
+          }
+        fi
+      else
+        warn "Continuing with ${lba}-byte LBA — triedb performance will suffer (per docs)"
+      fi
+    fi
+  fi
+
+  if (( DRY_RUN )); then
+    echo "  ${C_DIM}[dry-run] parted -s $dev mklabel gpt${C_RESET}"
+    echo "  ${C_DIM}[dry-run] parted -s $dev mkpart triedb 0% 100%${C_RESET}"
+    echo "  ${C_DIM}[dry-run] write /etc/udev/rules.d/99-triedb.rules${C_RESET}"
+    return 0
+  fi
+
+  if ! command -v parted >/dev/null 2>&1; then
+    run "installing parted" apt-get install -y parted || {
+      err "Could not install parted"
+      return 1
+    }
+  fi
+
+  run "parted: mklabel gpt on $dev" parted -s "$dev" mklabel gpt || return 1
+  run "parted: mkpart triedb on $dev" parted -s "$dev" mkpart triedb 0% 100% || return 1
+  sleep 2  # udev settle
+  partprobe "$dev" 2>/dev/null || true
+  sleep 1
+
+  # Detect new partition name (nvme0n1 → nvme0n1p1, sda → sda1)
+  local part_name
+  part_name=$(lsblk -ln -o NAME "$dev" 2>/dev/null | awk -v d="$target" '$0 != d {print; exit}')
+  if [[ -z "$part_name" ]]; then
+    err "Could not detect new partition on $dev"
+    return 1
+  fi
+  local part_dev="/dev/$part_name"
+
+  local partuuid
+  partuuid=$(lsblk -no PARTUUID "$part_dev" 2>/dev/null | tr -d ' ')
+  if [[ -z "$partuuid" ]]; then
+    err "Could not read PARTUUID of $part_dev"
+    return 1
+  fi
+  ok "Created $part_dev (PARTUUID=$partuuid)"
+
+  # Write udev rule per docs (step_triedb_symlink would also do this, but we do
+  # it here so /dev/triedb appears before later steps run).
+  local rule=/etc/udev/rules.d/99-triedb.rules
+  backup_file "$rule"
+  cat >"$rule" <<EOF
+# monad-validator-setup ${TS}
+ENV{ID_PART_ENTRY_UUID}=="${partuuid}", MODE="0666", SYMLINK+="triedb"
+EOF
+  ok "Wrote $rule"
+  run "reloading udev" udevadm control --reload-rules || true
+  run "triggering udev" udevadm trigger || true
+  udevadm settle || true
+  if [[ -L /dev/triedb ]]; then
+    ok "/dev/triedb → $(readlink -f /dev/triedb)"
+  else
+    warn "/dev/triedb symlink did not appear after udev trigger — may need reboot"
+  fi
+}
+
+# ===== Step: format triedb partition (optional, runs once per docs) =====
+# Per docs: systemctl start monad-mpt; journalctl -u monad-mpt -n 14
+# Only run when explicitly requested (--triedb-format) OR interactive yes.
+# Skipped if monad-mpt unit not installed, /dev/triedb missing, or partition
+# is already formatted (monad-mpt is a one-shot — second run is a no-op but
+# we don't want to look like we're "re-formatting" needlessly).
+step_triedb_format() {
+  section "Triedb partition format (one-shot, optional)"
+
+  if ! systemctl cat monad-mpt >/dev/null 2>&1; then
+    info "monad-mpt service not installed (ships with monad package) — skipping"
+    return 0
+  fi
+  if [[ ! -L /dev/triedb ]]; then
+    info "/dev/triedb not present — partition first or skip"
+    return 0
+  fi
+  # If monad-mpt has already completed successfully, ActiveState is "inactive"
+  # (one-shot) and ExecMainStatus is 0. Skip in that case to avoid log noise.
+  local main_status
+  main_status=$(systemctl show monad-mpt -p ExecMainStatus --value 2>/dev/null)
+  if [[ "$main_status" == "0" ]]; then
+    ok "monad-mpt already ran successfully — triedb formatted"
+    return 0
+  fi
+
+  local proceed=0
+  if (( WITH_TRIEDB_FORMAT )); then
+    proceed=1
+  elif (( NON_INTERACTIVE == 0 )); then
+    if confirm "Run one-shot triedb format (systemctl start monad-mpt)?"; then
+      proceed=1
+    fi
+  fi
+  if (( proceed == 0 )); then
+    info "Skipped — run manually later: sudo systemctl start monad-mpt"
+    return 0
+  fi
+
+  if (( DRY_RUN )); then
+    echo "  ${C_DIM}[dry-run] systemctl start monad-mpt${C_RESET}"
+    return 0
+  fi
+
+  run "starting monad-mpt (one-shot)" systemctl start monad-mpt || {
+    err "monad-mpt failed — last 14 lines:"
+    journalctl -u monad-mpt -n 14 --no-pager >&2 || true
+    return 1
+  }
+  ok "monad-mpt completed — triedb partition ready"
+}
+
+# ===== Step: customize node.toml (optional) =====
+# Operator must set beneficiary (rewards address) and node_name (unique moniker)
+# before going live. Auto-fills if --beneficiary / --node-name flags given; else
+# prompts interactively. Skips silently if both already set in node.toml.
+step_node_toml_customize() {
+  section "node.toml customization (beneficiary + node_name)"
+
+  local node_toml=/home/monad/monad-bft/config/node.toml
+  if [[ ! -f "$node_toml" ]]; then
+    info "node.toml not present yet — run step_config_files first"
+    return 0
+  fi
+
+  # Read current values
+  local cur_ben cur_name
+  cur_ben=$(awk -F\" '/^[[:space:]]*beneficiary[[:space:]]*=/ {print $2; exit}' "$node_toml")
+  cur_name=$(awk -F\" '/^[[:space:]]*node_name[[:space:]]*=/ {print $2; exit}' "$node_toml")
+
+  # --- Beneficiary ---
+  local ben_target="$BENEFICIARY"
+  local ben_placeholder='0x[0-9a-fA-F]*BENEFICIARY[0-9a-fA-F]*'
+  if [[ -z "$ben_target" ]]; then
+    # Only prompt if current is empty or looks like a placeholder
+    if [[ -z "$cur_ben" || "$cur_ben" == "0x0000000000000000000000000000000000000000" \
+          || "$cur_ben" =~ $ben_placeholder ]]; then
+      if (( NON_INTERACTIVE )); then
+        warn "Beneficiary placeholder in node.toml and no --beneficiary= provided"
+        warn "Edit $node_toml manually before starting services."
+      else
+        echo
+        info "Current beneficiary: ${cur_ben:-(empty)}"
+        info "This is the address where staking rewards are sent. Must be 0x + 40 hex."
+        local input=""
+        prompt_read input "${C_YELLOW}?${C_RESET} Beneficiary address (Enter to skip): "
+        if [[ -n "$input" ]]; then
+          if [[ ! "$input" =~ ^0x[0-9a-fA-F]{40}$ ]]; then
+            err "Invalid address format — skipping beneficiary"
+          else
+            ben_target="$input"
+          fi
+        fi
+      fi
+    else
+      ok "beneficiary already set: $cur_ben"
+    fi
+  fi
+  if [[ -n "$ben_target" ]]; then
+    if (( DRY_RUN )); then
+      echo "  ${C_DIM}[dry-run] set beneficiary = \"$ben_target\" in $node_toml${C_RESET}"
+    else
+      backup_file "$node_toml"
+      sed -i "s|^[[:space:]]*beneficiary[[:space:]]*=.*|beneficiary = \"$ben_target\"|" "$node_toml"
+      ok "Set beneficiary = $ben_target"
+    fi
+  fi
+
+  # --- node_name ---
+  local name_target="$NODE_NAME"
+  if [[ -z "$name_target" ]]; then
+    if [[ -z "$cur_name" || "$cur_name" == "PLACEHOLDER" || "$cur_name" == "REPLACE_ME" ]]; then
+      local default_name="BeeHive-$(hostname -s)"
+      if (( NON_INTERACTIVE )); then
+        name_target="$default_name"
+        info "Auto node_name: $name_target (override with --node-name=)"
+      else
+        local input=""
+        prompt_read input "${C_YELLOW}?${C_RESET} node_name (Enter for '$default_name'): "
+        name_target="${input:-$default_name}"
+      fi
+    else
+      ok "node_name already set: $cur_name"
+    fi
+  fi
+  if [[ -n "$name_target" ]]; then
+    if (( DRY_RUN )); then
+      echo "  ${C_DIM}[dry-run] set node_name = \"$name_target\" in $node_toml${C_RESET}"
+    else
+      backup_file "$node_toml"
+      sed -i "s|^[[:space:]]*node_name[[:space:]]*=.*|node_name = \"$name_target\"|" "$node_toml"
+      ok "Set node_name = $name_target"
+    fi
+  fi
+}
+
+# ===== Step: generate validator keys (optional) =====
+# Per docs: openssl rand → KEYSTORE_PASSWORD in /home/monad/.env, then
+# monad-keystore create for SECP + BLS keys. Operator picks password mode:
+#   1) auto-generate (display once — must back up immediately)
+#   2) enter manually (twice for confirmation)
+# Skipped silently if keys already exist.
+step_generate_keys() {
+  section "Validator key generation (optional)"
+
+  if ! command -v monad-keystore >/dev/null 2>&1; then
+    info "monad-keystore not installed (ships with monad package) — skipping"
+    return 0
+  fi
+  if [[ -f /home/monad/monad-bft/config/id-secp || -f /home/monad/monad-bft/config/id-bls ]]; then
+    ok "Keys already exist in /home/monad/monad-bft/config/ — skipping"
+    return 0
+  fi
+
+  local proceed=0
+  if (( WITH_KEYS )); then
+    proceed=1
+  elif (( NON_INTERACTIVE == 0 )); then
+    if confirm "Generate validator keys (SECP + BLS) now?"; then
+      proceed=1
+    fi
+  fi
+  if (( proceed == 0 )); then
+    info "Skipped — generate manually later per docs/node-ops/validator-installation"
+    return 0
+  fi
+
+  # Pick password mode
+  local mode="${KEYSTORE_PASSWORD_INPUT:-}"
+  if [[ -z "$mode" ]]; then
+    if (( NON_INTERACTIVE )); then
+      mode="auto"
+      info "Non-interactive: auto-generating password"
+    else
+      echo
+      echo "${C_BOLD}Password mode:${C_RESET}"
+      echo "  1) auto-generate strong random password (32 bytes base64, shown ONCE)"
+      echo "  2) enter your own password (typed twice, masked)"
+      local c=""
+      prompt_read c "${C_YELLOW}?${C_RESET} Choose [1/2]: "
+      case "$c" in
+        1) mode="auto" ;;
+        2) mode="prompt" ;;
+        *) warn "Invalid choice — skipping key gen"; return 0 ;;
+      esac
+    fi
+  fi
+
+  local password=""
+  case "$mode" in
+    auto)
+      if ! command -v openssl >/dev/null 2>&1; then
+        run "installing openssl" apt-get install -y openssl || return 1
+      fi
+      password=$(openssl rand -base64 32)
+      echo
+      echo "${C_BOLD}${C_YELLOW}═══════════════════════════════════════════════════════════"
+      echo "  GENERATED KEYSTORE PASSWORD — BACK UP NOW, SHOWN ONCE:"
+      echo "  ${password}"
+      echo "═══════════════════════════════════════════════════════════${C_RESET}"
+      echo
+      ;;
+    prompt)
+      local pw1 pw2
+      while true; do
+        if [[ -r /dev/tty ]]; then
+          read -srp "Enter keystore password: " pw1 </dev/tty; echo
+          read -srp "Confirm password:         " pw2 </dev/tty; echo
+        else
+          read -srp "Enter keystore password: " pw1; echo
+          read -srp "Confirm password:         " pw2; echo
+        fi
+        if [[ "$pw1" == "$pw2" && -n "$pw1" ]]; then
+          password="$pw1"
+          break
+        fi
+        warn "Passwords don't match (or empty). Try again."
+      done
+      ;;
+  esac
+
+  if (( DRY_RUN )); then
+    echo "  ${C_DIM}[dry-run] write KEYSTORE_PASSWORD to /home/monad/.env${C_RESET}"
+    echo "  ${C_DIM}[dry-run] monad-keystore create --key-type secp${C_RESET}"
+    echo "  ${C_DIM}[dry-run] monad-keystore create --key-type bls${C_RESET}"
+    return 0
+  fi
+
+  # Write to /home/monad/.env (replace existing line or append).
+  local envfile=/home/monad/.env
+  if [[ -f "$envfile" ]] && grep -q '^KEYSTORE_PASSWORD=' "$envfile"; then
+    backup_file "$envfile"
+    # Use awk + temp file for safety (escapes don't need to be perfect because
+    # password is base64 or operator-typed; we always single-quote it).
+    awk -v pw="$password" '
+      /^KEYSTORE_PASSWORD=/ { print "KEYSTORE_PASSWORD='\''" pw "'\''"; next }
+      { print }
+    ' "$envfile" >"${envfile}.tmp" && mv "${envfile}.tmp" "$envfile"
+  else
+    echo "KEYSTORE_PASSWORD='${password}'" >>"$envfile"
+  fi
+  chown monad:monad "$envfile"
+  chmod 0600 "$envfile"
+
+  # Backup directory per docs
+  mkdir -p /opt/monad/backup
+  echo "Keystore password: $password" >/opt/monad/backup/keystore-password-backup
+  chmod 0600 /opt/monad/backup/keystore-password-backup
+  ok "Wrote KEYSTORE_PASSWORD to $envfile (mode 0600) + backup in /opt/monad/backup/"
+
+  # Generate keys as 'monad' user
+  if ! sudo -u monad bash -c "
+    set -e
+    source /home/monad/.env
+    monad-keystore create --key-type secp \
+      --keystore-path /home/monad/monad-bft/config/id-secp \
+      --password \"\$KEYSTORE_PASSWORD\" > /opt/monad/backup/secp-backup
+    monad-keystore create --key-type bls \
+      --keystore-path /home/monad/monad-bft/config/id-bls \
+      --password \"\$KEYSTORE_PASSWORD\" > /opt/monad/backup/bls-backup
+    grep 'public key' /opt/monad/backup/secp-backup /opt/monad/backup/bls-backup \
+      > /home/monad/pubkey-secp-bls
+  " 2>>"$LOG_FILE"; then
+    err "monad-keystore create failed — see $LOG_FILE"
+    return 1
+  fi
+  chmod 0600 /opt/monad/backup/*-backup 2>/dev/null || true
+  ok "Generated SECP + BLS keys in /home/monad/monad-bft/config/"
+  ok "Public keys recorded in /home/monad/pubkey-secp-bls"
+  warn "${C_BOLD}BACK UP THE PASSWORD NOW. Without it the keys are unrecoverable.${C_RESET}"
+}
+
+# ===== Step: sign node-name record (optional) =====
+# Per docs: monad-sign-name-record outputs a signature for Auth UDP.
+# Inject into node.toml's [peer_discovery] section. Skip if signature already
+# present or keys missing.
+step_sign_name_record() {
+  section "Auth UDP name-record signature (optional)"
+
+  if ! command -v monad-sign-name-record >/dev/null 2>&1; then
+    info "monad-sign-name-record not installed (ships with monad package) — skipping"
+    return 0
+  fi
+  if [[ ! -f /home/monad/monad-bft/config/id-secp ]]; then
+    info "SECP key missing — run --generate-keys first"
+    return 0
+  fi
+  local node_toml=/home/monad/monad-bft/config/node.toml
+  if [[ ! -f "$node_toml" ]]; then
+    info "node.toml not present — run step_config_files first"
+    return 0
+  fi
+  # Skip if signature already in node.toml (avoid bumping self_record_seq_num)
+  if awk '/^\[peer_discovery\]/ {in_pd=1} /^\[/ && !/^\[peer_discovery\]/ {in_pd=0}
+          in_pd && /^[[:space:]]*self_name_record_sig[[:space:]]*=/ && !/= *""/ {found=1; exit}
+          END {exit !found}' "$node_toml" 2>/dev/null; then
+    ok "self_name_record_sig already in node.toml — skipping (avoids seq_num bump)"
+    return 0
+  fi
+
+  local proceed=0
+  if (( WITH_SIGN_NAME_RECORD )); then
+    proceed=1
+  elif (( NON_INTERACTIVE == 0 )); then
+    if confirm "Run monad-sign-name-record now (auto-pick public IP)?"; then
+      proceed=1
+    fi
+  fi
+  if (( proceed == 0 )); then
+    info "Skipped — generate manually per docs"
+    return 0
+  fi
+
+  # Need public IP
+  local pubip=""
+  if command -v curl >/dev/null 2>&1; then
+    pubip=$(curl -fsS -m 5 -4 https://ifconfig.me 2>/dev/null \
+            || curl -fsS -m 5 https://api.ipify.org 2>/dev/null \
+            || true)
+  fi
+  if [[ -z "$pubip" ]]; then
+    err "Could not auto-detect public IP — skipping. Run manually:"
+    err "  monad-sign-name-record --address <YOUR_IP>:8000 --authenticated-udp-port 8001 \\"
+    err "    --keystore-path /home/monad/monad-bft/config/id-secp \\"
+    err "    --password \"\$KEYSTORE_PASSWORD\" --self-record-seq-num 1"
+    return 1
+  fi
+
+  if (( DRY_RUN )); then
+    echo "  ${C_DIM}[dry-run] monad-sign-name-record --address ${pubip}:8000 ...${C_RESET}"
+    return 0
+  fi
+
+  info "Public IP: $pubip"
+  local sig_output
+  if ! sig_output=$(sudo -u monad bash -c "
+    source /home/monad/.env
+    monad-sign-name-record \
+      --address ${pubip}:8000 \
+      --authenticated-udp-port 8001 \
+      --keystore-path /home/monad/monad-bft/config/id-secp \
+      --password \"\$KEYSTORE_PASSWORD\" \
+      --self-record-seq-num 1
+  " 2>>"$LOG_FILE"); then
+    err "monad-sign-name-record failed — see $LOG_FILE"
+    return 1
+  fi
+  # Output is a signature string (likely hex). Capture last non-empty line.
+  local sig
+  sig=$(printf '%s\n' "$sig_output" | awk 'NF {last=$0} END {print last}')
+  if [[ -z "$sig" ]]; then
+    err "monad-sign-name-record produced no signature output"
+    return 1
+  fi
+
+  # Inject into [peer_discovery] — replace self_name_record_sig + self_record_seq_num.
+  # Also set self_address if currently empty.
+  backup_file "$node_toml"
+  python3 - "$node_toml" "$pubip" "$sig" <<'PYEOF'
+import sys, re
+path, pubip, sig = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(path) as f:
+    text = f.read()
+
+def set_in_section(text, section, key, value):
+    # Find [section] ... up to next [section] or EOF
+    pattern = re.compile(
+        r'(\[' + re.escape(section) + r'\][^\[]*?)'
+        r'(^\s*' + re.escape(key) + r'\s*=.*$)',
+        flags=re.MULTILINE | re.DOTALL
+    )
+    repl = r'\1' + key + ' = "' + value + '"'
+    new, n = pattern.subn(repl, text, count=1)
+    if n == 0:
+        # Key not present — insert at end of section
+        sect_re = re.compile(r'(\[' + re.escape(section) + r'\][^\[]*)', re.DOTALL)
+        m = sect_re.search(text)
+        if m:
+            insertion = f'\n{key} = "{value}"\n'
+            new = text[:m.end()] + insertion + text[m.end():]
+        else:
+            new = text + f'\n[{section}]\n{key} = "{value}"\n'
+    return new
+
+text = set_in_section(text, 'peer_discovery', 'self_address', f'{pubip}:8000')
+text = set_in_section(text, 'peer_discovery', 'self_auth_port', '8001')
+text = set_in_section(text, 'peer_discovery', 'self_record_seq_num', '1')
+text = set_in_section(text, 'peer_discovery', 'self_name_record_sig', sig)
+
+with open(path, 'w') as f:
+    f.write(text)
+print("Injected name-record signature into node.toml")
+PYEOF
+  ok "self_name_record_sig injected into node.toml [peer_discovery]"
+}
+
+# ===== Step: start services (final, opt-in) =====
+# Enable + start the three core services in the order docs prescribe.
+# Default: skip — operator should review node.toml + keys before going live.
+step_start_services() {
+  section "Start monad services (FINAL — opt-in)"
+
+  local services=(monad-execution monad-bft monad-rpc)
+  local missing=()
+  for s in "${services[@]}"; do
+    systemctl cat "$s" >/dev/null 2>&1 || missing+=("$s")
+  done
+  if (( ${#missing[@]} > 0 )); then
+    info "Skipped — services not installed yet: ${missing[*]}"
+    info "(Install monad package first via step_monad_install)"
+    return 0
+  fi
+
+  # Skip if all already active
+  local active_all=1
+  for s in "${services[@]}"; do
+    systemctl is-active --quiet "$s" || { active_all=0; break; }
+  done
+  if (( active_all )); then
+    ok "All services already active: ${services[*]}"
+    return 0
+  fi
+
+  local proceed=0
+  if (( WITH_START_SERVICES )); then
+    proceed=1
+  elif (( NON_INTERACTIVE == 0 )); then
+    echo
+    warn "Starting services boots the validator into the network."
+    warn "Before saying yes, confirm:"
+    warn "  - node.toml has correct beneficiary, node_name, self_name_record_sig"
+    warn "  - keys in /home/monad/monad-bft/config/ are correct (id-secp, id-bls)"
+    warn "  - /dev/triedb partition is formatted (systemctl status monad-mpt)"
+    if confirm "Start ${services[*]} now?"; then
+      proceed=1
+    fi
+  fi
+  if (( proceed == 0 )); then
+    info "Skipped — start manually when ready:"
+    for s in "${services[@]}"; do info "  sudo systemctl enable --now $s"; done
+    return 0
+  fi
+
+  if (( DRY_RUN )); then
+    for s in "${services[@]}"; do
+      echo "  ${C_DIM}[dry-run] systemctl enable --now $s${C_RESET}"
+    done
+    return 0
+  fi
+
+  for s in "${services[@]}"; do
+    if ! run "enabling+starting $s" systemctl enable --now "$s"; then
+      err "$s failed to start — check: journalctl -u $s -n 50"
+      return 1
+    fi
+  done
+  sleep 3
+  for s in "${services[@]}"; do
+    if systemctl is-active --quiet "$s"; then
+      ok "$s active"
+    else
+      err "$s not active after start — check journal"
+      return 1
+    fi
+  done
+  ok "All services started. Validator is now online."
 }
 
 # ===== Step: iptables UDP DDoS filter =====
@@ -1388,23 +2084,29 @@ EOF
   choose_network
 
   local failed=()
-  step_preflight        || failed+=("preflight")
-  step_dependencies     || failed+=("dependencies")
-  step_monad_user       || failed+=("monad-user")
-  step_sysctl           || failed+=("sysctl")
-  step_ulimits          || failed+=("ulimits")
-  step_io_scheduler     || failed+=("io-scheduler")
-  step_triedb_symlink   || failed+=("triedb-symlink")
-  step_chrony           || failed+=("chrony")
-  step_monad_install    || failed+=("monad-install")
-  step_config_files     || failed+=("config-files")
-  step_cruft_timer      || failed+=("cruft-timer")
-  step_otelcol_install  || failed+=("otelcol-install")
-  step_otelcol_enable   || failed+=("otelcol-enable")
-  step_firewall         || failed+=("firewall")
-  step_iptables_ddos    || failed+=("iptables-ddos")
-  step_monitoring       || failed+=("monitoring")
-  step_vdp_otel_push    || failed+=("vdp-otel-push")
+  step_preflight             || failed+=("preflight")
+  step_dependencies          || failed+=("dependencies")
+  step_monad_user            || failed+=("monad-user")
+  step_triedb_partition      || failed+=("triedb-partition")
+  step_sysctl                || failed+=("sysctl")
+  step_ulimits               || failed+=("ulimits")
+  step_io_scheduler          || failed+=("io-scheduler")
+  step_triedb_symlink        || failed+=("triedb-symlink")
+  step_chrony                || failed+=("chrony")
+  step_monad_install         || failed+=("monad-install")
+  step_triedb_format         || failed+=("triedb-format")
+  step_config_files          || failed+=("config-files")
+  step_node_toml_customize   || failed+=("node-toml-customize")
+  step_generate_keys         || failed+=("generate-keys")
+  step_sign_name_record      || failed+=("sign-name-record")
+  step_cruft_timer           || failed+=("cruft-timer")
+  step_otelcol_install       || failed+=("otelcol-install")
+  step_otelcol_enable        || failed+=("otelcol-enable")
+  step_firewall              || failed+=("firewall")
+  step_iptables_ddos         || failed+=("iptables-ddos")
+  step_monitoring            || failed+=("monitoring")
+  step_vdp_otel_push         || failed+=("vdp-otel-push")
+  step_start_services        || failed+=("start-services")
   step_report
 
   if (( ${#failed[@]} > 0 )); then
