@@ -667,9 +667,12 @@ check_sysctl() {
 
   wmem_max=$(sysctl -n net.core.wmem_max 2>/dev/null || echo 0)
   # monad-bft (since ~0.14.x) sets SO_RCVBUF=62500000 on the dataplane UDP
-  # socket and panics at startup if rmem_max is below that (kernel clamps the
-  # request → "unable to set udp receive buffer size to 62500000" in journal).
-  local need=67108864  # 64 MB — matches validator-setup default, headroom over 62.5M
+  # socket and panics at startup if rmem_max is below that. The exact panic
+  # message: "unable to set udp receive buffer size to 62500000. Got X instead.
+  # Set net.core.rmem_max to at least 62500000". So 62500000 IS the threshold,
+  # not a padded value above it. The monad apt package's
+  # /etc/sysctl.d/90-monad-network-buffer.conf ships exactly 62500000.
+  local need=62500000  # 62.5 MB — exact monad-bft requirement
   if (( rmem_max >= need && wmem_max >= need )); then
     emit os "sysctl.netbuf"     PASS "rmem_max=$rmem_max wmem_max=$wmem_max"
   else
