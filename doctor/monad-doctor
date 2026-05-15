@@ -1142,8 +1142,17 @@ check_monad_install() {
   fi
 
   if [[ -n "$available" && "$available" != "$installed" ]]; then
-    emit monad "monad.version"   WARN "installed=$installed, available=$available" \
-         $'Quick fix:   sudo apt-mark unhold monad   # if on hold\n             sudo apt update && sudo apt install --only-upgrade monad\n             sudo apt-mark hold monad     # re-hold\nVerify:      dpkg-query -W -f=\'${Version}\\n\' monad\nWhy:         apt has a newer version pinned in your suite (noble); the gap may include\n             consensus-affecting fixes. Don\'t lag.'
+    # Distinguish stable vs pre-release "available" candidates. Apt's
+    # "Candidate" greedily picks the highest version including ~rc/~alpha/
+    # ~beta/~dev suffixes. Recommending the operator upgrade FROM a stable
+    # release TO an RC is wrong — RCs aren't blessed for production.
+    if [[ "$available" =~ ~(rc|alpha|beta|dev|pre) ]]; then
+      emit monad "monad.version" INFO "installed=$installed (stable). Apt sees $available — pre-release, ignore unless deliberately tracking RCs." \
+           $'Why:         apt-cache greedy candidate picks any higher version including ~rc.X.\n             Stay on stable; rotate forward only when the RC promotes to a tagged release.'
+    else
+      emit monad "monad.version"   WARN "installed=$installed, available=$available" \
+           $'Quick fix:   sudo apt-mark unhold monad   # if on hold\n             sudo apt update && sudo apt install --only-upgrade monad\n             sudo apt-mark hold monad     # re-hold\nVerify:      dpkg-query -W -f=\'${Version}\\n\' monad\nWhy:         apt has a newer STABLE version pinned in your suite (noble); the gap may\n             include consensus-affecting fixes. Don\'t lag.'
+    fi
   else
     emit monad "monad.version"   PASS "installed=$installed (latest)"
   fi
