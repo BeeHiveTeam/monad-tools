@@ -21,7 +21,7 @@ Aligned with [docs.monad.xyz/node-ops/full-node-installation](https://docs.monad
 6. **IO scheduler** — `mq-deadline` on the triedb device. Selection priority: `--triedb-dev=` flag → `/dev/triedb` symlink → unused NVMe (largest, never picks an OS-RAID member). Persisted via udev rule that matches by attribute (`rotational=0`, `nvme*`) so swapping the disk doesn't silently regress.
 7. **TriedB SYMLINK udev rule** — writes `/etc/udev/rules.d/99-triedb.rules` with `ENV{ID_PART_ENTRY_UUID}==<PARTUUID>, MODE="0666", SYMLINK+="triedb"` exactly per docs format. Skips gracefully if no triedb partition exists yet.
 8. **chrony** — replaces `systemd-timesyncd` (sub-millisecond NTP for accurate `vote_delay`); prompts before replacing
-9. **Monad apt package** — adds `https://pkg.category.xyz/` (Category Labs, official) using deb822 `.sources` format with ASCII-armored key (`/keys/public-key.asc`) dearmored to `/etc/apt/keyrings/category-labs.gpg`. Installs `monad=$MONAD_PKG_VERSION` then **`apt-mark hold monad`** (per docs) so unattended-upgrades don't bump mid-epoch. Default is per docs: **testnet → 0.14.3, mainnet → 0.14.3** (both as of 2026-05-15). Override with `MONAD_PKG_VERSION=` env var.
+9. **Monad apt package** — adds `https://pkg.category.xyz/` (Category Labs, official) using deb822 `.sources` format with ASCII-armored key (`/keys/public-key.asc`) dearmored to `/etc/apt/keyrings/category-labs.gpg`. **Auto-detects target version**: queries `github.com/category-labs/monad-bft/releases/latest` (excludes pre-releases by design), falls back to `apt-cache policy monad` Candidate if GitHub is unreachable. Refuses to auto-install `~rc/~alpha/~beta/~dev` suffixes — operator must opt in explicitly via `MONAD_PKG_VERSION=`. After install: **`apt-mark hold monad`** so unattended-upgrades don't bump mid-epoch.
 10. **Bootstrap configs** — downloads `.env` and `node.toml` from `$MF_BUCKET/config/<network>/latest/` per docs. Validator gets `node.toml`; full-node gets `full-node-node.toml` (toggle with `--full-node`). Idempotent: preserves existing files (no overwrite).
 11. **`monad-cruft.timer`** — auto-enables hourly cleanup (per docs)
 12. **otelcol install** — downloads otelcol_${OTEL_VERSION}_linux_amd64.deb from GitHub releases, **sha256-verified against the pinned hash from docs** (currently `1a1576dde7d…6f8acd9` for v0.139.0). Skips cleanly if `otelcol-contrib` already active or `otelcol ≥ ${OTEL_VERSION}` already installed.
@@ -160,9 +160,9 @@ Override via environment variable:
 | `MONAD_APT_SUITE` | `noble` | apt suite (only `noble` exists upstream) |
 | `MONAD_APT_KEY_URL` | `${MONAD_APT_REPO}keys/public-key.asc` | ASCII-armored GPG signing key (dearmored on install) |
 | `MONAD_APT_KEYRING` | `/etc/apt/keyrings/category-labs.gpg` | local keyring path |
-| `MONAD_PKG_VERSION_TESTNET` | `0.14.3` | pinned testnet version (per docs) |
-| `MONAD_PKG_VERSION_MAINNET` | `0.14.2` | pinned mainnet version (per docs) |
-| `MONAD_PKG_VERSION` | unset (auto-pick by `--network=`) | overrides both defaults; set empty for `latest` |
+| `MONAD_PKG_VERSION_TESTNET` | (empty — auto) | optional pin if testnet should diverge from mainnet |
+| `MONAD_PKG_VERSION_MAINNET` | (empty — auto) | optional pin if mainnet should diverge from testnet |
+| `MONAD_PKG_VERSION` | unset (auto-detect) | hard pin a specific version. Without it: GitHub releases/latest → apt-cache fallback. Pre-release suffixes refused unless explicit. |
 | `MF_BUCKET` | `https://bucket.monadinfra.com` | Foundation config bucket |
 | `SYSCTL_RMEM` / `SYSCTL_WMEM` | `16777216` | UDP receive/send buffer max (raptorcast) |
 | `SYSCTL_FILE_MAX` | `2097152` | system-wide file descriptor limit |

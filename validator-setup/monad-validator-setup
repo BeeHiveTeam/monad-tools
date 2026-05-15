@@ -79,16 +79,21 @@ MONAD_APT_SUITE="${MONAD_APT_SUITE:-noble}"
 # now /keys/public-key.asc (ASCII-armored — requires `gpg --dearmor`).
 MONAD_APT_KEY_URL="${MONAD_APT_KEY_URL:-https://pkg.category.xyz/keys/public-key.asc}"
 MONAD_APT_KEYRING="${MONAD_APT_KEYRING:-/etc/apt/keyrings/category-labs.gpg}"
-# Pin version per docs — testnet and mainnet currently ship different versions.
-# Source: https://docs.monad.xyz/node-ops/full-node-installation
-# Resolved after --network=/choose_network. Set MONAD_PKG_VERSION explicitly to override
-# both defaults, or set it empty to install "latest" available in the apt repo.
-# Per docs.monad.xyz/node-ops/full-node-installation (verified 2026-05-15):
-# both testnet and mainnet currently pin to 0.14.3. Mainnet was 0.14.2 earlier
-# in May 2026; docs were updated to 0.14.3 around the same time we bumped testnet.
-MONAD_PKG_VERSION_TESTNET="${MONAD_PKG_VERSION_TESTNET:-0.14.3}"
-MONAD_PKG_VERSION_MAINNET="${MONAD_PKG_VERSION_MAINNET:-0.14.3}"
-MONAD_PKG_VERSION="${MONAD_PKG_VERSION-__auto__}"   # __auto__ = pick by NETWORK later
+# Monad package version policy.
+# Default: track whatever Category Labs publishes as the "candidate" in their
+# apt repo (https://pkg.category.xyz/). This is what `apt install monad`
+# without a version pin gets, and it's the source-of-truth the docs page
+# mirrors. By detecting the candidate at install time we never need to hand-
+# edit a hardcoded pin when MF/CL bump a release.
+#
+# Override paths (in priority order):
+#   MONAD_PKG_VERSION=0.14.3    → install exactly this version
+#   MONAD_PKG_VERSION=""        → install latest candidate from apt repo (default)
+#   MONAD_PKG_VERSION_TESTNET=  → per-network override (set both to keep them divergent)
+#   MONAD_PKG_VERSION_MAINNET=
+MONAD_PKG_VERSION_TESTNET="${MONAD_PKG_VERSION_TESTNET-}"
+MONAD_PKG_VERSION_MAINNET="${MONAD_PKG_VERSION_MAINNET-}"
+MONAD_PKG_VERSION="${MONAD_PKG_VERSION-__auto__}"   # __auto__ = decide after apt update
 
 # UFW ports per docs:
 #   - SSH (default 22/tcp, but auto-detected — operators commonly move SSH)
@@ -237,8 +242,11 @@ choose_network() {
   resolve_pkg_version
 }
 
-# Resolve MONAD_PKG_VERSION from per-network defaults if user did not set it
-# explicitly. Empty value means "install latest available in apt repo".
+# Resolve MONAD_PKG_VERSION from per-network env overrides if the user set them.
+# If neither this nor MONAD_PKG_VERSION is set, leave value empty — the real
+# version will be auto-detected from `apt-cache policy monad` after the repo
+# is added (see step_monad_install). This means the script tracks whatever
+# Category Labs publishes without anyone hand-editing version pins.
 resolve_pkg_version() {
   if [[ "$MONAD_PKG_VERSION" == "__auto__" ]]; then
     case "$NETWORK" in
@@ -246,9 +254,11 @@ resolve_pkg_version() {
       mainnet) MONAD_PKG_VERSION="$MONAD_PKG_VERSION_MAINNET" ;;
       *)       MONAD_PKG_VERSION="" ;;
     esac
-    info "Pinned monad version for ${NETWORK}: ${C_BOLD}${MONAD_PKG_VERSION:-latest}${C_RESET} (default per docs)"
+  fi
+  if [[ -n "$MONAD_PKG_VERSION" ]]; then
+    info "Pinned monad version: ${C_BOLD}${MONAD_PKG_VERSION}${C_RESET} (env override)"
   else
-    info "Pinned monad version: ${C_BOLD}${MONAD_PKG_VERSION:-latest}${C_RESET} (from MONAD_PKG_VERSION env)"
+    info "Monad version: ${C_BOLD}auto${C_RESET} — will use apt repo candidate at install time"
   fi
 }
 
@@ -871,7 +881,13 @@ step_monad_install() {
     local cur
     cur=$(dpkg-query -W -f='${Version}' monad)
     ok "monad already installed (version $cur)"
-    info "To upgrade: apt update && apt install --only-upgrade monad"
+    # Surface available upgrade so operator sees the gap on re-run.
+    local candidate=""
+    candidate=$(apt-cache policy monad 2>/dev/null | awk '/Candidate:/ {print $2; exit}')
+    if [[ -n "$candidate" && "$candidate" != "(none)" && "$candidate" != "$cur" ]]; then
+      info "Apt repo offers a newer version: $candidate"
+      info "To upgrade: apt-mark unhold monad && apt install --only-upgrade monad && apt-mark hold monad"
+    fi
     return 0
   fi
 
@@ -931,24 +947,65 @@ EOF
     fi
   fi
 
-  if (( DRY_RUN )); then
-    if [[ -n "$MONAD_PKG_VERSION" ]]; then
-      echo "  ${C_DIM}[dry-run] apt install monad=${MONAD_PKG_VERSION}${C_RESET}"
-    else
-      echo "  ${C_DIM}[dry-run] apt install monad (latest)${C_RESET}"
+  # Resolve final install target. Sources of truth, in priority order:
+  #   1. MONAD_PKG_VERSION env (operator pinned explicitly)
+  #   2. GitHub releases/latest (Category Labs publishes stable tags there;
+  #      /releases/latest endpoint excludes pre-releases by design)
+  #   3. apt-cache candidate (fallback when GitHub unreachable) — BUT only
+  #      if it's not a pre-release suffix (~rc, ~beta, ~alpha, ~dev).
+  #      apt's "Candidate" greedily picks the highest version including RCs;
+  #      auto-installing an RC silently is a footgun.
+  local target_version=""
+  if [[ -n "$MONAD_PKG_VERSION" ]]; then
+    target_version="$MONAD_PKG_VERSION"
+    info "Installing pinned version: monad=${target_version}"
+  else
+    local gh_latest=""
+    if command -v curl >/dev/null 2>&1; then
+      gh_latest=$(curl -fsS -m 5 -H 'Accept: application/vnd.github+json' \
+        https://api.github.com/repos/category-labs/monad-bft/releases/latest 2>/dev/null \
+        | grep -oE '"tag_name":[^,]+' | head -1 \
+        | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+([-~][a-z0-9.]+)?' | sed 's/^v//')
     fi
+    if [[ -n "$gh_latest" ]]; then
+      target_version="$gh_latest"
+      info "Latest stable from GitHub: monad=${C_BOLD}${target_version}${C_RESET}"
+    else
+      info "GitHub API unreachable — falling back to apt-cache candidate"
+      local candidate=""
+      candidate=$(apt-cache policy monad 2>/dev/null | awk '/Candidate:/ {print $2; exit}')
+      if [[ -z "$candidate" || "$candidate" == "(none)" ]]; then
+        err "Could not determine a monad version to install."
+        err "Neither GitHub releases/latest nor apt-cache returned a usable version."
+        err "Pin manually: MONAD_PKG_VERSION=X.Y.Z ./monad-validator-setup ..."
+        return 1
+      fi
+      if [[ "$candidate" =~ ~(rc|alpha|beta|dev|pre) ]]; then
+        err "Apt repo candidate is a PRE-RELEASE: $candidate"
+        err "Refusing to auto-install pre-release. Either:"
+        err "  - Pin a stable version: MONAD_PKG_VERSION=$(echo "$candidate" | sed 's/~.*//') ./monad-validator-setup ..."
+        err "  - Explicitly opt in to the RC: MONAD_PKG_VERSION=$candidate ./monad-validator-setup ..."
+        return 1
+      fi
+      target_version="$candidate"
+      info "Apt repo candidate: monad=${C_BOLD}${target_version}${C_RESET}"
+    fi
+  fi
+
+  if (( DRY_RUN )); then
+    echo "  ${C_DIM}[dry-run] apt install monad=${target_version}${C_RESET}"
     return 0
   fi
-  if [[ -n "$MONAD_PKG_VERSION" ]]; then
-    run "installing monad=${MONAD_PKG_VERSION}" apt-get install -y "monad=${MONAD_PKG_VERSION}"
-  else
-    run "installing monad (latest)" apt-get install -y monad
-  fi
-  if ! dpkg -l monad 2>/dev/null | grep -qE '^.i  monad'; then
-    err "monad install failed — check $LOG_FILE"
+
+  if ! run "installing monad=${target_version}" apt-get install -y "monad=${target_version}"; then
+    err "apt-get install monad=${target_version} failed — check $LOG_FILE"
     return 1
   fi
-  ok "monad package installed"
+  if ! dpkg -l monad 2>/dev/null | grep -qE '^.i  monad'; then
+    err "monad install failed (package not in installed state) — check $LOG_FILE"
+    return 1
+  fi
+  ok "monad ${target_version} installed"
 
   # Hold the package so unattended-upgrades / accidental `apt upgrade` don't
   # bump the version mid-epoch. Operators can `apt-mark unhold monad` to
