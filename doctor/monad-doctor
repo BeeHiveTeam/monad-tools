@@ -643,6 +643,8 @@ check_ulimits() {
       emit os "ulimit.limits-conf" PASS "limits.conf hard nofile=unlimited"
     elif [[ -n "$conf_limit" && "$conf_limit" =~ ^[0-9]+$ ]] && (( conf_limit >= ULIMIT_MIN )); then
       emit os "ulimit.limits-conf" PASS "limits.conf hard nofile=$conf_limit"
+    elif ! _monad_pkg_installed; then
+      emit os "ulimit.limits-conf" INFO "no high nofile limit in limits.conf — monad-validator-setup → step_ulimits will write 99-monad-validator.conf on install"
     else
       emit os "ulimit.limits-conf" WARN "no high nofile limit set in /etc/security/limits.conf" \
            $'Auto:        monad-validator-setup → step_ulimits writes /etc/security/limits.d/99-monad-validator.conf\nManual:      sudo tee /etc/security/limits.d/99-monad-validator.conf <<EOF\n             * soft nofile 1048576\n             * hard nofile 1048576\n             EOF\nVerify:      ulimit -n   # in a fresh shell session\nWhy:         pre-empts the same FD exhaustion as ulimit.service, for non-service runs.'
@@ -710,8 +712,12 @@ check_ntp() {
            $'Investigate: chronyc sources -v   # check selectability/reachability\n             chronyc tracking      # current offset/skew\nQuick fix:   sudo systemctl restart chrony; sleep 30; chronyc tracking\nIf persists: pool/server lines in /etc/chrony/chrony.conf reachable?\n             Add closer sources: pool 2.ubuntu.pool.ntp.org iburst maxsources 4\nWhy:         high clock offset distorts vote_delay metric and can cause MF jail decisions.'
     fi
   elif systemctl is-active --quiet systemd-timesyncd 2>/dev/null; then
-    emit os "ntp"               WARN "systemd-timesyncd active — drifts ~10-100ms, inflates vote_delay" \
-         $'Quick fix:   sudo apt install -y chrony   # auto-replaces timesyncd on Ubuntu\n             sudo systemctl disable --now systemd-timesyncd\nAuto:        monad-validator-setup → step_chrony does exactly this.\nVerify:      chronyc tracking   # tiny offset, leap status normal\nWhy:         timesyncd uses SNTP, no kernel discipline → drift accumulates between syncs,\n             distorts vote_delay; chrony slews continuously.'
+    if ! _monad_pkg_installed; then
+      emit os "ntp"             INFO "systemd-timesyncd active — monad-validator-setup → step_chrony will replace with chrony on install"
+    else
+      emit os "ntp"             WARN "systemd-timesyncd active — drifts ~10-100ms, inflates vote_delay" \
+           $'Quick fix:   sudo apt install -y chrony   # auto-replaces timesyncd on Ubuntu\n             sudo systemctl disable --now systemd-timesyncd\nAuto:        monad-validator-setup → step_chrony does exactly this.\nVerify:      chronyc tracking   # tiny offset, leap status normal\nWhy:         timesyncd uses SNTP, no kernel discipline → drift accumulates between syncs,\n             distorts vote_delay; chrony slews continuously.'
+    fi
   else
     emit os "ntp"               FAIL "no NTP daemon active" \
          $'Quick fix:   sudo apt install -y chrony && sudo systemctl enable --now chrony\nVerify:      chronyc tracking   # source synced, offset <1ms\nWhy:         without time sync, vote_delay drifts, MF metrics become incorrect,\n             and operators chase phantom performance regressions.'
@@ -849,8 +855,12 @@ check_firewall() {
     [[ -n "${SSH_CONNECTION:-}" ]] && _ssh_port=$(awk '{print $NF}' <<<"$SSH_CONNECTION")
     [[ -z "$_ssh_port" && -r /etc/ssh/sshd_config ]] && _ssh_port=$(sshd -T 2>/dev/null | awk '/^port / {print $2; exit}')
     [[ -z "$_ssh_port" ]] && _ssh_port="22"
-    emit network "net.firewall" WARN "ufw installed but inactive — no firewall protection" \
-         $'Quick fix:   sudo ufw allow '"$_ssh_port"$'/tcp     # SSH (detected — verify before enabling!)\n             sudo ufw allow 8000             # tcp+udp (consensus P2P)\n             sudo ufw allow 8001/udp         # authenticated UDP\n             sudo ufw --force enable\nAuto:        monad-validator-setup → step_firewall auto-detects SSH port and whitelists it.\nVerify:      sudo ufw status verbose\nDANGER:      double-check SSH port BEFORE `ufw enable`. Wrong port → lockout.\nWhy:         a publicly reachable validator without a firewall exposes management/\n             OS services to the open internet. ufw default-deny is a one-line win.'
+    if ! _monad_pkg_installed; then
+      emit network "net.firewall" INFO "ufw installed but inactive — monad-validator-setup → step_firewall will enable it on install (auto-detects SSH port)"
+    else
+      emit network "net.firewall" WARN "ufw installed but inactive — no firewall protection" \
+           $'Quick fix:   sudo ufw allow '"$_ssh_port"$'/tcp     # SSH (detected — verify before enabling!)\n             sudo ufw allow 8000             # tcp+udp (consensus P2P)\n             sudo ufw allow 8001/udp         # authenticated UDP\n             sudo ufw --force enable\nAuto:        monad-validator-setup → step_firewall auto-detects SSH port and whitelists it.\nVerify:      sudo ufw status verbose\nDANGER:      double-check SSH port BEFORE `ufw enable`. Wrong port → lockout.\nWhy:         a publicly reachable validator without a firewall exposes management/\n             OS services to the open internet. ufw default-deny is a one-line win.'
+    fi
   elif require_cmd nft || require_cmd iptables; then
     emit network "net.firewall" INFO "nftables/iptables in use (manual config) — ensure $NET_PORTS_REQUIRED open"
   else
@@ -987,8 +997,12 @@ check_unattended_upgrades() {
     if grep -rqE '^[[:space:]]*Unattended-Upgrade::Automatic-Reboot[[:space:]]+"?false"?' /etc/apt/apt.conf.d/ 2>/dev/null; then
       emit security "auto-upgrades" PASS "unattended-upgrades active, Automatic-Reboot=false (safe for validator)"
     else
-      emit security "auto-upgrades" WARN "unattended-upgrades active but may auto-reboot mid-epoch" \
-           $'Quick fix:   echo \'Unattended-Upgrade::Automatic-Reboot "false";\' | \\\n               sudo tee /etc/apt/apt.conf.d/52monad-no-reboot\nVerify:      apt-config dump | grep -i Automatic-Reboot   # "false"\nWhy:         unattended-upgrades CAN trigger reboot during a kernel update — if it lands\n             mid-epoch your validator is jailed. Keep patches flowing, disable reboot.'
+      if ! _monad_pkg_installed; then
+        emit security "auto-upgrades" INFO "unattended-upgrades active with auto-reboot — monad-validator-setup → step_cve_mitigation will disable auto-reboot on install"
+      else
+        emit security "auto-upgrades" WARN "unattended-upgrades active but may auto-reboot mid-epoch" \
+             $'Quick fix:   echo \'Unattended-Upgrade::Automatic-Reboot "false";\' | \\\n               sudo tee /etc/apt/apt.conf.d/52monad-no-reboot\nVerify:      apt-config dump | grep -i Automatic-Reboot   # "false"\nWhy:         unattended-upgrades CAN trigger reboot during a kernel update — if it lands\n             mid-epoch your validator is jailed. Keep patches flowing, disable reboot.'
+      fi
     fi
   else
     emit security "auto-upgrades" INFO "unattended-upgrades installed but disabled — security patches not auto-applied"
