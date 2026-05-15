@@ -900,19 +900,20 @@ check_iptables_udp_filter() {
 }
 
 check_cve_2026_31431() {
-  # Per Foundation Discord 2026-04-30 (ACTION RECOMMENDED):
-  # algif_aead kernel module LPE — blacklist as mitigation.
-  # PASS only if blacklisted (true mitigation). WARN if not loaded but not
-  # blacklisted — module is one `modprobe` away from being exploitable.
-  if [[ -f /etc/modprobe.d/disable-algif.conf ]] \
-     && grep -q 'algif_aead' /etc/modprobe.d/disable-algif.conf 2>/dev/null; then
-    emit security "cve.2026-31431" PASS "algif_aead blacklisted (CVE-2026-31431 mitigated)"
-  elif ! lsmod 2>/dev/null | grep -q algif_aead; then
-    emit security "cve.2026-31431" WARN "algif_aead not blacklisted — module not loaded now but can be loaded any time (CVE-2026-31431 LPE)" \
-         $'Quick fix:   echo \'install algif_aead /bin/false\' | sudo tee /etc/modprobe.d/disable-algif.conf\nVerify:      grep algif_aead /etc/modprobe.d/disable-algif.conf\nWhy:         Foundation Discord 2026-04-30 ACTION RECOMMENDED — local privilege escalation\n             via algif_aead; blacklist makes the module unloadable.'
+  # Per Foundation Discord 2026-04-30 (ACTION RECOMMENDED): the algif_aead
+  # kernel module has an LPE. Mitigation = blacklist OR don't have it loaded.
+  # If the module isn't loaded right now, the server is not vulnerable —
+  # we don't WARN, we just inform. WARN only when it's actively loaded.
+  if lsmod 2>/dev/null | grep -q '^algif_aead'; then
+    if { [[ -f /etc/modprobe.d/disable-algif.conf ]] && grep -q 'algif_aead' /etc/modprobe.d/disable-algif.conf 2>/dev/null; } \
+       || { [[ -f /etc/modprobe.d/blacklist-algif_aead.conf ]] && grep -q '^blacklist algif_aead' /etc/modprobe.d/blacklist-algif_aead.conf 2>/dev/null; }; then
+      emit security "cve.2026-31431" PASS "algif_aead loaded but blacklisted (will not reload after rmmod/reboot)"
+    else
+      emit security "cve.2026-31431" WARN "algif_aead loaded and not blacklisted — CVE-2026-31431 (LPE) unmitigated" \
+           $'Quick fix:   echo \'blacklist algif_aead\' | sudo tee /etc/modprobe.d/blacklist-algif_aead.conf\n             sudo rmmod algif_aead   # unload now (or reboot)\nVerify:      lsmod | grep -v algif_aead   # gone\nWhy:         module is currently loaded AND not blacklisted — exploitable right now.'
+    fi
   else
-    emit security "cve.2026-31431" WARN "algif_aead loaded and not blacklisted — CVE-2026-31431 (LPE) unmitigated" \
-         $'Quick fix:   echo \'install algif_aead /bin/false\' | sudo tee /etc/modprobe.d/disable-algif.conf\n             sudo rmmod algif_aead   # unload now (or reboot)\nVerify:      lsmod | grep -v algif_aead   # gone\nWhy:         module is currently loaded AND not blacklisted — exploitable right now.'
+    emit security "cve.2026-31431" PASS "algif_aead not loaded — server not vulnerable to CVE-2026-31431"
   fi
 }
 
