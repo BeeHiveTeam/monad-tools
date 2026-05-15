@@ -67,7 +67,8 @@ WITH_VDP_OTEL_EXPLICIT=0     # 1 if operator passed --with-vdp-otel OR --no-vdp-
 TRIEDB_DEV=""
 TRIEDB_PARTITION_DEV=""     # if set, step_triedb_partition uses this disk non-interactively
 WITH_TRIEDB_FORMAT=0        # if 1, systemctl start monad-mpt (one-shot triedb format)
-WITH_SNAPSHOT_RESTORE=0     # if 1, run docs' restore-from-snapshot.sh BEFORE start
+WITH_SNAPSHOT_RESTORE=1     # default ON per docs full-node-installation step 15; use --no-snapshot-restore to skip
+WITH_SNAPSHOT_RESTORE_EXPLICIT=0   # set if --snapshot-restore or --no-snapshot-restore was passed
 ALLOW_NVME_REFORMAT=0       # if 1, --non-interactive may invoke nvme format --lbaf=0
 BENEFICIARY=""              # 0x... address — auto-injected into node.toml if set
 NODE_NAME=""                # unique moniker — auto-injected into node.toml if set
@@ -78,7 +79,12 @@ WITH_START_SERVICES=0       # if 1, systemctl enable+start monad-* services (FIN
 NODE_RECONFIGURED=0         # set to 1 when a step modifies node.toml or keys
 ROLE_TRANSITION=""          # "full→validator" / "validator→full" / "" when changed
 NETWORK=""                  # testnet | mainnet — asked interactively if empty
-NODE_TYPE="validator"       # validator | full — affects which node.toml to fetch
+NODE_TYPE="full"            # full | validator — default per docs validator-installation:
+                            # "Start by configuring a node according to the full node installation
+                            # instructions." Validators are promoted from a full node AFTER on-chain
+                            # registration. Use --validator to override (only if you already have
+                            # an on-chain stake / Auth Address grant).
+NODE_TYPE_EXPLICIT=0        # set if --full-node, --validator, or --node-type= was passed
 ACTION="install"
 LOG_FILE="/tmp/monad-validator-setup-$(date +%Y%m%d-%H%M%S).log"
 TS=$(date -u +%Y%m%d-%H%M%S)
@@ -177,12 +183,14 @@ while [[ $# -gt 0 ]]; do
     --generate-keys)   WITH_KEYS=1 ;;
     --keys-password=*) KEYSTORE_PASSWORD_INPUT="${1#*=}" ;;
     --sign-name-record) WITH_SIGN_NAME_RECORD=1 ;;
-    --snapshot-restore) WITH_SNAPSHOT_RESTORE=1 ;;
+    --snapshot-restore) WITH_SNAPSHOT_RESTORE=1; WITH_SNAPSHOT_RESTORE_EXPLICIT=1 ;;
+    --no-snapshot-restore) WITH_SNAPSHOT_RESTORE=0; WITH_SNAPSHOT_RESTORE_EXPLICIT=1 ;;
     --allow-nvme-reformat) ALLOW_NVME_REFORMAT=1 ;;
     --start-services)  WITH_START_SERVICES=1 ;;
     --network=*)       NETWORK="${1#*=}" ;;
-    --node-type=*)     NODE_TYPE="${1#*=}" ;;
-    --full-node)       NODE_TYPE="full" ;;
+    --node-type=*)     NODE_TYPE="${1#*=}"; NODE_TYPE_EXPLICIT=1 ;;
+    --full-node)       NODE_TYPE="full"; NODE_TYPE_EXPLICIT=1 ;;
+    --validator)       NODE_TYPE="validator"; NODE_TYPE_EXPLICIT=1 ;;
     --uninstall)       ACTION="uninstall" ;;
     --uninstall-deep)  ACTION="uninstall-deep" ;;
     -h|--help)
@@ -197,22 +205,26 @@ USAGE
 QUICK START (interactive, recommended for first install)
   sudo ./monad-validator-setup
     → script asks: testnet or mainnet, disk to partition, beneficiary
-      address, password mode. Walks through 24 steps with progress.
+      address, password mode. Walks through 25 steps with progress.
+    → DEFAULT is full-node (per docs validator-installation: validators
+      are PROMOTED from a full node after on-chain registration).
+    → Snapshot restore is enabled by default (docs step 15: hard-reset).
 
-TWO-PHASE FLOW (recommended for VDP delegation candidates)
-  Phase 1 — install as full-node first (sync the chain, build uptime):
-    sudo ./monad-validator-setup --network=testnet --full-node \
+TWO-PHASE FLOW (default, per docs)
+  Phase 1 — install as full-node (sync the chain, build uptime):
+    sudo ./monad-validator-setup --network=testnet \
       --triedb-partition=nvme1n1 --start-services
-    (no keys, no MON needed; nodes uses 0x000…000 burn beneficiary)
+    (no keys, no MON needed; uses 0x000…000 burn beneficiary; snapshot
+     restore runs automatically before services start)
 
   Phase 2 — when you have 100k MON ready, PROMOTE to validator:
-    sudo ./monad-validator-setup --network=testnet \
+    sudo ./monad-validator-setup --network=testnet --validator \
       --beneficiary=0x<YOUR_REAL_REWARDS_ADDRESS> \
       --node-name=<UNIQUE_MONIKER> \
       --generate-keys --keys-password=auto
-    (re-running detects full→validator transition; patches node.toml,
-     generates keys, signs name-record, hot-reloads monad-bft config —
-     no service restart needed when monad-debug-node reload-config works)
+    (re-running detects full→validator transition; backs up the existing
+     full-node node.toml, swaps in the validator template, patches the
+     beneficiary, generates keys, signs name-record)
 
   After Phase 2: addValidator() on-chain via staking-sdk-cli + 100k MON
   self-stake (see github.com/monad-developers/staking-sdk-cli).
@@ -233,7 +245,11 @@ OPERATOR INPUT NEEDED (cannot be auto-detected)
 
 FLAGS (all optional)
   --network=testnet|mainnet         Which Monad network. Asked interactively.
-  --full-node                       Full-node template (default: validator).
+  --full-node                       Full-node template (DEFAULT).
+  --validator                       Validator template (use only after on-chain stake).
+                                    Without on-chain registration, bootstraps refuse
+                                    to share peer-list (anti-Sybil), so the node never
+                                    finds peers. Promote a full-node after stake is in.
   --triedb-partition=DEV            DESTRUCTIVE: partition this NVMe for triedb.
   --triedb-dev=DEV                  IO-scheduler target (no partitioning).
   --allow-nvme-reformat             Allow nvme format --lbaf=0 under --non-interactive.
@@ -243,7 +259,8 @@ FLAGS (all optional)
   --keys-password=auto|prompt       auto = generate + show; prompt = type twice.
   --sign-name-record                (no-op flag — Auth UDP sig auto-generated)
   --triedb-format                   (no-op flag — monad-mpt format auto-runs)
-  --snapshot-restore                Download docs hard-reset snapshot. ~10s GB.
+  --snapshot-restore                Force docs hard-reset snapshot (DEFAULT ON).
+  --no-snapshot-restore             Skip snapshot restore (sync from genesis instead).
   --with-monitoring                 Install BeeHive monad-grafana stack.
   --with-vdp-otel                   Run MF VDP OTel push setup (VDP enrollment).
                                     AUTO-ENABLED for --network=testnet (VDP eligibility
@@ -1455,15 +1472,16 @@ PYEOF
   NODE_RECONFIGURED=1
 }
 
-# ===== Step: snapshot restore (optional, per docs hard-reset) =====
+# ===== Step: snapshot restore (per docs hard-reset, default ON) =====
 # Per docs.monad.xyz/node-ops/node-recovery/hard-reset:
 #   curl -sSL $MF_BUCKET/scripts/<network>/restore-from-snapshot.sh | bash
-# This downloads a recent DB snapshot and seeds the triedb so monad-bft
-# doesn't have to sync from genesis (which takes days). Default off — it
-# downloads tens of GB and the operator should know before triggering it.
+# Docs full-node-installation step 15 explicitly tells operators to run
+# hard-reset to seed the triedb so monad-bft doesn't sync from genesis
+# (testnet: hours; mainnet: weeks). Default ON for fresh installs; auto-
+# skip when the ledger already has data unless ROLE_TRANSITION happened.
 step_snapshot_restore() {
   if (( WITH_SNAPSHOT_RESTORE == 0 )); then
-    info "Skipping snapshot restore (use --snapshot-restore to import a snapshot)"
+    info "Skipping snapshot restore (--no-snapshot-restore was passed)"
     info "Without it, monad-bft syncs from genesis — days on mainnet, hours on testnet"
     return 0
   fi
@@ -1474,16 +1492,43 @@ step_snapshot_restore() {
     return 1
   fi
 
-  # Skip if services are already running — restoring under a live node is
-  # destructive (overwrites triedb) and would corrupt state.
-  if systemctl is-active --quiet monad-bft 2>/dev/null; then
-    warn "monad-bft is active — refusing to restore snapshot under a running node"
-    warn "Stop first: sudo systemctl stop monad-bft monad-execution monad-rpc"
-    return 1
-  fi
   if [[ ! -L /dev/triedb ]]; then
     err "/dev/triedb not present — partition + format the triedb device first"
     return 1
+  fi
+
+  # If services are running, stop them — restoring under a live node would
+  # corrupt state. Remember we did this so step_start_services later starts
+  # them back up.
+  local services_were_active=0
+  if systemctl is-active --quiet monad-bft 2>/dev/null; then
+    services_were_active=1
+    warn "monad-bft is active — stopping services for snapshot restore"
+    run "stopping services" systemctl stop monad-bft monad-execution monad-rpc || true
+  fi
+
+  # Skip if ledger already has data AND no role transition. Tens of GB
+  # download is wasteful when triedb is already populated and the node
+  # only needs to catch up from current snapshot via normal sync.
+  local ledger_dir=/home/monad/monad-bft/ledger
+  local ledger_bytes=0
+  if [[ -d "$ledger_dir" ]]; then
+    ledger_bytes=$(du -sb "$ledger_dir" 2>/dev/null | awk '{print $1+0}')
+  fi
+  # 100 MB threshold — empty fresh install is < 1 MB; even short genesis
+  # sync produces tens of MB; "real" data starts in the hundreds.
+  if (( ledger_bytes > 104857600 )) && [[ -z "$ROLE_TRANSITION" ]]; then
+    info "Ledger already populated ($(( ledger_bytes / 1048576 )) MB) and no role change — skipping snapshot."
+    info "To force re-import: rm -rf $ledger_dir/* && re-run with --snapshot-restore"
+    # If we stopped services for this check, restart them.
+    if (( services_were_active )); then
+      info "Restarting services that were stopped pre-check…"
+      run "starting services" systemctl start monad-bft monad-execution monad-rpc || true
+    fi
+    return 0
+  fi
+  if [[ -n "$ROLE_TRANSITION" ]]; then
+    warn "Role transition detected ($ROLE_TRANSITION) — proceeding with snapshot restore regardless of existing ledger."
   fi
 
   local snap_url="${MF_BUCKET}/scripts/${NETWORK}/restore-from-snapshot.sh"
@@ -1493,16 +1538,22 @@ step_snapshot_restore() {
     return 0
   fi
 
-  warn "About to download + apply a DB snapshot for ${NETWORK} (tens of GB)."
-  warn "This OVERWRITES /dev/triedb contents."
+  warn "About to download + apply a DB snapshot for ${NETWORK}."
+  warn "This OVERWRITES /dev/triedb contents (testnet < 5 min, mainnet 1-5 min)."
   if ! confirm "Run snapshot restore now?"; then
     info "Skipped — re-run with --snapshot-restore (or stop services + curl manually)"
+    if (( services_were_active )); then
+      run "restarting services" systemctl start monad-bft monad-execution monad-rpc || true
+    fi
     return 0
   fi
 
   info "Fetching + running $snap_url …"
   if ! curl -sSL --max-time 30 "$snap_url" | bash; then
     err "Snapshot restore script failed — check log on its own (it writes to /var/log/monad-snapshot* or similar)"
+    if (( services_were_active )); then
+      run "restarting services" systemctl start monad-bft monad-execution monad-rpc || true
+    fi
     return 1
   fi
   ok "Snapshot restore completed"
@@ -1900,9 +1951,62 @@ step_config_files() {
     fi
   fi
 
-  # node.toml — preserve if already exists
+  # node.toml — detect mismatched template (validator vs full) before
+  # preserving. If the existing file is a validator template but operator
+  # asked for full-node (or vice versa), backup + replace. This catches
+  # the common "I installed as validator before stake, now want to be a
+  # full node so peers will talk to me" recovery flow.
+  local existing_type=""
   if [[ -f "$node_toml" ]]; then
-    info "node.toml already present — keeping (delete first to re-download)"
+    # Heuristic: validator template has enable_publisher=true and a real
+    # beneficiary; full-node template has enable_publisher=false and
+    # beneficiary = 0x0000…0000.
+    if grep -qE '^enable_publisher[[:space:]]*=[[:space:]]*true' "$node_toml" 2>/dev/null; then
+      existing_type="validator"
+    elif grep -qE '^enable_publisher[[:space:]]*=[[:space:]]*false' "$node_toml" 2>/dev/null; then
+      existing_type="full"
+    fi
+  fi
+
+  if [[ -f "$node_toml" && -n "$existing_type" && "$existing_type" != "$NODE_TYPE" ]]; then
+    warn "Existing node.toml is a ${existing_type}-template, requested ${NODE_TYPE}."
+    if [[ "$existing_type" == "validator" && "$NODE_TYPE" == "full" ]]; then
+      warn "A validator node without on-chain registration won't receive peer-list from bootstraps."
+      warn "Switching to full-node template fixes peer discovery."
+    fi
+    if (( DRY_RUN )); then
+      echo "  ${C_DIM}[dry-run] backup + replace $node_toml with ${toml_name}${C_RESET}"
+    elif confirm "Replace node.toml with the ${NODE_TYPE} template (backup created)?"; then
+      # Stop services if running — replacing node.toml under a live node
+      # would cause an immediate config-reload mid-flight.
+      local services_were_active=0
+      if systemctl is-active --quiet monad-bft 2>/dev/null; then
+        services_were_active=1
+        warn "Stopping monad-bft/execution/rpc before replacing node.toml…"
+        run "stopping services" systemctl stop monad-bft monad-execution monad-rpc || true
+      fi
+      cp -a "$node_toml" "${node_toml}.${existing_type}-backup.${TS}"
+      ok "Backed up: ${node_toml}.${existing_type}-backup.${TS}"
+      if run "downloading node.toml (${NODE_TYPE} on ${NETWORK})" \
+           curl -fsSL --max-time 30 -o "$node_toml" "$toml_url"; then
+        chown monad:monad "$node_toml" 2>/dev/null || true
+        chmod 0644 "$node_toml"
+        ok "Replaced $node_toml with ${NODE_TYPE} template"
+        NODE_RECONFIGURED=1
+        ROLE_TRANSITION="${existing_type}→${NODE_TYPE}"
+      else
+        warn "Download failed — restoring backup"
+        cp -a "${node_toml}.${existing_type}-backup.${TS}" "$node_toml"
+        return 1
+      fi
+      # If we stopped services, mark for snapshot restore + restart in
+      # later steps. The role transition means stale ledger is suspect.
+      (( services_were_active )) && info "Services will restart after remaining steps."
+    else
+      info "Keeping existing ${existing_type}-template node.toml"
+    fi
+  elif [[ -f "$node_toml" ]]; then
+    info "node.toml already present (${existing_type:-unknown} template) — keeping"
   elif (( DRY_RUN )); then
     echo "  ${C_DIM}[dry-run] curl -o $node_toml $toml_url${C_RESET}"
   else
@@ -2100,6 +2204,59 @@ ACTION==\"add|change\", SUBSYSTEM==\"block\", KERNEL==\"nvme*\", \\
   ok "Wrote udev rule (persists across reboots)"
   run "reloading udev" udevadm control --reload-rules || \
     warn "udev rule written but reload failed — will apply on next boot"
+}
+
+# ===== Step: CVE mitigations =====
+# Per Monad Foundation Discord advisory 2026-04-30 (CVE-2026-31431):
+#   the algif_aead kernel module is exploitable on validator workloads.
+#   Foundation recommends blacklisting it. monad-bft does not use it.
+# Also: docs.monad.xyz/node-ops/full-node-installation guidance to keep
+# the node from auto-rebooting under unattended-upgrades (an unscheduled
+# reboot mid-block-proposal misses votes).
+step_cve_mitigation() {
+  section "Security mitigations (Foundation advisory)"
+
+  # algif_aead blacklist — idempotent, harmless if already present.
+  local conf=/etc/modprobe.d/blacklist-algif_aead.conf
+  if [[ -f "$conf" ]] && grep -q '^blacklist algif_aead' "$conf"; then
+    ok "algif_aead already blacklisted (per Foundation 2026-04-30 advisory)"
+  elif (( DRY_RUN )); then
+    echo "  ${C_DIM}[dry-run] echo 'blacklist algif_aead' > $conf${C_RESET}"
+  else
+    if confirm "Blacklist algif_aead kernel module (Foundation advisory, CVE-2026-31431)?"; then
+      echo 'blacklist algif_aead' > "$conf"
+      chmod 0644 "$conf"
+      # Unload now if currently loaded
+      if lsmod | grep -q '^algif_aead'; then
+        modprobe -r algif_aead 2>/dev/null || \
+          warn "algif_aead is loaded but couldn't be unloaded — reboot to clear"
+      fi
+      ok "Wrote $conf (algif_aead blacklisted)"
+    else
+      info "Skipped — re-run any time to apply"
+    fi
+  fi
+
+  # Unattended-upgrades automatic-reboot — set Automatic-Reboot "false"
+  # so apt security updates don't reboot mid-block-proposal.
+  local au_conf=/etc/apt/apt.conf.d/50unattended-upgrades
+  if [[ -f "$au_conf" ]]; then
+    if grep -qE '^[[:space:]]*Unattended-Upgrade::Automatic-Reboot[[:space:]]+"false"' "$au_conf"; then
+      ok "unattended-upgrades auto-reboot already disabled"
+    elif (( DRY_RUN )); then
+      echo "  ${C_DIM}[dry-run] disable Unattended-Upgrade::Automatic-Reboot in $au_conf${C_RESET}"
+    else
+      # Replace any existing Automatic-Reboot setting, or append.
+      if grep -qE 'Unattended-Upgrade::Automatic-Reboot' "$au_conf"; then
+        sed -i -E 's|^[[:space:]]*//?[[:space:]]*Unattended-Upgrade::Automatic-Reboot[[:space:]]+"[^"]*"[[:space:]]*;|Unattended-Upgrade::Automatic-Reboot "false";|' "$au_conf"
+      else
+        printf '\nUnattended-Upgrade::Automatic-Reboot "false";\n' >> "$au_conf"
+      fi
+      ok "Disabled unattended-upgrades automatic reboot"
+    fi
+  else
+    info "unattended-upgrades not configured — skipping reboot-disable"
+  fi
 }
 
 # ===== Step: chrony =====
@@ -2936,23 +3093,24 @@ EOF
   echo "${C_RESET}"
 
   cat <<EOF
-${C_BOLD}This script will install a Monad node end-to-end (24 steps, ~5–10 min):${C_RESET}
+${C_BOLD}This script will install a Monad node end-to-end (25 steps, ~5–10 min):${C_RESET}
 
   ${C_BLUE}①${C_RESET} Verify hardware/OS (monad-doctor preflight)
   ${C_BLUE}②${C_RESET} Install OS packages (curl, gnupg, ufw, parted, python3, …)
   ${C_BLUE}③${C_RESET} Create 'monad' user + /home/monad/monad-bft directory tree
   ${C_BLUE}④${C_RESET} Partition a free NVMe disk for /dev/triedb ${C_YELLOW}(destructive — asks first)${C_RESET}
-  ${C_BLUE}⑤${C_RESET} Tune ulimits, IO scheduler (mq-deadline), chrony (NTP)
-  ${C_BLUE}⑥${C_RESET} Add Monad apt repo + install + hold the 'monad' package
-  ${C_BLUE}⑦${C_RESET} Run one-shot triedb format (systemctl start monad-mpt)
-  ${C_BLUE}⑧${C_RESET} Download .env + node.toml from Monad Foundation bucket
-  ${C_BLUE}⑨${C_RESET} ${C_BOLD}Ask you for: beneficiary address (0x…) + node name${C_RESET}
-  ${C_BLUE}⑩${C_RESET} Generate validator keys (SECP + BLS) — ${C_BOLD}saves password to /opt/monad/backup${C_RESET}
-  ${C_BLUE}⑪${C_RESET} Sign Auth UDP name-record + inject into node.toml
-  ${C_BLUE}⑫${C_RESET} Install + enable otelcol (metrics collector)
-  ${C_BLUE}⑬${C_RESET} Configure UFW firewall + iptables UDP-DDoS filter
-  ${C_BLUE}⑭${C_RESET} (Optional, --snapshot-restore) Download recent DB snapshot
-  ${C_BLUE}⑮${C_RESET} ${C_BOLD}Ask you: start services now? (FINAL — goes live on the network)${C_RESET}
+  ${C_BLUE}⑤${C_RESET} Tune ulimits, IO scheduler (mq-deadline)
+  ${C_BLUE}⑥${C_RESET} Foundation CVE mitigation (algif_aead blacklist) + chrony (NTP)
+  ${C_BLUE}⑦${C_RESET} Add Monad apt repo + install + hold the 'monad' package
+  ${C_BLUE}⑧${C_RESET} Run one-shot triedb format (systemctl start monad-mpt)
+  ${C_BLUE}⑨${C_RESET} Download .env + node.toml from Monad Foundation bucket ${C_BOLD}(full-node template by default)${C_RESET}
+  ${C_BLUE}⑩${C_RESET} ${C_BOLD}Ask you for: beneficiary address (0x…) + node name${C_RESET}
+  ${C_BLUE}⑪${C_RESET} Generate validator keys (SECP + BLS) — ${C_BOLD}saves password to /opt/monad/backup${C_RESET}
+  ${C_BLUE}⑫${C_RESET} Sign Auth UDP name-record + inject into node.toml
+  ${C_BLUE}⑬${C_RESET} Install + enable otelcol (metrics collector)
+  ${C_BLUE}⑭${C_RESET} Configure UFW firewall + iptables UDP-DDoS filter
+  ${C_BLUE}⑮${C_RESET} ${C_BOLD}Snapshot restore (per docs hard-reset, default ON)${C_RESET} — testnet < 5 min
+  ${C_BLUE}⑯${C_RESET} ${C_BOLD}Ask you: start services now? (FINAL — goes live on the network)${C_RESET}
 
 ${C_BOLD}You'll be prompted ONLY at destructive / operator-specific steps.${C_RESET}
 Other actions just happen with [✓] / [!] / [✗] markers.
@@ -2985,6 +3143,7 @@ EOF
   step_ulimits               || failed+=("ulimits")
   step_io_scheduler          || failed+=("io-scheduler")
   step_triedb_symlink        || failed+=("triedb-symlink")
+  step_cve_mitigation        || failed+=("cve-mitigation")
   step_chrony                || failed+=("chrony")
   step_monad_install         || failed+=("monad-install")
   step_triedb_format         || failed+=("triedb-format")
