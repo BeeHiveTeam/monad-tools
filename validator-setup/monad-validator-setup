@@ -1127,12 +1127,21 @@ with open(path) as f:
 
 def set_in_section(text, section, key, value, as_int=False):
     """Set/insert key=value inside [section]. as_int=True writes  key = N
-    (no quotes); as_int=False writes  key = "value" (TOML string)."""
+    (no quotes); as_int=False writes  key = "value" (TOML string).
+
+    NOTE: deliberately NOT using re.DOTALL. With DOTALL, the `.*$` in the
+    second capture group becomes greedy across newlines and eats the rest
+    of the file (a real bug: node.toml shrank from 3300 → 900 bytes,
+    dropping refresh_period and everything after the matched key).
+    Without DOTALL: `.*$` is bounded to one line; the `[^\[]*?` char-class
+    in group 1 still matches newlines fine because char classes ignore
+    DOTALL — they're explicit about what they include/exclude.
+    """
     rhs = value if as_int else f'"{value}"'
     pattern = re.compile(
         r'(\[' + re.escape(section) + r'\][^\[]*?)'
         r'(^\s*' + re.escape(key) + r'\s*=.*$)',
-        flags=re.MULTILINE | re.DOTALL
+        flags=re.MULTILINE
     )
     # NOTE: \1 in replacement gets the captured section prefix back.
     # Use a lambda to avoid re module interpreting backslashes in `rhs`
