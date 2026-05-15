@@ -444,6 +444,7 @@ step_monad_user() {
         err "Could not create 'monad' user — aborting step."
         return 1
       fi
+      ok "Created user 'monad' ($(id -u monad):$(id -g monad), home: /home/monad)"
     fi
   fi
   local dirs=(
