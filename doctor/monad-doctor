@@ -1220,12 +1220,21 @@ check_authudp_peers() {
   fi
 }
 
+# Helper: is monad pkg installed? VDP checks are meaningless before install.
+_monad_pkg_installed() {
+  dpkg -l monad 2>/dev/null | grep -qE '^.i  monad'
+}
+
 check_vdp_otel_collector() {
   # MF VDP (May 2026 email) requires every validator to push OTel metrics to
   # otel-external.monadinfra.com:443. That needs an active OTel collector.
   # Plain `otelcol` ships with Monad apt package; `otelcol-contrib` is sometimes
   # installed separately for journald receivers (logs → Loki). Either is fine —
   # VDP only cares the push works.
+  if ! _monad_pkg_installed; then
+    emit monad "vdp.otel-collector" INFO "monad pkg not installed — VDP checks skipped (pre-flight)"
+    return
+  fi
   local active=""
   for svc in otelcol otelcol-contrib; do
     if systemctl is-active --quiet "$svc" 2>/dev/null; then
@@ -1244,6 +1253,10 @@ check_vdp_otel_collector() {
 check_vdp_otel_version() {
   # MF VDP setup script (May 2026) targets otelcol >= 0.139.0 — earlier versions
   # lack the resource processor attributes used by MF config.
+  if ! _monad_pkg_installed; then
+    emit monad "vdp.otel-version" INFO "monad pkg not installed — VDP checks skipped"
+    return
+  fi
   local required="0.139.0"
   local bin=""
   for svc in otelcol otelcol-contrib; do
@@ -1274,6 +1287,10 @@ check_vdp_secp_key_label() {
   # MF VDP compliance check: every monad_* metric served by local Prometheus
   # exporter on :8889 must carry a secp_key="<pubkey>" label so MF can identify
   # the validator. This is exactly what the MF script's idempotency-check looks for.
+  if ! _monad_pkg_installed; then
+    emit monad "vdp.secp-key-label" INFO "monad pkg not installed — VDP checks skipped"
+    return
+  fi
   if ! command -v curl >/dev/null 2>&1; then
     emit monad "vdp.secp-key-label" INFO "curl not installed — skipping VDP label check"
     return
@@ -1304,6 +1321,10 @@ check_vdp_mf_push() {
   # MF push uses OTLP gRPC over TLS to otel-external.monadinfra.com:443 (Cloudflare-fronted).
   # We confirm a live push by counting ESTABLISHED TLS connections from the
   # otelcol process to :443 destinations.
+  if ! _monad_pkg_installed; then
+    emit monad "vdp.mf-push" INFO "monad pkg not installed — VDP checks skipped"
+    return
+  fi
   if ! command -v ss >/dev/null 2>&1; then
     emit monad "vdp.mf-push" INFO "ss not available — skipping connection check"
     return
