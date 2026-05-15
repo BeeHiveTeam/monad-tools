@@ -340,7 +340,7 @@ check_ram() {
   swap_used_mb=$(awk '/SwapFree/ {sf=$2} /SwapTotal/ {st=$2} END {printf "%d", (st-sf)/1024}' /proc/meminfo)
   if (( swap_used_mb > 100 )); then
     emit hardware "ram.swap"    WARN "swap in use: ${swap_used_mb} MB — node may stall under load" \
-         $'Quick fix:   sudo swapoff -a && sudo swapon -a   # resets swap, frees pressure now\nInvestigate: ps -eo pid,rss,cmd --sort=-rss | head   # who is using memory?\nLong-term:   set vm.swappiness=1 (validator-setup does this);\n             if RAM <64GB, upgrade — chronic swap = stalled votes.\nWhy:         swapped-out validator state introduces 10-100ms read latency,\n             missing vote deadlines and triggering re-elections.'
+         $'Quick fix:   sudo swapoff -a && sudo swapon -a   # resets swap, frees pressure now\nInvestigate: ps -eo pid,rss,cmd --sort=-rss | head   # who is using memory?\nLong-term:   echo "vm.swappiness = 1" | sudo tee /etc/sysctl.d/99-monad-tuning.conf\n             sudo sysctl --system\n             if RAM <64GB, upgrade — chronic swap = stalled votes.\nWhy:         swapped-out validator state introduces 10-100ms read latency,\n             missing vote deadlines and triggering re-elections.\nNote:        BeeHive recommendation — not in docs.monad.xyz.'
   else
     emit hardware "ram.swap"    PASS "swap not in use"
   fi
@@ -656,7 +656,7 @@ check_ulimits() {
     emit os "ulimit.system"     PASS "fs.file-max = $sysmax"
   else
     emit os "ulimit.system"     WARN "fs.file-max = $sysmax — low" \
-         $'Quick fix:   echo "fs.file-max = 2097152" | sudo tee -a /etc/sysctl.conf && sudo sysctl -p\nAuto:        monad-validator-setup → step_sysctl sets fs.file-max in 99-monad-validator.conf.\nVerify:      sysctl fs.file-max   # ≥ 2097152\nWhy:         system-wide cap above per-process; required for high LimitNOFILE to take effect.'
+         $'Quick fix:   echo "fs.file-max = 2097152" | sudo tee /etc/sysctl.d/99-monad-tuning.conf\n             sudo sysctl --system\nVerify:      sysctl fs.file-max   # ≥ 2097152\nWhy:         system-wide cap above per-process; required for high LimitNOFILE to take effect.\nNote:        BeeHive recommendation — not in docs.monad.xyz.'
   fi
 }
 
@@ -677,7 +677,7 @@ check_sysctl() {
     emit os "sysctl.netbuf"     PASS "rmem_max=$rmem_max wmem_max=$wmem_max"
   else
     emit os "sysctl.netbuf"     FAIL "rmem/wmem_max below ${need} — monad-bft will panic at startup" \
-         $'Symptom:     "unable to set udp receive buffer size to 62500000" in journalctl -u monad-bft\nAuto:        monad-validator-setup → step_sysctl writes /etc/sysctl.d/99-monad-validator.conf.\nManual:      sudo tee /etc/sysctl.d/99-monad-validator.conf <<EOF\n             net.core.rmem_max = 67108864\n             net.core.wmem_max = 67108864\n             net.core.rmem_default = 4194304\n             net.core.wmem_default = 4194304\n             EOF\n             sudo sysctl --system\nVerify:      sysctl net.core.rmem_max net.core.wmem_max   # both ≥ 67108864\nWhy:         monad-bft (since ~0.14.x) calls setsockopt(SO_RCVBUF, 62500000) on\n             the dataplane UDP socket; kernel clamps to rmem_max and the node\n             panics if the resulting buffer is below the requested size.'
+         $'Symptom:     "unable to set udp receive buffer size to 62500000" in journalctl -u monad-bft\nExpected:    the monad apt package ships /etc/sysctl.d/90-monad-network-buffer.conf\n             with net.core.rmem_max = 62500000 (applied on package install via\n             postinst). If this file is missing/overridden, monad-bft will panic.\nCheck:       cat /etc/sysctl.d/90-monad-network-buffer.conf   # should exist after monad install\n             ls /etc/sysctl.d/ | grep -E "monad|99-"   # look for higher-priority overrides\nFix:         sudo dpkg-reconfigure monad   # re-apply pkg drop-in\n             OR remove any 99-*.conf that lowers rmem_max below 62500000\n             sudo sysctl --system\nVerify:      sysctl net.core.rmem_max net.core.wmem_max   # both ≥ 62500000\nWhy:         monad-bft (since ~0.14.x) calls setsockopt(SO_RCVBUF, 62500000) on\n             the dataplane UDP socket; kernel clamps to rmem_max and the node\n             panics if the resulting buffer is below the requested size.'
   fi
 
   local swappiness
@@ -686,7 +686,7 @@ check_sysctl() {
     emit os "sysctl.swappiness" PASS "vm.swappiness=$swappiness"
   else
     emit os "sysctl.swappiness" WARN "vm.swappiness=$swappiness — high" \
-         $'Quick fix:   echo "vm.swappiness = 1" | sudo tee -a /etc/sysctl.d/99-monad-validator.conf\n             sudo sysctl --system\nAuto:        monad-validator-setup → step_sysctl sets vm.swappiness=1.\nVerify:      sysctl vm.swappiness   # 1\nWhy:         default 60 swaps anonymous pages aggressively; for a validator with hot\n             working set this introduces 10-100ms read latency and missed votes.'
+         $'Quick fix:   echo "vm.swappiness = 1" | sudo tee /etc/sysctl.d/99-monad-tuning.conf\n             sudo sysctl --system\nVerify:      sysctl vm.swappiness   # 1\nWhy:         default 60 swaps anonymous pages aggressively; for a validator with hot\n             working set this introduces 10-100ms read latency and missed votes.\nNote:        BeeHive recommendation — not in docs.monad.xyz.'
   fi
 }
 
