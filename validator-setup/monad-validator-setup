@@ -1086,16 +1086,38 @@ step_sign_name_record() {
     err "monad-sign-name-record failed — see $LOG_FILE"
     return 1
   fi
-  # Output is a signature string (likely hex). Capture last non-empty line.
+
+  # monad-sign-name-record outputs TOML-style lines, e.g.:
+  #   self_name_record_sig = "e8187992a11dd4..."
+  # The naive "last non-empty line" approach captured the WHOLE line
+  # including the `key = "` prefix, then python's set_in_section quoted
+  # it again, producing  self_name_record_sig = "self_name_record_sig = "...""
+  # — which is a TOML parse error (witnessed in production today).
+  # Extract ONLY the value between the outer double quotes.
   local sig
-  sig=$(printf '%s\n' "$sig_output" | awk 'NF {last=$0} END {print last}')
+  sig=$(printf '%s\n' "$sig_output" | awk -F\" '
+    /^[[:space:]]*self_name_record_sig[[:space:]]*=/ {print $2; exit}')
   if [[ -z "$sig" ]]; then
-    err "monad-sign-name-record produced no signature output"
+    # Fallback: any long hex string in the output (>=60 chars, 0-9a-f)
+    sig=$(printf '%s\n' "$sig_output" | grep -oE '[0-9a-f]{60,}' | head -1)
+  fi
+  if [[ -z "$sig" ]]; then
+    err "Could not parse signature from monad-sign-name-record output."
+    err "Tool stdout was:"
+    printf '%s\n' "$sig_output" | sed 's/^/  /' >&2
+    err "Tool stderr in: $LOG_FILE"
+    return 1
+  fi
+  # Sanity-check: hex only, reasonable length (sig is ~130 hex chars for SECP)
+  if [[ ! "$sig" =~ ^[0-9a-fA-F]{60,}$ ]]; then
+    err "Parsed signature doesn't look hex: '$sig'"
     return 1
   fi
 
-  # Inject into [peer_discovery] — replace self_name_record_sig + self_record_seq_num.
-  # Also set self_address if currently empty.
+  # Inject into [peer_discovery]. Three fields are integers in TOML
+  # (self_auth_port, self_record_seq_num) so the python helper takes a
+  # mode flag — quoting integers as strings is also a parse error per docs
+  # (witnessed: monad-bft TOML parser rejected `self_auth_port = "8001"`).
   backup_file "$node_toml"
   python3 - "$node_toml" "$pubip" "$sig" <<'PYEOF'
 import sys, re
@@ -1103,29 +1125,34 @@ path, pubip, sig = sys.argv[1], sys.argv[2], sys.argv[3]
 with open(path) as f:
     text = f.read()
 
-def set_in_section(text, section, key, value):
-    # Find [section] ... up to next [section] or EOF
+def set_in_section(text, section, key, value, as_int=False):
+    """Set/insert key=value inside [section]. as_int=True writes  key = N
+    (no quotes); as_int=False writes  key = "value" (TOML string)."""
+    rhs = value if as_int else f'"{value}"'
     pattern = re.compile(
         r'(\[' + re.escape(section) + r'\][^\[]*?)'
         r'(^\s*' + re.escape(key) + r'\s*=.*$)',
         flags=re.MULTILINE | re.DOTALL
     )
-    repl = r'\1' + key + ' = "' + value + '"'
-    new, n = pattern.subn(repl, text, count=1)
+    # NOTE: \1 in replacement gets the captured section prefix back.
+    # Use a lambda to avoid re module interpreting backslashes in `rhs`
+    # (signatures are hex so they're safe, but lambda is cleaner).
+    new, n = pattern.subn(lambda m: m.group(1) + f'{key} = {rhs}', text, count=1)
     if n == 0:
         # Key not present — insert at end of section
         sect_re = re.compile(r'(\[' + re.escape(section) + r'\][^\[]*)', re.DOTALL)
         m = sect_re.search(text)
         if m:
-            insertion = f'\n{key} = "{value}"\n'
+            insertion = f'\n{key} = {rhs}\n'
             new = text[:m.end()] + insertion + text[m.end():]
         else:
-            new = text + f'\n[{section}]\n{key} = "{value}"\n'
+            new = text + f'\n[{section}]\n{key} = {rhs}\n'
     return new
 
-text = set_in_section(text, 'peer_discovery', 'self_address', f'{pubip}:8000')
-text = set_in_section(text, 'peer_discovery', 'self_auth_port', '8001')
-text = set_in_section(text, 'peer_discovery', 'self_record_seq_num', '1')
+# Strings → quoted; ports/seq → bare integers per docs
+text = set_in_section(text, 'peer_discovery', 'self_address',         f'{pubip}:8000')
+text = set_in_section(text, 'peer_discovery', 'self_auth_port',       '8001', as_int=True)
+text = set_in_section(text, 'peer_discovery', 'self_record_seq_num',  '1',    as_int=True)
 text = set_in_section(text, 'peer_discovery', 'self_name_record_sig', sig)
 
 with open(path, 'w') as f:
@@ -1183,6 +1210,22 @@ step_start_services() {
     fi
     if [[ -z "$self_sig" || "$self_sig" =~ [\<\>] ]]; then
       blockers+=("node.toml self_name_record_sig placeholder: '$self_sig' (run --sign-name-record or edit node.toml)")
+    fi
+    # Catch the specific double-quote injection bug we hit: when
+    # monad-sign-name-record output gets misparsed, the sig ends up as
+    # the literal TOML LINE ('self_name_record_sig = "hex..."') wrapped in
+    # additional quotes — anything containing '=' or quotes is corrupt.
+    if [[ "$self_sig" == *'='* || "$self_sig" == *'"'* ]]; then
+      blockers+=("node.toml self_name_record_sig is malformed (contains = or quotes): '$self_sig' — re-run after restoring node.toml from backup")
+    fi
+    # TOML int fields must NOT be strings — monad-bft parser rejects
+    # self_auth_port = "8001" (quoted). Detect by checking the line content.
+    local toml="$node_toml"
+    if grep -qE '^[[:space:]]*self_auth_port[[:space:]]*=[[:space:]]*"' "$toml" 2>/dev/null; then
+      blockers+=("node.toml self_auth_port is quoted (must be integer): edit to 'self_auth_port = 8001' (no quotes)")
+    fi
+    if grep -qE '^[[:space:]]*self_record_seq_num[[:space:]]*=[[:space:]]*"' "$toml" 2>/dev/null; then
+      blockers+=("node.toml self_record_seq_num is quoted (must be integer): edit to 'self_record_seq_num = 1' (no quotes)")
     fi
   else
     blockers+=("node.toml missing (run step_config_files)")
