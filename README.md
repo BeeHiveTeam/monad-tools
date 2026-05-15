@@ -5,9 +5,9 @@ Operator tooling for Monad validator nodes, by [BeeHive](https://bee-hive.work).
 | Tool | What | Lines |
 |---|---|---|
 | **[monad-doctor](doctor/)** | Pre-flight readiness check — hardware/OS/network/security/monad/VDP. **55 checks** in 30 seconds, JSON output, exits 0/1/2. Extended fix hints (Quick fix / Auto / Verify / Why) on every FAIL & WARN. | ~1380 |
-| **[monad-validator-setup](validator-setup/)** | **Fresh-server-to-running-validator** in one command — **24 steps**, 6 of them opt-in for destructive/operator-specific ops (disk partitioning, key generation, name-record signing, service startup). Auto-detects monad version from GitHub releases/latest, otelcol sha256-verified, UFW SSH-port auto-detect. `--non-interactive` mode supports zero-prompt CI install. | ~2100 |
+| **[monad-validator-setup](validator-setup/)** | **Fresh-server-to-running-validator** in one command — **25 steps**, including snapshot restore (default ON) and Foundation CVE mitigation (`algif_aead` blacklist + `unattended-upgrades` no-auto-reboot). Defaults to **full-node template** (per docs validator-installation — validators are promoted from a full node after on-chain stake); `--validator` opts into validator template. Auto-detects monad version from GitHub releases/latest, otelcol sha256-verified, UFW SSH-port auto-detect, end-to-end verified on a fresh Hetzner box. | ~2500 |
 
-Companion repo: [BeeHiveTeam/monad-grafana](https://github.com/BeeHiveTeam/monad-grafana) — Prometheus + Grafana monitoring stack with 47-panel dashboard, installs in one command.
+Companion repo: [BeeHiveTeam/monad-grafana](https://github.com/BeeHiveTeam/monad-grafana) — Prometheus + Grafana + node_exporter monitoring stack (4 containers, 49-panel dashboard, `--public` flag for browser access). Installs in one command.
 
 ---
 
@@ -21,29 +21,29 @@ cd monad-tools
 # 2. Check the server is ready (55 checks, 30 seconds)
 sudo ./doctor/monad-doctor
 
-# 3. If READY (no FAIL): configure host. Asks testnet/mainnet interactively,
-#    or pass --network=testnet|mainnet. Adds --with-monitoring for Grafana,
-#    --with-vdp-otel for MF metrics push compliance (testnet first).
-sudo ./validator-setup/monad-validator-setup --network=testnet --with-monitoring
+# 3. If READY (no FAIL): configure host end-to-end.
+#    Default = full-node template (per docs validator-installation flow).
+#    Snapshot restore is ON by default (--no-snapshot-restore to skip).
+#    --with-vdp-otel is auto-enabled for testnet (VDP eligibility starts there).
+sudo ./validator-setup/monad-validator-setup --network=testnet \
+  --triedb-partition=nvme1n1 --start-services
 
-# 4. node.toml has been downloaded from $MF_BUCKET/config/<network>/latest/
-#    Edit it to set: beneficiary, node_name, Auth UDP keys
-sudo -u monad nano /home/monad/monad-bft/config/node.toml
+# 4. After node is fully synced AND you have ≥100k MON stake on the
+#    beneficiary address, PROMOTE to validator on the same machine:
+sudo ./validator-setup/monad-validator-setup --network=testnet --validator \
+  --beneficiary=0x<your_real_rewards_address> --node-name=<your_moniker> \
+  --generate-keys --keys-password=auto
+# The script detects the full→validator transition, backs up the existing
+# node.toml, swaps in the validator template, generates SECP+BLS keys, and
+# signs the Auth UDP name-record.
 
-# 5. Place your validator keys
-sudo cp bls_priv_key secp_priv_key validator_id /home/monad/monad-bft/config/
-sudo chmod 600 /home/monad/monad-bft/config/{bls,secp}_priv_key
-sudo chown -R monad:monad /home/monad/monad-bft/config/
-
-# 6. Start services
-sudo systemctl enable --now monad-execution monad-bft monad-rpc
-
-# 7. Verify everything healthy (incl. Auth UDP runtime + config, VDP push)
+# 5. Verify everything healthy (incl. sync gap, Auth UDP, VDP push)
 sudo ./doctor/monad-doctor
 
-# 8. (with --with-monitoring) open Grafana via SSH tunnel
-ssh -L 3000:127.0.0.1:3000 -L 9090:127.0.0.1:9090 user@your.server
-# → http://localhost:3000  (admin / pass in /opt/monad-grafana/.env)
+# 6. Install monitoring (separate repo, one command, optional --public for
+#    browser access). See https://github.com/BeeHiveTeam/monad-grafana
+curl -fsSL https://raw.githubusercontent.com/BeeHiveTeam/monad-grafana/main/install.sh \
+  | sudo bash -s -- --public
 ```
 
 ---

@@ -227,9 +227,13 @@ If you see this in doctor output you do NOT need to come here — re-run
 
 | Check | Auto-fix in setup |
 |---|---|
-| `ulimit.limits-conf`, `ulimit.system` | `step_ulimits`, `step_sysctl` |
-| `sysctl.netbuf`, `sysctl.swappiness` | `step_sysctl` |
+| `ulimit.limits-conf` | `step_ulimits` (writes `/etc/security/limits.d/99-monad-validator.conf`) |
+| `ulimit.system` (fs.file-max) | **Manual** — BeeHive recommendation, not in docs.monad.xyz. `echo "fs.file-max = 2097152" \| sudo tee /etc/sysctl.d/99-monad-tuning.conf && sudo sysctl --system` |
+| `sysctl.netbuf` (rmem/wmem_max) | **`monad` apt package** — drops `/etc/sysctl.d/90-monad-network-buffer.conf` itself. The script no longer writes a sysctl drop-in (overriding pkg's value caused monad-bft panics). |
+| `sysctl.swappiness` | **Manual** — BeeHive recommendation, not in docs.monad.xyz. `echo "vm.swappiness = 1" \| sudo tee /etc/sysctl.d/99-monad-tuning.conf && sudo sysctl --system` |
 | `ntp` (timesyncd → chrony) | `step_chrony` |
+| `auto-upgrades` (Automatic-Reboot=false) | `step_cve_mitigation` |
+| `cve.2026-31431` (algif_aead) | `step_cve_mitigation` (blacklists module + unloads if present) |
 | `net.firewall` (UFW install + rules) | `step_firewall` |
 | `iptables.udp-filter` | `step_iptables_ddos` |
 | `deps.nvme-cli` | `step_dependencies` |
@@ -237,4 +241,4 @@ If you see this in doctor output you do NOT need to come here — re-run
 | `monad.triedb-udev` | `step_triedb_symlink` |
 | `disk.sched.*` (mq-deadline) | `step_io_scheduler` (udev-persisted) |
 | `vdp.otel-collector` (enable) | `step_otelcol_enable` |
-| `vdp.mf-push`, `vdp.secp-key-label`, `vdp.otel-version` | `step_vdp_otel_push` (requires `--with-vdp-otel`) |
+| `vdp.mf-push`, `vdp.secp-key-label`, `vdp.otel-version` | `step_vdp_otel_push` (auto-enabled on testnet, soft-fails on verify) |

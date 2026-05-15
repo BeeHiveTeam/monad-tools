@@ -82,12 +82,12 @@ Every FAIL and WARN comes with a multi-line hint following a consistent format:
 
 ```
   ! sysctl.swappiness              vm.swappiness=60 — high
-    → Quick fix:   echo "vm.swappiness = 1" | sudo tee -a /etc/sysctl.d/99-monad-validator.conf
+    → Quick fix:   echo "vm.swappiness = 1" | sudo tee /etc/sysctl.d/99-monad-tuning.conf
     →              sudo sysctl --system
-    → Auto:        monad-validator-setup → step_sysctl sets vm.swappiness=1.
     → Verify:      sysctl vm.swappiness   # 1
     → Why:         default 60 swaps anonymous pages aggressively; for a validator with hot
     →              working set this introduces 10-100ms read latency and missed votes.
+    → Note:        BeeHive recommendation — not in docs.monad.xyz.
 ```
 
 | Field | Purpose |
