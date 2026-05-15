@@ -79,8 +79,18 @@ REPORT_FILE="/var/lib/monad-validator-setup/report-${TS}.json"
 MF_BUCKET="${MF_BUCKET:-https://bucket.monadinfra.com}"
 
 # Tuning values
-SYSCTL_RMEM=16777216
-SYSCTL_WMEM=16777216
+# UDP buffer maximums: monad-bft (since ~0.14.x) calls setsockopt with
+# SO_RCVBUF=62500000 (≈62 MB) for the dataplane socket. If rmem_max is
+# below that, the kernel clamps the request and monad-bft panics at
+# startup with "unable to set udp receive buffer size to 62500000".
+# We set 64 MB (67108864) for headroom; raise via env if a future
+# release bumps the requirement again.
+SYSCTL_RMEM_MAX="${SYSCTL_RMEM_MAX:-67108864}"
+SYSCTL_WMEM_MAX="${SYSCTL_WMEM_MAX:-67108864}"
+# System-wide DEFAULTS for newly-created sockets (kept modest so we don't
+# waste kernel memory on every non-monad TCP socket on the box).
+SYSCTL_RMEM_DEFAULT="${SYSCTL_RMEM_DEFAULT:-4194304}"
+SYSCTL_WMEM_DEFAULT="${SYSCTL_WMEM_DEFAULT:-4194304}"
 SYSCTL_NETDEV_BACKLOG=5000
 SYSCTL_FILE_MAX=2097152
 SYSCTL_SWAPPINESS=1
@@ -1548,11 +1558,15 @@ step_sysctl() {
   local conf=/etc/sysctl.d/99-monad-validator.conf
   local content
   content="# monad-validator-setup ${TS}
-# Network buffers — raptorcast UDP throughput
-net.core.rmem_max = $SYSCTL_RMEM
-net.core.wmem_max = $SYSCTL_WMEM
-net.core.rmem_default = $SYSCTL_RMEM
-net.core.wmem_default = $SYSCTL_WMEM
+# Network buffer MAX — monad-bft sets SO_RCVBUF=62500000 (~62MB) for the
+# dataplane UDP socket; rmem_max must be ≥ that or the node panics on start.
+# 64MB chosen for headroom.
+net.core.rmem_max = $SYSCTL_RMEM_MAX
+net.core.wmem_max = $SYSCTL_WMEM_MAX
+# Per-socket DEFAULTS (system-wide). Kept modest so non-monad sockets
+# don't preallocate large buffers — apps that need more call setsockopt.
+net.core.rmem_default = $SYSCTL_RMEM_DEFAULT
+net.core.wmem_default = $SYSCTL_WMEM_DEFAULT
 net.core.netdev_max_backlog = $SYSCTL_NETDEV_BACKLOG
 # File descriptors
 fs.file-max = $SYSCTL_FILE_MAX
