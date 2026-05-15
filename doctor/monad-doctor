@@ -1220,9 +1220,17 @@ check_authudp_peers() {
   fi
 }
 
-# Helper: is monad pkg installed? VDP checks are meaningless before install.
+# Helper: is monad pkg installed? Node-specific checks are meaningless
+# until the package is in place.
 _monad_pkg_installed() {
   dpkg -l monad 2>/dev/null | grep -qE '^.i  monad'
+}
+
+# Helper: single INFO emitted when monad pkg isn't installed, to make the
+# pre-flight intent explicit in the report.
+_monad_not_installed_notice() {
+  emit monad "monad.preflight" INFO \
+    "monad package not installed — node-specific checks (triedb, keys, OTel, VDP, Auth UDP) skipped. Hardware/OS/network/security still verified above."
 }
 
 check_vdp_otel_collector() {
@@ -1230,11 +1238,7 @@ check_vdp_otel_collector() {
   # otel-external.monadinfra.com:443. That needs an active OTel collector.
   # Plain `otelcol` ships with Monad apt package; `otelcol-contrib` is sometimes
   # installed separately for journald receivers (logs → Loki). Either is fine —
-  # VDP only cares the push works.
-  if ! _monad_pkg_installed; then
-    emit monad "vdp.otel-collector" INFO "monad pkg not installed — VDP checks skipped (pre-flight)"
-    return
-  fi
+  # VDP only cares the push works. Caller (main) gates this on _monad_pkg_installed.
   local active=""
   for svc in otelcol otelcol-contrib; do
     if systemctl is-active --quiet "$svc" 2>/dev/null; then
@@ -1253,10 +1257,6 @@ check_vdp_otel_collector() {
 check_vdp_otel_version() {
   # MF VDP setup script (May 2026) targets otelcol >= 0.139.0 — earlier versions
   # lack the resource processor attributes used by MF config.
-  if ! _monad_pkg_installed; then
-    emit monad "vdp.otel-version" INFO "monad pkg not installed — VDP checks skipped"
-    return
-  fi
   local required="0.139.0"
   local bin=""
   for svc in otelcol otelcol-contrib; do
@@ -1287,10 +1287,6 @@ check_vdp_secp_key_label() {
   # MF VDP compliance check: every monad_* metric served by local Prometheus
   # exporter on :8889 must carry a secp_key="<pubkey>" label so MF can identify
   # the validator. This is exactly what the MF script's idempotency-check looks for.
-  if ! _monad_pkg_installed; then
-    emit monad "vdp.secp-key-label" INFO "monad pkg not installed — VDP checks skipped"
-    return
-  fi
   if ! command -v curl >/dev/null 2>&1; then
     emit monad "vdp.secp-key-label" INFO "curl not installed — skipping VDP label check"
     return
@@ -1321,10 +1317,6 @@ check_vdp_mf_push() {
   # MF push uses OTLP gRPC over TLS to otel-external.monadinfra.com:443 (Cloudflare-fronted).
   # We confirm a live push by counting ESTABLISHED TLS connections from the
   # otelcol process to :443 destinations.
-  if ! _monad_pkg_installed; then
-    emit monad "vdp.mf-push" INFO "monad pkg not installed — VDP checks skipped"
-    return
-  fi
   if ! command -v ss >/dev/null 2>&1; then
     emit monad "vdp.mf-push" INFO "ss not available — skipping connection check"
     return
@@ -1370,11 +1362,21 @@ main() {
   run_section security  check_ssh_hardening check_unattended_upgrades check_fail2ban \
                         check_rpc_exposure check_iptables_udp_filter check_cve_2026_31431 \
                         check_nvme_cli
-  run_section monad     check_monad_user check_triedb_device check_triedb_udev \
-                        check_cruft_timer check_monad_install \
-                        check_github_release check_authudp_config check_authudp_peers \
-                        check_vdp_otel_collector check_vdp_otel_version \
-                        check_vdp_secp_key_label check_vdp_mf_push
+  # MONAD section: if the monad package is not installed, only run
+  # `check_monad_install` (which emits an INFO that this is a pre-flight
+  # check) and skip every other node-specific check. There's nothing for
+  # them to measure until the package is in place. Operators running
+  # doctor before installation get a clean report focused on hardware/OS/
+  # network/security — i.e. what they CAN fix before kicking off install.
+  if _monad_pkg_installed; then
+    run_section monad     check_monad_user check_triedb_device check_triedb_udev \
+                          check_cruft_timer check_monad_install \
+                          check_github_release check_authudp_config check_authudp_peers \
+                          check_vdp_otel_collector check_vdp_otel_version \
+                          check_vdp_secp_key_label check_vdp_mf_push
+  else
+    run_section monad     check_monad_install _monad_not_installed_notice
+  fi
 
   if [[ $JSON_OUTPUT -eq 1 ]]; then
     print_json
