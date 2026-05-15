@@ -948,37 +948,55 @@ check_nvme_cli() {
 }
 
 check_ssh_hardening() {
-  local sshd=/etc/ssh/sshd_config
-  [[ -r "$sshd" ]] || { emit security "ssh.config" INFO "sshd_config not readable (skipped)"; return; }
+  # Use `sshd -T` to query the effective config — this is the only authoritative
+  # source on modern Ubuntu (22.04+) where /etc/ssh/sshd_config includes
+  # /etc/ssh/sshd_config.d/*.conf via "Include" at the top. Grepping the main
+  # file alone misses every drop-in override and reports stale defaults from
+  # the commented-out lines like "#PasswordAuthentication yes". Output keys
+  # from sshd -T are lowercase.
+  local effective
+  effective=$(sshd -T 2>/dev/null) || effective=""
+
+  if [[ -z "$effective" ]]; then
+    # Fallback: parse main file directly. Only happens if sshd isn't installed
+    # or current user lacks privilege to read host keys (rare on a node host).
+    local sshd=/etc/ssh/sshd_config
+    [[ -r "$sshd" ]] || { emit security "ssh.config" INFO "sshd not queryable and sshd_config not readable (skipped)"; return; }
+    effective=$(grep -E '^[[:space:]]*(PasswordAuthentication|PermitRootLogin)[[:space:]]' "$sshd" 2>/dev/null \
+                | awk '{print tolower($1), $2}')
+  fi
 
   # PasswordAuthentication
   local pwauth
-  pwauth=$(grep -E '^[[:space:]]*PasswordAuthentication' "$sshd" 2>/dev/null | awk '{print $2}' | tail -1)
-  pwauth=${pwauth:-yes}  # default
+  pwauth=$(awk '/^passwordauthentication / {print $2; exit}' <<<"$effective")
+  pwauth=${pwauth:-yes}  # sshd default when unset
   case "$pwauth" in
-    no|No|NO)  emit security "ssh.passwordauth" PASS "PasswordAuthentication=no" ;;
+    no|No|NO)  emit security "ssh.passwordauth" PASS "PasswordAuthentication=no (effective via sshd -T)" ;;
     *)         emit security "ssh.passwordauth" WARN "PasswordAuthentication=$pwauth — bruteforce risk" \
-                  $'Quick fix:   sudo sed -i \'s/^[#[:space:]]*PasswordAuthentication.*/PasswordAuthentication no/\' /etc/ssh/sshd_config\n             sudo systemctl reload ssh\nDANGER:      ensure your SSH key is already in ~/.ssh/authorized_keys BEFORE reload,\n             or you will lock yourself out (no console fallback on some hosts).\nVerify:      sshd -T | grep -i passwordauthentication   # no\nWhy:         password auth is the primary bruteforce surface on a 22/tcp validator.' ;;
+                  $'Quick fix:   echo \'PasswordAuthentication no\' | sudo tee /etc/ssh/sshd_config.d/99-no-password.conf\n             sudo systemctl reload ssh\nDANGER:      ensure your SSH key is already in ~/.ssh/authorized_keys BEFORE reload,\n             or you will lock yourself out (no console fallback on some hosts).\nVerify:      sshd -T | grep -i passwordauthentication   # no\nWhy:         password auth is the primary bruteforce surface on a 22/tcp validator.' ;;
   esac
 
   # PermitRootLogin — but if PasswordAuth is already off, key-only root login
   # has the same effective security as 'prohibit-password'.
   local rootlogin
-  rootlogin=$(grep -E '^[[:space:]]*PermitRootLogin' "$sshd" 2>/dev/null | awk '{print $2}' | tail -1)
+  rootlogin=$(awk '/^permitrootlogin / {print $2; exit}' <<<"$effective")
   rootlogin=${rootlogin:-prohibit-password}
   case "$rootlogin" in
-    no|No|NO|prohibit-password)
-      emit security "ssh.rootlogin" PASS "PermitRootLogin=$rootlogin" ;;
+    no|No|NO|prohibit-password|without-password)
+      # "without-password" is the legacy synonym for "prohibit-password" still
+      # emitted by sshd -T on some Ubuntu versions; both forbid password auth
+      # for root.
+      emit security "ssh.rootlogin" PASS "PermitRootLogin=$rootlogin (effective via sshd -T)" ;;
     yes|Yes|YES)
       if [[ "$pwauth" == "no" || "$pwauth" == "No" || "$pwauth" == "NO" ]]; then
         emit security "ssh.rootlogin" INFO "PermitRootLogin=yes — but PasswordAuth=no, so effectively key-only" \
-             "Optional tightening: set 'PermitRootLogin prohibit-password'"
+             "Optional tightening: set 'PermitRootLogin prohibit-password' in /etc/ssh/sshd_config.d/*.conf"
       else
         emit security "ssh.rootlogin" WARN "PermitRootLogin=yes with password auth — risky" \
-             $'Quick fix:   sudo sed -i \'s/^[#[:space:]]*PermitRootLogin.*/PermitRootLogin prohibit-password/\' /etc/ssh/sshd_config\n             sudo systemctl reload ssh\nDANGER:      ensure root\'s authorized_keys is set BEFORE reload.\nWhy:         allows password bruteforce directly against root — historically the\n             #1 vector for compromised validators.'
+             $'Quick fix:   echo \'PermitRootLogin prohibit-password\' | sudo tee /etc/ssh/sshd_config.d/98-root-keys-only.conf\n             sudo systemctl reload ssh\nDANGER:      ensure root\'s authorized_keys is set BEFORE reload.\nWhy:         allows password bruteforce directly against root — historically the\n             #1 vector for compromised validators.'
       fi ;;
     *)
-      emit security "ssh.rootlogin" INFO "PermitRootLogin=$rootlogin" ;;
+      emit security "ssh.rootlogin" INFO "PermitRootLogin=$rootlogin (effective via sshd -T)" ;;
   esac
 }
 
