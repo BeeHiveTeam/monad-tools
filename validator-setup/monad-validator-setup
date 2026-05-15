@@ -63,6 +63,7 @@ DRY_RUN=0
 SKIP_PREFLIGHT=0
 WITH_MONITORING=0
 WITH_VDP_OTEL=0
+WITH_VDP_OTEL_EXPLICIT=0     # 1 if operator passed --with-vdp-otel OR --no-vdp-otel explicitly
 TRIEDB_DEV=""
 TRIEDB_PARTITION_DEV=""     # if set, step_triedb_partition uses this disk non-interactively
 WITH_TRIEDB_FORMAT=0        # if 1, systemctl start monad-mpt (one-shot triedb format)
@@ -164,7 +165,8 @@ while [[ $# -gt 0 ]]; do
     --dry-run)         DRY_RUN=1 ;;
     --skip-preflight)  SKIP_PREFLIGHT=1 ;;
     --with-monitoring) WITH_MONITORING=1 ;;
-    --with-vdp-otel)   WITH_VDP_OTEL=1 ;;
+    --with-vdp-otel)   WITH_VDP_OTEL=1; WITH_VDP_OTEL_EXPLICIT=1 ;;
+    --no-vdp-otel)     WITH_VDP_OTEL=0; WITH_VDP_OTEL_EXPLICIT=1 ;;
     --triedb-dev=*)    TRIEDB_DEV="${1#*=}" ;;
     --triedb-partition=*) TRIEDB_PARTITION_DEV="${1#*=}" ;;
     --triedb-format)   WITH_TRIEDB_FORMAT=1 ;;
@@ -223,6 +225,9 @@ FLAGS (all optional)
   --snapshot-restore                Download docs hard-reset snapshot. ~10s GB.
   --with-monitoring                 Install BeeHive monad-grafana stack.
   --with-vdp-otel                   Run MF VDP OTel push setup (VDP enrollment).
+                                    AUTO-ENABLED for --network=testnet (VDP eligibility
+                                    needs 4-week metrics history from testnet).
+  --no-vdp-otel                     Opt out of VDP push setup (override testnet default).
   --start-services                  systemctl enable+start monad-* at end.
   --skip-preflight                  Skip monad-doctor pre-check.
   --non-interactive                 No prompts; missing flags use safe defaults.
@@ -397,6 +402,17 @@ resolve_pkg_version() {
     info "Pinned monad version: ${C_BOLD}${MONAD_PKG_VERSION}${C_RESET} (env override)"
   else
     info "Monad version: ${C_BOLD}auto${C_RESET} — will use apt repo candidate at install time"
+  fi
+
+  # Auto-enable VDP OTel push for testnet — VDP eligibility requires 4-week
+  # uptime + metrics flow to MF. Testnet is where that history accumulates,
+  # so every testnet validator should be pushing from day one. Mainnet stays
+  # opt-in (operator may have a custom collector or no VDP plans).
+  # --no-vdp-otel lets the operator opt out explicitly.
+  if (( WITH_VDP_OTEL_EXPLICIT == 0 )) && [[ "$NETWORK" == "testnet" ]]; then
+    WITH_VDP_OTEL=1
+    info "Testnet default: ${C_BOLD}--with-vdp-otel${C_RESET} enabled (VDP delegation track)"
+    info "  Opt out with: --no-vdp-otel"
   fi
 }
 
@@ -2458,11 +2474,20 @@ step_vdp_otel_push() {
   section "VDP OTel push (Monad Foundation metrics export)"
 
   # Critical pre-conditions: KEYSTORE_PASSWORD must be in /home/monad/.env
-  # (set by the operator when generating SECP/BLS keys). Without it, monad-keystore
-  # can't recover the SECP pubkey that the MF script needs for the resource label.
+  # (set by the operator when generating SECP/BLS keys). Without it,
+  # monad-keystore can't recover the SECP pubkey that the MF script needs.
   if [[ ! -f /home/monad/.env ]] || ! grep -q "^KEYSTORE_PASSWORD=" /home/monad/.env 2>/dev/null; then
+    # If VDP was auto-enabled (testnet default), soft-skip — don't fail the
+    # whole install when keys just aren't placed yet. Operator can re-run
+    # --with-vdp-otel later. If VDP was EXPLICITLY requested, hard-fail
+    # because the operator asked for it.
+    if (( WITH_VDP_OTEL_EXPLICIT == 0 )); then
+      warn "VDP push skipped — no KEYSTORE_PASSWORD in /home/monad/.env (keys not generated yet)"
+      warn "Auto-enabled because --network=testnet. Re-run with --with-vdp-otel after --generate-keys"
+      return 0
+    fi
     err "/home/monad/.env missing or has no KEYSTORE_PASSWORD — set it after generating keys"
-    err "Skipping VDP setup. Re-run with --with-vdp-otel once keys are placed."
+    err "Re-run with --with-vdp-otel once keys are placed."
     return 1
   fi
 
