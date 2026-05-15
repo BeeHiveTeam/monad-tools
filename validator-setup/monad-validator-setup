@@ -79,18 +79,17 @@ REPORT_FILE="/var/lib/monad-validator-setup/report-${TS}.json"
 MF_BUCKET="${MF_BUCKET:-https://bucket.monadinfra.com}"
 
 # Tuning values
-# UDP buffer maximums: monad-bft (since ~0.14.x) calls setsockopt with
-# SO_RCVBUF=62500000 (≈62 MB) for the dataplane socket. If rmem_max is
-# below that, the kernel clamps the request and monad-bft panics at
-# startup with "unable to set udp receive buffer size to 62500000".
-# We set 64 MB (67108864) for headroom; raise via env if a future
-# release bumps the requirement again.
-SYSCTL_RMEM_MAX="${SYSCTL_RMEM_MAX:-67108864}"
-SYSCTL_WMEM_MAX="${SYSCTL_WMEM_MAX:-67108864}"
-# System-wide DEFAULTS for newly-created sockets (kept modest so we don't
-# waste kernel memory on every non-monad TCP socket on the box).
-SYSCTL_RMEM_DEFAULT="${SYSCTL_RMEM_DEFAULT:-4194304}"
-SYSCTL_WMEM_DEFAULT="${SYSCTL_WMEM_DEFAULT:-4194304}"
+#
+# DELIBERATELY NOT SET HERE: net.core.rmem_max / wmem_max / rmem_default /
+# wmem_default. The monad apt package drops `/etc/sysctl.d/90-monad-network-
+# buffer.conf` with the exact values its dataplane expects (currently
+# 62500000 = 62.5 MB). We used to override these via our 99- drop-in with
+# 16 MB, which silently DOWNGRADED what the package wanted (99 > 90 priority)
+# and made monad-bft panic at startup. Leave network-buffer sizing to the
+# monad pkg — it knows its own SO_RCVBUF requirement and will keep itself in
+# sync if Monad bumps the value in a future release.
+#
+# What we DO add on top — settings the monad pkg doesn't touch:
 SYSCTL_NETDEV_BACKLOG=5000
 SYSCTL_FILE_MAX=2097152
 SYSCTL_SWAPPINESS=1
@@ -1206,6 +1205,13 @@ step_start_services() {
   [[ -f /home/monad/monad-bft/config/id-secp ]] || blockers+=("missing /home/monad/monad-bft/config/id-secp (run --generate-keys)")
   [[ -f /home/monad/monad-bft/config/id-bls ]]  || blockers+=("missing /home/monad/monad-bft/config/id-bls (run --generate-keys)")
   [[ -L /dev/triedb ]] || blockers+=("/dev/triedb symlink missing (run --triedb-partition= or partition manually)")
+  # monad-bft will panic at startup if rmem_max is below 62500000 — see
+  # monad-dataplane/src/udp.rs panic "unable to set udp receive buffer size".
+  local rmem_max_now
+  rmem_max_now=$(sysctl -n net.core.rmem_max 2>/dev/null || echo 0)
+  if (( rmem_max_now < 62500000 )); then
+    blockers+=("net.core.rmem_max = $rmem_max_now (need ≥62500000 — monad-bft will panic). Fix: sudo sysctl --system; if still low, check /etc/sysctl.d/ for an override")
+  fi
   if [[ -f /home/monad/monad-bft/config/node.toml ]]; then
     local ben name self_addr self_sig
     ben=$(awk -F\" '/^[[:space:]]*beneficiary[[:space:]]*=/ {print $2; exit}' /home/monad/monad-bft/config/node.toml)
@@ -1558,21 +1564,20 @@ step_sysctl() {
   local conf=/etc/sysctl.d/99-monad-validator.conf
   local content
   content="# monad-validator-setup ${TS}
-# Network buffer MAX — monad-bft sets SO_RCVBUF=62500000 (~62MB) for the
-# dataplane UDP socket; rmem_max must be ≥ that or the node panics on start.
-# 64MB chosen for headroom.
-net.core.rmem_max = $SYSCTL_RMEM_MAX
-net.core.wmem_max = $SYSCTL_WMEM_MAX
-# Per-socket DEFAULTS (system-wide). Kept modest so non-monad sockets
-# don't preallocate large buffers — apps that need more call setsockopt.
-net.core.rmem_default = $SYSCTL_RMEM_DEFAULT
-net.core.wmem_default = $SYSCTL_WMEM_DEFAULT
+#
+# Network buffer sizes (rmem_max / wmem_max / rmem_default / wmem_default)
+# are DELIBERATELY NOT SET HERE — see /etc/sysctl.d/90-monad-network-buffer.conf
+# from the monad apt package. Setting them in our 99- file would override
+# the package's choice (99 > 90 priority) and silently downgrade what
+# monad-bft requires at startup.
+#
+# What this file adds — settings the monad pkg doesn't manage:
 net.core.netdev_max_backlog = $SYSCTL_NETDEV_BACKLOG
 # File descriptors
 fs.file-max = $SYSCTL_FILE_MAX
 # Swap behaviour — validators must not swap
 vm.swappiness = $SYSCTL_SWAPPINESS
-# Reasonable defaults for high-perf servers
+# TCP fast open — short connection wins on bursty consensus traffic
 net.ipv4.tcp_fastopen = 3
 "
 
@@ -1924,6 +1929,24 @@ EOF
     ok "monad pinned at $(dpkg-query -W -f='${Version}' monad) (apt-mark hold)"
   else
     ok "monad already on hold"
+  fi
+
+  # The monad package drops /etc/sysctl.d/90-monad-network-buffer.conf with
+  # rmem_max=62500000 (and the other UDP buffer settings monad-bft needs).
+  # Postinst may or may not invoke `sysctl --system` — we run it explicitly
+  # so the values are guaranteed live before any later step that depends on
+  # them (notably step_start_services / monad-bft).
+  if [[ -f /etc/sysctl.d/90-monad-network-buffer.conf ]]; then
+    run "applying monad pkg sysctl drop-in" sysctl --system >/dev/null \
+      || warn "sysctl --system returned non-zero (values may still be in effect)"
+    local rmem_now
+    rmem_now=$(sysctl -n net.core.rmem_max 2>/dev/null || echo 0)
+    if (( rmem_now < 62500000 )); then
+      warn "rmem_max is $rmem_now after sysctl --system — monad-bft needs ≥62500000"
+      warn "Reboot the host or investigate /etc/sysctl.d/ priority before --start-services"
+    else
+      ok "net.core.rmem_max = $rmem_now (≥62500000 — monad-bft will be happy)"
+    fi
   fi
 }
 
