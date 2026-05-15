@@ -138,10 +138,24 @@ esac
 # ===== Pre-checks =====
 [[ $EUID -eq 0 ]] || fatal "Run as root: sudo $0 $*"
 
+# Read interactively from the controlling terminal, not STDIN. This is what
+# makes prompts work when the script is run as `curl ... | sudo bash` — in
+# that case STDIN is the script body itself, so `read` would consume future
+# script lines instead of waiting for the operator.
+# Falls back to STDIN if /dev/tty isn't available (e.g. true headless CI).
+prompt_read() {
+  local var="$1" promptmsg="$2"
+  if [[ -r /dev/tty ]]; then
+    read -rp "$promptmsg" "$var" </dev/tty
+  else
+    read -rp "$promptmsg" "$var"
+  fi
+}
+
 confirm() {
   [[ $NON_INTERACTIVE -eq 1 ]] && { info "(non-interactive: assuming Yes for: $1)"; return 0; }
-  local ans
-  read -rp "${C_YELLOW}?${C_RESET} $1 [Y/n] " ans
+  local ans=""
+  prompt_read ans "${C_YELLOW}?${C_RESET} $1 [Y/n] "
   [[ ! "$ans" =~ ^[Nn]$ ]]
 }
 
@@ -199,7 +213,7 @@ choose_network() {
   echo "  2) mainnet"
   local ans
   while true; do
-    read -rp "${C_YELLOW}?${C_RESET} Choose [1/2]: " ans
+    prompt_read ans "${C_YELLOW}?${C_RESET} Choose [1/2]: "
     case "$ans" in
       1|testnet) NETWORK="testnet"; break ;;
       2|mainnet) NETWORK="mainnet"; break ;;
@@ -296,6 +310,13 @@ step_preflight() {
     1) warn "Preflight: warnings (continuing)" ;;
     2)
       err "Preflight: FAIL — server not ready for validator"
+      # Hard-abort in --non-interactive mode: CI/automation must not silently
+      # auto-continue past a hardware/OS issue the operator hasn't seen.
+      # Operators who *want* to bypass FAIL non-interactively can pass
+      # --skip-preflight explicitly.
+      if (( NON_INTERACTIVE )); then
+        fatal "Preflight FAIL in --non-interactive mode — re-run without it OR pass --skip-preflight to override."
+      fi
       if confirm "Continue anyway? (NOT recommended)"; then
         warn "Continuing despite preflight failures"
       else
@@ -328,9 +349,6 @@ step_dependencies() {
     echo "  ${C_DIM}[dry-run] apt install -y ${missing[*]}${C_RESET}"
     return
   fi
-  # iptables-persistent prompts non-interactively — preseed answers.
-  echo iptables-persistent iptables-persistent/autosave_v4 boolean true | debconf-set-selections
-  echo iptables-persistent iptables-persistent/autosave_v6 boolean true | debconf-set-selections
   # apt update failure here is almost always a broken /etc/apt/sources.list.d
   # entry (e.g. a half-configured Category Labs source from a previous run).
   # Bail out — silent success masked the real problem before.
@@ -359,7 +377,10 @@ step_monad_user() {
     if (( DRY_RUN )); then
       echo "  ${C_DIM}[dry-run] useradd -m -s /bin/bash monad${C_RESET}"
     else
-      run "creating user monad" useradd -m -s /bin/bash monad
+      if ! run "creating user monad" useradd -m -s /bin/bash monad; then
+        err "Could not create 'monad' user — aborting step."
+        return 1
+      fi
     fi
   fi
   local dirs=(
@@ -374,10 +395,16 @@ step_monad_user() {
     elif (( DRY_RUN )); then
       echo "  ${C_DIM}[dry-run] mkdir -p $d${C_RESET}"
     else
-      mkdir -p "$d"
+      if ! mkdir -p "$d"; then
+        err "Could not create directory $d"
+        return 1
+      fi
     fi
   done
   if (( DRY_RUN == 0 )) && id monad >/dev/null 2>&1; then
+    # chown is intentionally tolerant: on a re-run after a partial failure,
+    # some files may already be owned by monad; we don't want to fail the
+    # whole step over that.
     chown -R monad:monad /home/monad/monad-bft 2>/dev/null || true
   fi
   ok "Directory tree under /home/monad/monad-bft/ ready"
@@ -460,6 +487,15 @@ step_iptables_ddos() {
         }
         { print }
       ' "$ufw_before" >"${ufw_before}.tmp" && mv "${ufw_before}.tmp" "$ufw_before"
+
+      # Verify the insertion actually landed. If before.rules has an unusual
+      # structure (no *filter, no COMMIT in *filter section), awk silently
+      # leaves the file unchanged — and the rule would not persist.
+      if ! grep -qF "$rule_marker" "$ufw_before"; then
+        err "Failed to insert rule into $ufw_before — unusual file structure?"
+        err "Restore from backup: sudo cp ${ufw_before}.bak.${TS} ${ufw_before}"
+        return 1
+      fi
       if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
         run "reloading ufw to load before.rules" ufw reload
       fi
@@ -592,7 +628,10 @@ step_cruft_timer() {
     echo "  ${C_DIM}[dry-run] systemctl enable --now monad-cruft.timer${C_RESET}"
     return
   fi
-  run "enabling monad-cruft.timer" systemctl enable --now monad-cruft.timer
+  if ! run "enabling monad-cruft.timer" systemctl enable --now monad-cruft.timer; then
+    err "Could not enable monad-cruft.timer"
+    return 1
+  fi
   ok "monad-cruft.timer active"
 }
 
@@ -892,11 +931,20 @@ EOF
   else
     run "installing monad (latest)" apt-get install -y monad
   fi
-  if dpkg -l monad 2>/dev/null | grep -qE '^.i  monad'; then
-    ok "monad package installed"
-  else
+  if ! dpkg -l monad 2>/dev/null | grep -qE '^.i  monad'; then
     err "monad install failed — check $LOG_FILE"
     return 1
+  fi
+  ok "monad package installed"
+
+  # Hold the package so unattended-upgrades / accidental `apt upgrade` don't
+  # bump the version mid-epoch. Operators can `apt-mark unhold monad` to
+  # upgrade deliberately during a planned maintenance window.
+  if ! dpkg -l monad 2>/dev/null | grep -qE '^hi  monad'; then
+    run "holding monad package version" apt-mark hold monad || true
+    ok "monad pinned at $(dpkg-query -W -f='${Version}' monad) (apt-mark hold)"
+  else
+    ok "monad already on hold"
   fi
 }
 
