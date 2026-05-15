@@ -66,6 +66,8 @@ WITH_VDP_OTEL=0
 TRIEDB_DEV=""
 TRIEDB_PARTITION_DEV=""     # if set, step_triedb_partition uses this disk non-interactively
 WITH_TRIEDB_FORMAT=0        # if 1, systemctl start monad-mpt (one-shot triedb format)
+WITH_SNAPSHOT_RESTORE=0     # if 1, run docs' restore-from-snapshot.sh BEFORE start
+ALLOW_NVME_REFORMAT=0       # if 1, --non-interactive may invoke nvme format --lbaf=0
 BENEFICIARY=""              # 0x... address — auto-injected into node.toml if set
 NODE_NAME=""                # unique moniker — auto-injected into node.toml if set
 WITH_KEYS=0                 # if 1, run monad-keystore create with KEYSTORE_PASSWORD source
@@ -171,6 +173,8 @@ while [[ $# -gt 0 ]]; do
     --generate-keys)   WITH_KEYS=1 ;;
     --keys-password=*) KEYSTORE_PASSWORD_INPUT="${1#*=}" ;;
     --sign-name-record) WITH_SIGN_NAME_RECORD=1 ;;
+    --snapshot-restore) WITH_SNAPSHOT_RESTORE=1 ;;
+    --allow-nvme-reformat) ALLOW_NVME_REFORMAT=1 ;;
     --start-services)  WITH_START_SERVICES=1 ;;
     --network=*)       NETWORK="${1#*=}" ;;
     --node-type=*)     NODE_TYPE="${1#*=}" ;;
@@ -334,7 +338,16 @@ run() {
 backup_file() {
   local f="$1"
   [[ -f "$f" ]] || return 0
+  # Find an unused backup name. ${f}.bak.${TS} would collide when multiple
+  # steps in the same run back up the same file (witnessed: step_node_toml_
+  # customize and step_sign_name_record both write node.toml → second
+  # backup_file overwrites the first, losing the original-state copy).
   local bak="${f}.bak.${TS}"
+  if [[ -e "$bak" ]]; then
+    local n=1
+    while [[ -e "${f}.bak.${TS}.${n}" ]]; do ((n++)); done
+    bak="${f}.bak.${TS}.${n}"
+  fi
   if (( DRY_RUN )); then
     echo "  ${C_DIM}[dry-run] backup: $f → $bak${C_RESET}"
     return 0
@@ -539,6 +552,43 @@ step_triedb_partition() {
     return 0
   fi
 
+  # Detect "half state": a previous run created a GPT partition with label
+  # "triedb" but udev didn't get the rule / symlink. Re-running would
+  # uselessly destroy the partition and start over; better to just re-emit
+  # the udev rule with the existing partition's PARTUUID and trigger udev.
+  local existing_triedb_part=""
+  while IFS= read -r blk; do
+    local lbl
+    lbl=$(lsblk -no PARTLABEL "/dev/$blk" 2>/dev/null | head -1 | tr -d ' ')
+    if [[ "$lbl" == "triedb" ]]; then
+      existing_triedb_part="$blk"
+      break
+    fi
+  done < <(lsblk -ln -o NAME,TYPE 2>/dev/null | awk '$2=="part" {print $1}')
+  if [[ -n "$existing_triedb_part" ]]; then
+    local partuuid
+    partuuid=$(lsblk -no PARTUUID "/dev/$existing_triedb_part" 2>/dev/null | tr -d ' ')
+    if [[ -n "$partuuid" ]]; then
+      info "Found existing 'triedb' partition /dev/$existing_triedb_part (PARTUUID=$partuuid) — recovering udev rule"
+      local rule=/etc/udev/rules.d/99-triedb.rules
+      backup_file "$rule"
+      cat >"$rule" <<EOF
+# monad-validator-setup ${TS} (recovered from existing partition)
+ENV{ID_PART_ENTRY_UUID}=="${partuuid}", MODE="0666", SYMLINK+="triedb"
+EOF
+      udevadm control --reload-rules 2>/dev/null || true
+      udevadm trigger 2>/dev/null || true
+      udevadm settle --timeout=10 2>/dev/null || sleep 2
+      if [[ -L /dev/triedb ]]; then
+        ok "/dev/triedb → $(readlink -f /dev/triedb) (recovered)"
+        return 0
+      else
+        warn "udev rule rewritten but /dev/triedb still not appearing — may need reboot"
+        return 0
+      fi
+    fi
+  fi
+
   # Find candidates
   local -a candidates=()
   while IFS= read -r d; do
@@ -606,7 +656,12 @@ step_triedb_partition() {
     if [[ -n "$lba" && "$lba" != "512" ]]; then
       warn "$dev currently has ${lba}-byte LBA — docs require 512 for triedb."
       warn "Reformatting at the NVMe level (lbaf=0) destroys the disk entirely."
-      if confirm "Run 'nvme format $dev --lbaf=0 --force' now?"; then
+      # In --non-interactive mode, confirm() returns Yes by default. For
+      # nvme format that's too dangerous — require an explicit opt-in flag.
+      if (( NON_INTERACTIVE )) && (( ALLOW_NVME_REFORMAT == 0 )); then
+        warn "Skipping nvme format in --non-interactive (use --allow-nvme-reformat to opt in)"
+        warn "Continuing with ${lba}-byte LBA — triedb performance will suffer (per docs)"
+      elif confirm "Run 'nvme format $dev --lbaf=0 --force' now?"; then
         if (( DRY_RUN )); then
           echo "  ${C_DIM}[dry-run] nvme format $dev --lbaf=0 --force${C_RESET}"
         else
@@ -698,12 +753,16 @@ step_triedb_format() {
     info "/dev/triedb not present — partition first or skip"
     return 0
   fi
-  # If monad-mpt has already completed successfully, ActiveState is "inactive"
-  # (one-shot) and ExecMainStatus is 0. Skip in that case to avoid log noise.
-  local main_status
+  # Idempotency: skip only when monad-mpt has ACTUALLY been started and
+  # exited cleanly. ExecMainStatus=0 alone matches a never-started unit too
+  # (default value before first run), which made us skip on a fresh install
+  # and leave triedb unformatted. Cross-check with ExecMainStartTimestamp:
+  # empty timestamp = never started.
+  local last_run main_status
+  last_run=$(systemctl show monad-mpt -p ExecMainStartTimestamp --value 2>/dev/null)
   main_status=$(systemctl show monad-mpt -p ExecMainStatus --value 2>/dev/null)
-  if [[ "$main_status" == "0" ]]; then
-    ok "monad-mpt already ran successfully — triedb formatted"
+  if [[ -n "$last_run" && "$main_status" == "0" ]]; then
+    ok "monad-mpt already ran successfully ($last_run) — triedb formatted"
     return 0
   fi
 
@@ -755,16 +814,21 @@ step_node_toml_customize() {
 
   # --- Beneficiary ---
   # A valid beneficiary is ^0x[0-9a-fA-F]{40}$ (Ethereum address). Anything
-  # else — empty, the zero address, `<INSERT_ADDRESS>` placeholder, partial
-  # hex, stray angle brackets — must be treated as "not set", otherwise
-  # monad-bft panics at startup with `InvalidDigit('<')` (seen on real
-  # deployments where the operator answered the prompt but the regex above
-  # accepted a placeholder).
+  # else — empty, `<INSERT_ADDRESS>` placeholder, partial hex, stray angle
+  # brackets — must be treated as "not set", otherwise monad-bft panics at
+  # startup with `InvalidDigit('<')`.
+  # EXCEPTION for full-node: docs explicitly tell full-node operators to use
+  # the zero address (0x0000…0000) as beneficiary. For validators that's
+  # still rejected (operator must set a real reward address).
   local ben_target="$BENEFICIARY"
   local ben_is_valid=0
-  if [[ "$cur_ben" =~ ^0x[0-9a-fA-F]{40}$ \
-        && "$cur_ben" != "0x0000000000000000000000000000000000000000" ]]; then
-    ben_is_valid=1
+  if [[ "$cur_ben" =~ ^0x[0-9a-fA-F]{40}$ ]]; then
+    if [[ "$cur_ben" == "0x0000000000000000000000000000000000000000" \
+          && "$NODE_TYPE" != "full" ]]; then
+      :  # zero address rejected for validator role
+    else
+      ben_is_valid=1
+    fi
   fi
   if [[ -z "$ben_target" ]]; then
     if (( ben_is_valid == 0 )); then
@@ -839,8 +903,62 @@ step_node_toml_customize() {
       echo "  ${C_DIM}[dry-run] set node_name = \"$name_target\" in $node_toml${C_RESET}"
     else
       _backup_once
-      sed -i "s|^[[:space:]]*node_name[[:space:]]*=.*|node_name = \"$name_target\"|" "$node_toml"
+      # Use # as sed delimiter — node_name may contain | or / chars
+      sed -i "s#^[[:space:]]*node_name[[:space:]]*=.*#node_name = \"${name_target//\#/\\#}\"#" "$node_toml"
       ok "Set node_name = $name_target"
+    fi
+  fi
+
+  # --- Full-node-specific fields (per docs/full-node-installation) ---
+  # The full-node template should already have these set, but we ensure them
+  # idempotently in case the template drifted or the operator started with a
+  # validator template and switched to --full-node.
+  if [[ "$NODE_TYPE" == "full" ]] && (( DRY_RUN == 0 )); then
+    # enable_client = true under [fullnode_raptorcast]
+    if ! awk '/^\[fullnode_raptorcast\]/{f=1} /^\[/&&!/fullnode_raptorcast/{f=0}
+              f && /^[[:space:]]*enable_client[[:space:]]*=[[:space:]]*true/{found=1; exit}
+              END{exit !found}' "$node_toml"; then
+      _backup_once
+      python3 - "$node_toml" <<'PYEOF'
+import sys, re
+path = sys.argv[1]
+with open(path) as f:
+    text = f.read()
+pattern = re.compile(
+    r'(\[fullnode_raptorcast\][^\[]*?)(^\s*enable_client\s*=.*$)',
+    flags=re.MULTILINE
+)
+new, n = pattern.subn(lambda m: m.group(1) + 'enable_client = true', text, count=1)
+if n == 0:
+    sect = re.compile(r'(\[fullnode_raptorcast\][^\[]*)')
+    m = sect.search(text)
+    new = text[:m.end()] + '\nenable_client = true\n' + text[m.end():] if m else text + '\n[fullnode_raptorcast]\nenable_client = true\n'
+open(path, 'w').write(new)
+PYEOF
+      ok "Set enable_client = true (full-node)"
+    fi
+    # expand_to_group = true under [statesync]
+    if ! awk '/^\[statesync\]/{f=1} /^\[/&&!/statesync/{f=0}
+              f && /^[[:space:]]*expand_to_group[[:space:]]*=[[:space:]]*true/{found=1; exit}
+              END{exit !found}' "$node_toml"; then
+      _backup_once
+      python3 - "$node_toml" <<'PYEOF'
+import sys, re
+path = sys.argv[1]
+with open(path) as f:
+    text = f.read()
+pattern = re.compile(
+    r'(\[statesync\][^\[]*?)(^\s*expand_to_group\s*=.*$)',
+    flags=re.MULTILINE
+)
+new, n = pattern.subn(lambda m: m.group(1) + 'expand_to_group = true', text, count=1)
+if n == 0:
+    sect = re.compile(r'(\[statesync\][^\[]*)')
+    m = sect.search(text)
+    new = text[:m.end()] + '\nexpand_to_group = true\n' + text[m.end():] if m else text + '\n[statesync]\nexpand_to_group = true\n'
+open(path, 'w').write(new)
+PYEOF
+      ok "Set expand_to_group = true (full-node)"
     fi
   fi
 }
@@ -858,9 +976,25 @@ step_generate_keys() {
     info "monad-keystore not installed (ships with monad package) — skipping"
     return 0
   fi
-  if [[ -f /home/monad/monad-bft/config/id-secp || -f /home/monad/monad-bft/config/id-bls ]]; then
+  # Require BOTH keys to exist AND be non-empty. The old OR-check skipped
+  # the step when only one key existed (e.g. SECP succeeded, BLS failed) —
+  # leaving the operator with a broken half-install that nothing detected.
+  if [[ -s /home/monad/monad-bft/config/id-secp \
+        && -s /home/monad/monad-bft/config/id-bls ]]; then
     ok "Keys already exist in /home/monad/monad-bft/config/ — skipping"
     return 0
+  fi
+  # If only one of them is present (partial state from a previous run),
+  # bail with a clear message — re-creating would overwrite the surviving
+  # one and the operator would lose half the keypair if they didn't notice.
+  if [[ -e /home/monad/monad-bft/config/id-secp \
+        || -e /home/monad/monad-bft/config/id-bls ]]; then
+    err "Partial keystore state — only one of id-secp/id-bls is present."
+    err "  id-secp: $([[ -s /home/monad/monad-bft/config/id-secp ]] && echo OK || echo missing/empty)"
+    err "  id-bls:  $([[ -s /home/monad/monad-bft/config/id-bls  ]] && echo OK || echo missing/empty)"
+    err "Refusing to silently regenerate — either restore from backup OR"
+    err "remove both files first: sudo rm -f /home/monad/monad-bft/config/id-{secp,bls}"
+    return 1
   fi
 
   local proceed=0
@@ -970,7 +1104,11 @@ step_generate_keys() {
   fi
 
   # Backup directory per docs (root-owned, operator-readable only).
+  # mkdir -p alone leaves the dir world-listable (0755) — the password file
+  # inside is 0600 but the directory itself shouldn't even be enumerable
+  # by non-root. Set 0700 explicitly.
   mkdir -p /opt/monad/backup
+  chmod 0700 /opt/monad/backup
   echo "Keystore password: $password" >/opt/monad/backup/keystore-password-backup
   chmod 0600 /opt/monad/backup/keystore-password-backup
   ok "Wrote KEYSTORE_PASSWORD to $envfile (mode 0600) + backup in /opt/monad/backup/"
@@ -1181,13 +1319,69 @@ PYEOF
   ok "self_name_record_sig injected into node.toml [peer_discovery]"
 }
 
+# ===== Step: snapshot restore (optional, per docs hard-reset) =====
+# Per docs.monad.xyz/node-ops/node-recovery/hard-reset:
+#   curl -sSL $MF_BUCKET/scripts/<network>/restore-from-snapshot.sh | bash
+# This downloads a recent DB snapshot and seeds the triedb so monad-bft
+# doesn't have to sync from genesis (which takes days). Default off — it
+# downloads tens of GB and the operator should know before triggering it.
+step_snapshot_restore() {
+  if (( WITH_SNAPSHOT_RESTORE == 0 )); then
+    info "Skipping snapshot restore (use --snapshot-restore to import a snapshot)"
+    info "Without it, monad-bft syncs from genesis — days on mainnet, hours on testnet"
+    return 0
+  fi
+  section "Snapshot restore (per docs hard-reset)"
+
+  if [[ -z "$NETWORK" ]]; then
+    err "Network not chosen — cannot pick snapshot URL"
+    return 1
+  fi
+
+  # Skip if services are already running — restoring under a live node is
+  # destructive (overwrites triedb) and would corrupt state.
+  if systemctl is-active --quiet monad-bft 2>/dev/null; then
+    warn "monad-bft is active — refusing to restore snapshot under a running node"
+    warn "Stop first: sudo systemctl stop monad-bft monad-execution monad-rpc"
+    return 1
+  fi
+  if [[ ! -L /dev/triedb ]]; then
+    err "/dev/triedb not present — partition + format the triedb device first"
+    return 1
+  fi
+
+  local snap_url="${MF_BUCKET}/scripts/${NETWORK}/restore-from-snapshot.sh"
+
+  if (( DRY_RUN )); then
+    echo "  ${C_DIM}[dry-run] curl -sSL $snap_url | bash${C_RESET}"
+    return 0
+  fi
+
+  warn "About to download + apply a DB snapshot for ${NETWORK} (tens of GB)."
+  warn "This OVERWRITES /dev/triedb contents."
+  if ! confirm "Run snapshot restore now?"; then
+    info "Skipped — re-run with --snapshot-restore (or stop services + curl manually)"
+    return 0
+  fi
+
+  info "Fetching + running $snap_url …"
+  if ! curl -sSL --max-time 30 "$snap_url" | bash; then
+    err "Snapshot restore script failed — check log on its own (it writes to /var/log/monad-snapshot* or similar)"
+    return 1
+  fi
+  ok "Snapshot restore completed"
+}
+
 # ===== Step: start services (final, opt-in) =====
 # Enable + start the three core services in the order docs prescribe.
 # Default: skip — operator should review node.toml + keys before going live.
 step_start_services() {
   section "Start monad services (FINAL — opt-in)"
 
-  local services=(monad-execution monad-bft monad-rpc)
+  # Docs canonical order: monad-bft monad-execution monad-rpc.
+  # systemd dependencies usually sort this regardless, but match docs to
+  # avoid surprises when monad team changes their unit's After= clauses.
+  local services=(monad-bft monad-execution monad-rpc)
   local missing=()
   for s in "${services[@]}"; do
     systemctl cat "$s" >/dev/null 2>&1 || missing+=("$s")
@@ -1222,9 +1416,12 @@ step_start_services() {
 
     # Beneficiary must be a real Ethereum address. ANYTHING with < or > or
     # non-hex chars makes monad-bft panic with InvalidDigit('<') at startup.
-    if [[ ! "$ben" =~ ^0x[0-9a-fA-F]{40}$ ]] \
-       || [[ "$ben" == "0x0000000000000000000000000000000000000000" ]]; then
+    # For full-node mode, docs explicitly say to use the zero address — allow.
+    if [[ ! "$ben" =~ ^0x[0-9a-fA-F]{40}$ ]]; then
       blockers+=("node.toml beneficiary invalid/placeholder: '$ben' (run --beneficiary=0x... or edit node.toml)")
+    elif [[ "$ben" == "0x0000000000000000000000000000000000000000" \
+            && "$NODE_TYPE" != "full" ]]; then
+      blockers+=("node.toml beneficiary is the zero address — only valid for --full-node mode (use a real reward address for a validator)")
     fi
     # node_name placeholder check (angle brackets are the tell)
     if [[ -z "$name" || "$name" =~ [\<\>] || "$name" == "PLACEHOLDER" ]]; then
@@ -1534,6 +1731,25 @@ step_config_files() {
       return 1
     fi
   fi
+
+  # Ensure REMOTE_VALIDATORS_URL / REMOTE_FORKPOINT_URL are set in .env.
+  # The MF .env.example template currently includes them, but defensive
+  # coding: docs explicitly say "Add these to /home/monad/.env", so if a
+  # future template drops them or the operator pre-placed a stripped .env,
+  # we add them ourselves. monad-bft uses them to fetch validators.toml
+  # and forkpoint.toml at startup.
+  if (( DRY_RUN == 0 )) && [[ -f "$env_file" ]]; then
+    local v_url="${MF_BUCKET}/validators/${NETWORK}/validators.toml"
+    local f_url="${MF_BUCKET}/forkpoint/${NETWORK}/forkpoint.toml"
+    if ! grep -qE '^[[:space:]]*REMOTE_VALIDATORS_URL[[:space:]]*=' "$env_file"; then
+      echo "REMOTE_VALIDATORS_URL='$v_url'" >>"$env_file"
+      ok "Added REMOTE_VALIDATORS_URL to $env_file"
+    fi
+    if ! grep -qE '^[[:space:]]*REMOTE_FORKPOINT_URL[[:space:]]*=' "$env_file"; then
+      echo "REMOTE_FORKPOINT_URL='$f_url'" >>"$env_file"
+      ok "Added REMOTE_FORKPOINT_URL to $env_file"
+    fi
+  fi
 }
 
 # ===== Step: enable monad-cruft.timer =====
@@ -1839,7 +2055,11 @@ EOF
   else
     local gh_latest=""
     if command -v curl >/dev/null 2>&1; then
-      gh_latest=$(curl -fsS -m 5 -H 'Accept: application/vnd.github+json' \
+      # GitHub API rejects unauthenticated requests without User-Agent with
+      # 403 Forbidden — set a recognisable UA so they don't 403 us.
+      gh_latest=$(curl -fsS -m 5 \
+        -H 'Accept: application/vnd.github+json' \
+        -H 'User-Agent: BeeHive/monad-tools' \
         https://api.github.com/repos/category-labs/monad-bft/releases/latest 2>/dev/null \
         | grep -oE '"tag_name":[^,]+' | head -1 \
         | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+([-~][a-z0-9.]+)?' | sed 's/^v//')
@@ -1969,6 +2189,14 @@ step_otelcol_install() {
   fi
   rm -f "$deb"
 
+  # Pin otelcol so `apt upgrade` doesn't silently bump it past the
+  # sha256-pinned version we just installed (any future upgrade should be
+  # deliberate + manually-verified).
+  if ! dpkg -l otelcol 2>/dev/null | grep -qE '^hi  otelcol'; then
+    run "holding otelcol version" apt-mark hold otelcol || true
+    ok "otelcol pinned at $OTEL_VERSION (apt-mark hold)"
+  fi
+
   # Docs: cp /opt/monad/scripts/otel-config.yaml /etc/otelcol/config.yaml
   # The bundled config comes from the monad apt package. If monad isn't
   # installed yet (operator hasn't reached step_monad_install), or used a
@@ -2080,8 +2308,14 @@ step_firewall() {
 
   if ! ufw status | grep -q "Status: active"; then
     if confirm "Enable UFW now? (SSH allowed on: ${UFW_SSH_PORT})"; then
+      # Explicit default policies. ufw's first-install defaults are normally
+      # deny-incoming / allow-outgoing, but a previous operator may have
+      # flipped them with `ufw default allow incoming` — we don't want to
+      # `ufw enable` on top of an allow-incoming default.
+      ufw default deny incoming  >>"$LOG_FILE" 2>&1 || true
+      ufw default allow outgoing >>"$LOG_FILE" 2>&1 || true
       ufw --force enable >>"$LOG_FILE" 2>&1
-      ok "UFW enabled (SSH allowed on ${UFW_SSH_PORT})"
+      ok "UFW enabled (default deny incoming, SSH allowed on ${UFW_SSH_PORT})"
     else
       warn "UFW configured but not enabled — run 'sudo ufw enable' when ready"
     fi
@@ -2416,6 +2650,7 @@ EOF
   step_iptables_ddos         || failed+=("iptables-ddos")
   step_monitoring            || failed+=("monitoring")
   step_vdp_otel_push         || failed+=("vdp-otel-push")
+  step_snapshot_restore      || failed+=("snapshot-restore")
   step_start_services        || failed+=("start-services")
   step_report
 
