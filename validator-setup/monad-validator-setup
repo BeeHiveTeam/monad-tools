@@ -151,8 +151,11 @@ confirm() {
 # Sources (merged + deduped):
 #   1. $SSH_CONNECTION (when run inside an SSH session): the LAST field is the
 #      server port we're connected on right now. Guaranteed-not-locked-out port.
-#   2. sshd_config `Port` directive(s) — may have multiple.
-#   3. Live `ss -tlnp` output for the sshd process — handles non-standard configs.
+#   2. sshd_config `Port` directive(s) via `sshd -T` (handles Include + multi-Port).
+# NOTE: we deliberately do NOT inspect `ss -tlnp` for sshd-owned sockets.
+# That source picks up X11 forwarding sockets (6010, 6011, ...) which are
+# owned by per-session sshd processes but are NOT the master daemon port —
+# whitelisting them in UFW would add useless rules that disappear with the session.
 # Returns a space-separated list. Falls back to "22" only if all sources empty.
 detect_ssh_ports() {
   local ports=""
@@ -162,7 +165,8 @@ detect_ssh_ports() {
     cur_port=$(awk '{print $NF}' <<<"$SSH_CONNECTION")
     [[ "$cur_port" =~ ^[0-9]+$ ]] && ports+="$cur_port "
   fi
-  # Source 2: sshd_config (handle multiple Port lines + Include directives)
+  # Source 2: sshd_config — `sshd -T` evaluates Include + Match defaults and is
+  # the authoritative source for the daemon's listening port(s).
   if [[ -r /etc/ssh/sshd_config ]]; then
     local sshd_ports
     sshd_ports=$(sshd -T 2>/dev/null | awk '/^port / {print $2}')
@@ -170,13 +174,6 @@ detect_ssh_ports() {
       /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null \
       | awk '{print $2}')
     ports+="$sshd_ports "
-  fi
-  # Source 3: live listening ports of sshd (catches setups where the daemon
-  # was reconfigured but config file lags reality).
-  if command -v ss >/dev/null 2>&1; then
-    local live
-    live=$(ss -tlnp 2>/dev/null | awk '/users:\(\("sshd"/ {split($4,a,":"); print a[length(a)]}')
-    ports+="$live "
   fi
   # Dedupe and validate
   local unique
@@ -329,8 +326,20 @@ step_dependencies() {
   # iptables-persistent prompts non-interactively — preseed answers.
   echo iptables-persistent iptables-persistent/autosave_v4 boolean true | debconf-set-selections
   echo iptables-persistent iptables-persistent/autosave_v6 boolean true | debconf-set-selections
-  run "apt update" apt-get update -qq
-  run "installing missing deps: ${missing[*]}" apt-get install -y "${missing[@]}"
+  # apt update failure here is almost always a broken /etc/apt/sources.list.d
+  # entry (e.g. a half-configured Category Labs source from a previous run).
+  # Bail out — silent success masked the real problem before.
+  if ! run "apt update" apt-get update -qq; then
+    err "apt-get update failed — likely a broken entry in /etc/apt/sources.list.d/"
+    err "Inspect: sudo apt-get update    (without -qq to see the offending source)"
+    err "Common fix: sudo rm /etc/apt/sources.list.d/category-labs.sources \\"
+    err "           /etc/apt/keyrings/category-labs.gpg   # then re-run this script"
+    return 1
+  fi
+  if ! run "installing missing deps: ${missing[*]}" apt-get install -y "${missing[@]}"; then
+    err "Dependency install failed — check $LOG_FILE"
+    return 1
+  fi
   ok "Dependencies installed."
 }
 
@@ -757,17 +766,39 @@ step_monad_install() {
     return 0
   fi
 
-  # Install apt repo if missing — uses deb822 .sources format per official docs
+  # Install apt repo + key. Use a strict order: key first, sources file ONLY
+  # after the key is on disk, apt-get update last. If any step fails, do not
+  # leave a half-configured state (broken sources file pointing at a repo with
+  # no valid key) for the next run to trip on.
   local sources_file=/etc/apt/sources.list.d/category-labs.sources
-  if [[ ! -f "$sources_file" ]]; then
-    if (( DRY_RUN )); then
+  # Re-fetch key whenever the keyring is missing OR empty, even if sources_file
+  # exists — this recovers from a previous run where the curl failed but the
+  # sources file got written anyway (happened with the old GPG URL going 403).
+  local need_key=0 need_sources=0
+  if [[ ! -s "$MONAD_APT_KEYRING" ]]; then need_key=1; fi
+  if [[ ! -f "$sources_file" ]]; then need_sources=1; fi
+
+  if (( DRY_RUN )); then
+    if (( need_key + need_sources > 0 )); then
       echo "  ${C_DIM}[dry-run] add Category Labs apt repo (${MONAD_APT_REPO})${C_RESET}"
-    else
-      info "Adding Monad apt repository: $MONAD_APT_REPO (suite=$MONAD_APT_SUITE)"
+    fi
+  else
+    if (( need_key )); then
+      info "Adding Monad apt signing key: $MONAD_APT_KEY_URL"
       mkdir -p "$(dirname "$MONAD_APT_KEYRING")"
-      # ASCII-armored key (.asc) — dearmor to keyring binary format that apt expects.
-      run "fetching + dearmoring signing key" bash -c \
-        "curl -fsSL '${MONAD_APT_KEY_URL}' | gpg --dearmor --yes -o '$MONAD_APT_KEYRING'"
+      # ASCII-armored key (.asc) — dearmor to keyring binary format apt expects.
+      # If this fails, clean up so the next run retries from scratch.
+      if ! run "fetching + dearmoring signing key" bash -c \
+          "curl -fsSL '${MONAD_APT_KEY_URL}' | gpg --dearmor --yes -o '$MONAD_APT_KEYRING'"; then
+        rm -f "$MONAD_APT_KEYRING"   # don't leave an empty/partial keyring
+        err "Could not fetch the apt signing key — aborting monad install."
+        err "Check network, then verify the URL: ${MONAD_APT_KEY_URL}"
+        return 1
+      fi
+      ok "Signing key installed at $MONAD_APT_KEYRING"
+    fi
+    if (( need_sources )); then
+      info "Adding Monad apt repository: $MONAD_APT_REPO (suite=$MONAD_APT_SUITE)"
       cat > "$sources_file" <<EOF
 Types: deb
 URIs: ${MONAD_APT_REPO}
@@ -776,7 +807,18 @@ Components: main
 Signed-By: ${MONAD_APT_KEYRING}
 EOF
       ok "Wrote $sources_file"
-      run "apt update" apt-get update
+    fi
+    if (( need_key + need_sources > 0 )); then
+      # Refresh package lists. If this fails, the repo is misconfigured — bail
+      # out rather than letting the next `apt-get install` produce confusing
+      # "Unable to locate package monad" output.
+      if ! run "apt update" apt-get update; then
+        err "apt-get update failed against Monad repo. Common causes:"
+        err "  - signing key URL changed (check ${MONAD_APT_KEY_URL})"
+        err "  - network filtered (CloudFront block, captive portal)"
+        err "  - GPG keyring corrupt — rm $MONAD_APT_KEYRING and re-run"
+        return 1
+      fi
     fi
   fi
 
