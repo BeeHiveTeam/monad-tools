@@ -184,6 +184,7 @@ while [[ $# -gt 0 ]]; do
     --node-type=*)     NODE_TYPE="${1#*=}" ;;
     --full-node)       NODE_TYPE="full" ;;
     --uninstall)       ACTION="uninstall" ;;
+    --uninstall-deep)  ACTION="uninstall-deep" ;;
     -h|--help)
       cat <<'HELP'
 monad-validator-setup — one-shot Monad validator host configuration.
@@ -252,7 +253,11 @@ FLAGS (all optional)
   --skip-preflight                  Skip monad-doctor pre-check.
   --non-interactive                 No prompts; missing flags use safe defaults.
   --dry-run                         Show what would change; no system modifications.
-  --uninstall                       Remove config files (best-effort).
+  --uninstall                       Remove our config files only (apt pkg + user stay).
+  --uninstall-deep                  Full wipe: apt purge monad + userdel monad + configs.
+                                    Internally orders apt purge BEFORE userdel because
+                                    monad's postrm runs `crontab -u monad -r` which
+                                    fails if the user is already gone.
   -h, --help                        This message.
 
 ENVIRONMENT OVERRIDES
@@ -2790,7 +2795,15 @@ EOF
 do_uninstall() {
   warn "This will REMOVE configuration files written by this installer."
   warn "It will NOT remove the monad package, chrony, ufw, or your keys."
-  confirm "Continue?" || { info "Aborted."; exit 0; }
+  warn ""
+  warn "${C_BOLD}If you ALSO want to remove the monad package + monad user${C_RESET},"
+  warn "use --uninstall-deep instead. The order matters there: the monad"
+  warn "postrm script (as of pkg.category.xyz monad 0.14.x) runs"
+  warn "  crontab -u monad -r"
+  warn "which FAILS if the monad user was already deleted — do apt purge"
+  warn "BEFORE userdel, never the other way around. --uninstall-deep handles"
+  warn "that ordering for you."
+  confirm "Continue with config-only removal?" || { info "Aborted."; exit 0; }
 
   # /etc/sysctl.d/99-monad-validator.conf is from older script versions —
   # we no longer create it, but remove if present so a re-install doesn't
@@ -2805,6 +2818,71 @@ do_uninstall() {
   sysctl --system >/dev/null 2>&1 || true
   udevadm control --reload-rules 2>/dev/null || true
   ok "Configuration removed. Reboot recommended to fully reset kernel parameters."
+}
+
+# Full uninstall — removes the monad package + system user + all our configs.
+# Order is critical: monad's postrm calls `crontab -u monad -r`, which fails
+# if the monad user is already gone. So we MUST apt purge BEFORE userdel.
+# DO NOT change the order below without testing both paths.
+do_uninstall_deep() {
+  warn "${C_BOLD}DEEP UNINSTALL${C_RESET} — this removes:"
+  warn "  - all config files this installer wrote"
+  warn "  - the monad apt package (apt-mark unhold + apt purge)"
+  warn "  - the monad system user + /home/monad"
+  warn "  - validator keys + KEYSTORE_PASSWORD backups"
+  warn ""
+  warn "Does NOT touch: chrony, ufw, otelcol, kernel parameters from monad pkg's"
+  warn "                90-monad-network-buffer.conf (it's removed by apt purge)."
+  if ! confirm_destructive "Wipe the monad install?"; then
+    info "Aborted."
+    exit 0
+  fi
+
+  # Stop services first — if monad-bft is running, files are locked / busy
+  for s in monad-rpc monad-bft monad-execution monad-cruft.timer monad-mpt otelcol; do
+    if systemctl is-active --quiet "$s" 2>/dev/null; then
+      run "stopping $s" systemctl stop "$s" || true
+    fi
+    if systemctl is-enabled --quiet "$s" 2>/dev/null; then
+      run "disabling $s" systemctl disable "$s" || true
+    fi
+  done
+
+  # Apt purge BEFORE userdel — see comment above the function.
+  if dpkg -l monad 2>/dev/null | grep -qE '^.i  monad'; then
+    run "apt-mark unhold monad" apt-mark unhold monad || true
+    run "apt purge monad" apt-get purge -y monad || warn "apt purge monad failed; the monad user / cron entry may need cleanup"
+  fi
+  if dpkg -l otelcol 2>/dev/null | grep -qE '^.i  otelcol'; then
+    run "apt-mark unhold otelcol" apt-mark unhold otelcol || true
+    run "apt purge otelcol" apt-get purge -y otelcol || true
+  fi
+
+  # NOW it's safe to remove the user — postrm ran while user still existed.
+  if id monad >/dev/null 2>&1; then
+    run "removing monad user + home" userdel -r monad || warn "userdel -r monad failed; remove /home/monad manually if needed"
+  fi
+
+  # Our config drop-ins
+  for f in /etc/sysctl.d/99-monad-validator.conf \
+           /etc/security/limits.d/99-monad-validator.conf \
+           /etc/udev/rules.d/60-monad-triedb-scheduler.rules \
+           /etc/udev/rules.d/99-triedb.rules \
+           /etc/apt/sources.list.d/category-labs.sources \
+           /etc/apt/keyrings/category-labs.gpg; do
+    [[ -e "$f" ]] && rm -f "$f" && ok "Removed $f"
+  done
+
+  # Backup directory (with keystore password!) — don't auto-delete; print path.
+  if [[ -d /opt/monad/backup ]]; then
+    warn "/opt/monad/backup/ contains your KEYSTORE_PASSWORD + key backups."
+    warn "NOT removing automatically. Delete manually after off-host backup:"
+    warn "  sudo rm -rf /opt/monad/backup/"
+  fi
+
+  sysctl --system >/dev/null 2>&1 || true
+  udevadm control --reload-rules 2>/dev/null || true
+  ok "Deep uninstall complete. Reboot recommended."
 }
 
 # ===== Main =====
@@ -2901,6 +2979,7 @@ EOF
 }
 
 case "$ACTION" in
-  install)   do_install ;;
-  uninstall) do_uninstall ;;
+  install)        do_install ;;
+  uninstall)      do_uninstall ;;
+  uninstall-deep) do_uninstall_deep ;;
 esac
