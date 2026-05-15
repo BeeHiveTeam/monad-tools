@@ -9,14 +9,14 @@
 #              triedb udev SYMLINK, chrony, monad apt+pkg, otelcol install+enable,
 #              UFW, iptables UDP filter, post-install report.
 #   Optional (prompts or --flags):
-#              triedb partitioning (--triedb-partition=DEV)
-#              triedb format (--triedb-format)
-#              node.toml customize (--beneficiary=, --node-name=)
-#              key generation (--generate-keys, --keys-password=auto|prompt)
-#              name-record signing (--sign-name-record)
+#              triedb partitioning (--triedb-partition=DEV; prompts otherwise — DESTRUCTIVE)
+#              triedb format (AUTO when /dev/triedb exists & monad-mpt unrun)
+#              node.toml customize (--beneficiary=, --node-name=; prompts for beneficiary)
+#              key generation (--generate-keys, --keys-password=auto|prompt; prompts otherwise)
+#              name-record signing (AUTO when keys exist & sig is placeholder)
 #              monad-grafana monitoring (--with-monitoring)
 #              VDP OTel push (--with-vdp-otel)
-#              start services (--start-services)
+#              start services (--start-services; prompts otherwise — FINAL go-live)
 #
 # What it deliberately does NOT do:
 #   - Generate or import validator keys (you must do this manually)
@@ -696,18 +696,11 @@ step_triedb_format() {
     return 0
   fi
 
-  local proceed=0
-  if (( WITH_TRIEDB_FORMAT )); then
-    proceed=1
-  elif (( NON_INTERACTIVE == 0 )); then
-    if confirm "Run one-shot triedb format (systemctl start monad-mpt)?"; then
-      proceed=1
-    fi
-  fi
-  if (( proceed == 0 )); then
-    info "Skipped — run manually later: sudo systemctl start monad-mpt"
-    return 0
-  fi
+  # Auto-run: monad-mpt is a one-shot systemd service. If /dev/triedb exists
+  # and monad-mpt hasn't run successfully yet, we want it to run — there's no
+  # reason to make the operator wait for a prompt here. Idempotent on re-run
+  # (we already skipped above if ExecMainStatus=0).
+  info "Running triedb format (auto — /dev/triedb present, monad-mpt not yet completed)"
 
   if (( DRY_RUN )); then
     echo "  ${C_DIM}[dry-run] systemctl start monad-mpt${C_RESET}"
@@ -784,6 +777,13 @@ step_node_toml_customize() {
       sed -i "s|^[[:space:]]*beneficiary[[:space:]]*=.*|beneficiary = \"$ben_target\"|" "$node_toml"
       ok "Set beneficiary = $ben_target"
     fi
+  elif (( ben_is_valid == 0 )); then
+    # Operator declined to provide a beneficiary AND current value is a
+    # placeholder. Fail the step loudly — silent continuation would lead to
+    # monad-bft panic on startup with InvalidDigit('<') (real bug witnessed).
+    err "node.toml beneficiary is invalid/placeholder and no value provided."
+    err "Re-run with --beneficiary=0x... or fix $node_toml manually."
+    return 1
   fi
 
   # --- node_name ---
@@ -1025,18 +1025,11 @@ step_sign_name_record() {
     return 0
   fi
 
-  local proceed=0
-  if (( WITH_SIGN_NAME_RECORD )); then
-    proceed=1
-  elif (( NON_INTERACTIVE == 0 )); then
-    if confirm "Run monad-sign-name-record now (auto-pick public IP)?"; then
-      proceed=1
-    fi
-  fi
-  if (( proceed == 0 )); then
-    info "Skipped — generate manually per docs"
-    return 0
-  fi
+  # Auto-run when prereqs are met. Signing is not destructive (it just
+  # generates a signature for self_name_record_sig). The only risk is
+  # bumping self_record_seq_num — but our skip-if-already-set check
+  # above prevents that on re-run.
+  info "Generating name-record signature (auto — prerequisites are met)"
 
   # Need public IP
   local pubip=""
