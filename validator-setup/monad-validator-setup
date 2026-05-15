@@ -5,9 +5,14 @@
 #
 # What it does (idempotent, safe to re-run; many steps optional with explicit
 # opt-in via prompt or flag — defaults preserve manual-control workflow):
-#   Mandatory: preflight, deps, monad user/dirs, sysctl/ulimits, IO scheduler,
-#              triedb udev SYMLINK, chrony, monad apt+pkg, otelcol install+enable,
-#              UFW, iptables UDP filter, post-install report.
+#   Mandatory: preflight, deps, monad user/dirs, ulimits, IO scheduler,
+#              triedb udev SYMLINK, chrony, monad apt+pkg (which drops its
+#              own /etc/sysctl.d/90-monad-network-buffer.conf for rmem_max
+#              etc), otelcol install+enable, UFW, iptables UDP filter,
+#              post-install report.
+#   Note: we no longer write a /etc/sysctl.d/99-monad-validator.conf —
+#         the monad pkg owns network-buffer tuning. Legacy file from
+#         older installs is cleaned up at start.
 #   Optional (prompts or --flags):
 #              triedb partitioning (--triedb-partition=DEV; prompts otherwise — DESTRUCTIVE)
 #              triedb format (AUTO when /dev/triedb exists & monad-mpt unrun)
@@ -80,19 +85,15 @@ MF_BUCKET="${MF_BUCKET:-https://bucket.monadinfra.com}"
 
 # Tuning values
 #
-# DELIBERATELY NOT SET HERE: net.core.rmem_max / wmem_max / rmem_default /
-# wmem_default. The monad apt package drops `/etc/sysctl.d/90-monad-network-
-# buffer.conf` with the exact values its dataplane expects (currently
-# 62500000 = 62.5 MB). We used to override these via our 99- drop-in with
-# 16 MB, which silently DOWNGRADED what the package wanted (99 > 90 priority)
-# and made monad-bft panic at startup. Leave network-buffer sizing to the
-# monad pkg — it knows its own SO_RCVBUF requirement and will keep itself in
-# sync if Monad bumps the value in a future release.
+# We deliberately DO NOT write /etc/sysctl.d/99-monad-validator.conf anymore.
+# The monad apt package drops /etc/sysctl.d/90-monad-network-buffer.conf with
+# the network-buffer tuning its dataplane needs; everything else (swappiness,
+# netdev_max_backlog, fs.file-max, tcp_fastopen) uses Linux defaults.
+# Operators who want stricter limits write their own drop-in.
 #
-# What we DO add on top — settings the monad pkg doesn't touch:
-SYSCTL_NETDEV_BACKLOG=5000
-SYSCTL_FILE_MAX=2097152
-SYSCTL_SWAPPINESS=1
+# monad-doctor will WARN (not FAIL) on the defaults — that's informational,
+# the operator decides. See history (commits before bf6730d) for the old
+# behavior that wrote rmem_max=16MB and silently downgraded the monad pkg.
 ULIMIT_NOFILE=1048576
 
 # OpenTelemetry collector .deb from upstream (per Monad docs — they pin
@@ -1558,48 +1559,10 @@ step_cruft_timer() {
 }
 
 # ===== Step: sysctl =====
-step_sysctl() {
-  section "Kernel tuning (sysctl)"
-
-  local conf=/etc/sysctl.d/99-monad-validator.conf
-  local content
-  content="# monad-validator-setup ${TS}
-#
-# Network buffer sizes (rmem_max / wmem_max / rmem_default / wmem_default)
-# are DELIBERATELY NOT SET HERE — see /etc/sysctl.d/90-monad-network-buffer.conf
-# from the monad apt package. Setting them in our 99- file would override
-# the package's choice (99 > 90 priority) and silently downgrade what
-# monad-bft requires at startup.
-#
-# What this file adds — settings the monad pkg doesn't manage:
-net.core.netdev_max_backlog = $SYSCTL_NETDEV_BACKLOG
-# File descriptors
-fs.file-max = $SYSCTL_FILE_MAX
-# Swap behaviour — validators must not swap
-vm.swappiness = $SYSCTL_SWAPPINESS
-# TCP fast open — short connection wins on bursty consensus traffic
-net.ipv4.tcp_fastopen = 3
-"
-
-  if [[ -f "$conf" ]] && [[ "$(cat "$conf" 2>/dev/null)" == "$content" ]]; then
-    ok "sysctl already configured ($conf)"
-    return 0
-  fi
-
-  backup_file "$conf"
-  if (( DRY_RUN )); then
-    echo "  ${C_DIM}[dry-run] write $conf with monad tuning${C_RESET}"
-    return 0
-  fi
-  echo "$content" >"$conf"
-  ok "Wrote $conf"
-  # `sysctl --system` may warn about unrelated drop-ins on the box but still
-  # apply our settings. Don't fail the whole step on its rc, just surface it.
-  if ! run "applying sysctl" sysctl --system; then
-    warn "sysctl --system returned non-zero — values from $conf may still be in effect."
-    warn "Check: sysctl net.core.rmem_max vm.swappiness fs.file-max"
-  fi
-}
+# Intentionally REMOVED — see header comment block. The monad apt package
+# owns /etc/sysctl.d/90-monad-network-buffer.conf; everything else uses
+# Linux defaults. If a legacy /etc/sysctl.d/99-monad-validator.conf exists
+# from a pre-bf6730d install, we clean it up in do_install.
 
 # ===== Step: ulimits =====
 step_ulimits() {
@@ -2388,6 +2351,9 @@ do_uninstall() {
   warn "It will NOT remove the monad package, chrony, ufw, or your keys."
   confirm "Continue?" || { info "Aborted."; exit 0; }
 
+  # /etc/sysctl.d/99-monad-validator.conf is from older script versions —
+  # we no longer create it, but remove if present so a re-install doesn't
+  # inherit stale tuning.
   for f in /etc/sysctl.d/99-monad-validator.conf \
            /etc/security/limits.d/99-monad-validator.conf \
            /etc/udev/rules.d/60-monad-triedb-scheduler.rules; do
@@ -2417,12 +2383,22 @@ EOF
   # Ask early so the rest of the run can show consistent banner.
   choose_network
 
+  # One-shot legacy cleanup: prior versions of this script wrote
+  # /etc/sysctl.d/99-monad-validator.conf with rmem_max=16MB, silently
+  # downgrading what the monad apt pkg sets (62.5MB) and crashing
+  # monad-bft at startup. We no longer manage sysctl drop-ins; remove
+  # the legacy file if it survived from an older install.
+  if [[ -f /etc/sysctl.d/99-monad-validator.conf ]] && (( DRY_RUN == 0 )); then
+    info "Removing legacy /etc/sysctl.d/99-monad-validator.conf (script no longer manages sysctl)"
+    rm -f /etc/sysctl.d/99-monad-validator.conf
+    sysctl --system >/dev/null 2>&1 || true
+  fi
+
   local failed=()
   step_preflight             || failed+=("preflight")
   step_dependencies          || failed+=("dependencies")
   step_monad_user            || failed+=("monad-user")
   step_triedb_partition      || failed+=("triedb-partition")
-  step_sysctl                || failed+=("sysctl")
   step_ulimits               || failed+=("ulimits")
   step_io_scheduler          || failed+=("io-scheduler")
   step_triedb_symlink        || failed+=("triedb-symlink")
