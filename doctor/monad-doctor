@@ -675,6 +675,11 @@ check_sysctl() {
   local need=62500000  # 62.5 MB — exact monad-bft requirement
   if (( rmem_max >= need && wmem_max >= need )); then
     emit os "sysctl.netbuf"     PASS "rmem_max=$rmem_max wmem_max=$wmem_max"
+  elif ! _monad_pkg_installed; then
+    # Pre-install: the monad apt package writes /etc/sysctl.d/90-monad-network-buffer.conf
+    # in its postinst, which raises rmem_max/wmem_max to 62500000. Until that
+    # happens the operator can't (and shouldn't need to) fix this manually.
+    emit os "sysctl.netbuf"     INFO "rmem/wmem_max below ${need} — monad pkg will raise this on install (postinst writes /etc/sysctl.d/90-monad-network-buffer.conf)"
   else
     emit os "sysctl.netbuf"     FAIL "rmem/wmem_max below ${need} — monad-bft will panic at startup" \
          $'Symptom:     "unable to set udp receive buffer size to 62500000" in journalctl -u monad-bft\nExpected:    the monad apt package ships /etc/sysctl.d/90-monad-network-buffer.conf\n             with net.core.rmem_max = 62500000 (applied on package install via\n             postinst). If this file is missing/overridden, monad-bft will panic.\nCheck:       cat /etc/sysctl.d/90-monad-network-buffer.conf   # should exist after monad install\n             ls /etc/sysctl.d/ | grep -E "monad|99-"   # look for higher-priority overrides\nFix:         sudo dpkg-reconfigure monad   # re-apply pkg drop-in\n             OR remove any 99-*.conf that lowers rmem_max below 62500000\n             sudo sysctl --system\nVerify:      sysctl net.core.rmem_max net.core.wmem_max   # both ≥ 62500000\nWhy:         monad-bft (since ~0.14.x) calls setsockopt(SO_RCVBUF, 62500000) on\n             the dataplane UDP socket; kernel clamps to rmem_max and the node\n             panics if the resulting buffer is below the requested size.'
@@ -893,6 +898,11 @@ check_iptables_udp_filter() {
   if iptables -C INPUT -p udp --dport 8000 -m length --length 0:1400 -j DROP 2>/dev/null \
      || iptables -C ufw-before-input -p udp --dport 8000 -m length --length 0:1400 -j DROP 2>/dev/null; then
     emit security "iptables.udp-filter" PASS "UDP length filter on :8000 active (per docs)"
+  elif ! _monad_pkg_installed; then
+    # Pre-install: monad-validator-setup → step_iptables_ddos applies this rule.
+    # Until then, nothing is listening on :8000, so the filter would be no-op anyway.
+    emit security "iptables.udp-filter" INFO "no UDP length filter on :8000 yet — monad-validator-setup will add it (step_iptables_ddos)"
+    return
   else
     emit security "iptables.udp-filter" WARN "no UDP length 0:1400 DROP rule on :8000 — robustness against UDP DDoS missing" \
          $'Quick fix:   sudo iptables -I INPUT -p udp --dport 8000 -m length --length 0:1400 -j DROP\n             # then persist: sudo netfilter-persistent save\n             # OR (if UFW replaced iptables-persistent): add to /etc/ufw/before.rules\nAuto:        monad-validator-setup → step_iptables_ddos applies + persists this rule.\n             Auto-detects whether netfilter-persistent or UFW before.rules is the\n             right persistence path (ufw + iptables-persistent Conflict on Ubuntu 24.04).\nVerify:      sudo iptables -L INPUT -nv -L ufw-before-input -nv 2>/dev/null | grep "dpt:8000"\nWhy:         valid raptorcast UDP datagrams exceed 1400 bytes; small UDP packets on\n             :8000 are spoofed amplification / probing traffic. Docs recommend this rule.'
