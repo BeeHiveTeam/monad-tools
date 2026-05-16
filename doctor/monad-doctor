@@ -36,7 +36,8 @@ DISK_GB_OS_MIN=${DISK_GB_OS_MIN:-500}   # docs: "500GB Disk" for MonadBFT/OS
 DISK_GB_TRIEDB_MIN=${DISK_GB_TRIEDB_MIN:-1700}  # docs: "2TB dedicated disk" (real 2TB-class drives advertise ~1.92TB ≈ 1788 GiB)
 NVME_IOPS_MIN=${NVME_IOPS_MIN:-200000}  # not in docs — heuristic from operators
 NVME_IOPS_REC=${NVME_IOPS_REC:-500000}
-ULIMIT_MIN=${ULIMIT_MIN:-1000000}
+ULIMIT_MIN=${ULIMIT_MIN:-1000000}                  # per-process LimitNOFILE (validator needs ~10k fd; 1M is generous headroom matching what the monad apt pkg sets in units)
+SYSTEM_FILE_MAX_MIN=${SYSTEM_FILE_MAX_MIN:-65536}  # system-wide fs.file-max cap; sum of all-processes fd; 65k is the canonical Linux floor (was kernel default for years)
 # Per docs.monad.xyz/node-ops/full-node-installation:
 #   "Linux Kernel >= 6.8.0.60"
 #   "There is a known bug affecting Linux kernel versions v6.8.0.56-generic
@@ -651,14 +652,28 @@ check_ulimits() {
     fi
   fi
 
-  # System-wide file-max
-  local sysmax
+  # System-wide file-max — the cap on TOTAL open fd across all processes on
+  # the host, separate from per-process LimitNOFILE. Validator workload uses
+  # ~3k fd total in practice (monad-bft + execution + rpc combined; measured
+  # 2688 used on a 9-day-uptime BeeHive prod node). docs.monad.xyz specifies
+  # neither this nor LimitNOFILE; the monad apt pkg sets LimitNOFILE=1048576
+  # per-service in its unit files but says nothing about system-wide cap.
+  # Threshold: canonical Linux floor (65536), not per-process (1M).
+  local sysmax filenr used pct
   sysmax=$(cat /proc/sys/fs/file-max 2>/dev/null || echo 0)
-  if (( sysmax >= ULIMIT_MIN )); then
-    emit os "ulimit.system"     PASS "fs.file-max = $sysmax"
+  filenr=$(awk '{print $1}' /proc/sys/fs/file-nr 2>/dev/null || echo 0)
+  used=${filenr:-0}
+  pct=$(( sysmax > 0 ? (used * 100 / sysmax) : 100 ))
+  if (( sysmax >= SYSTEM_FILE_MAX_MIN )); then
+    emit os "ulimit.system"     PASS "fs.file-max = $sysmax (current usage ${used}, ${pct}%)"
+  elif (( used * 4 < sysmax )); then
+    # file-max below 65k floor BUT current usage uses <25% — node is fine
+    # right now, headroom adequate. INFO not WARN to avoid false-alarming
+    # operators on a perfectly functional install.
+    emit os "ulimit.system"     INFO "fs.file-max = $sysmax (below ${SYSTEM_FILE_MAX_MIN} floor but only ${pct}% used, ${used} of ${sysmax}); per-process LimitNOFILE from monad systemd units is the authoritative limit for monad-* processes"
   else
-    emit os "ulimit.system"     WARN "fs.file-max = $sysmax — low" \
-         $'Quick fix:   echo "fs.file-max = 2097152" | sudo tee /etc/sysctl.d/99-monad-tuning.conf\n             sudo sysctl --system\nVerify:      sysctl fs.file-max   # ≥ 2097152\nWhy:         system-wide cap above per-process; required for high LimitNOFILE to take effect.\nNote:        BeeHive recommendation — not in docs.monad.xyz.'
+    emit os "ulimit.system"     WARN "fs.file-max = $sysmax — low AND usage at ${pct}% (${used} of ${sysmax})" \
+         $'Quick fix:   echo "fs.file-max = 2097152" | sudo tee /etc/sysctl.d/99-monad-tuning.conf\n             sudo sysctl --system\nVerify:      sysctl fs.file-max   # ≥ 2097152\nWhy:         system-wide cap above per-process; the kernel rejects open() with ENFILE\n             once total fd allocated approaches fs.file-max regardless of LimitNOFILE.\nNote:        BeeHive recommendation — not in docs.monad.xyz. The monad apt pkg\n             sets LimitNOFILE=1048576 per service unit, but those are bounded by\n             this system-wide cap.'
   fi
 }
 
