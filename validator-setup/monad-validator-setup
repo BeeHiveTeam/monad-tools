@@ -456,6 +456,18 @@ resolve_pkg_version() {
     info "Testnet default: ${C_BOLD}--with-vdp-otel${C_RESET} enabled (VDP delegation track)"
     info "  Opt out with: --no-vdp-otel"
   fi
+
+  # Mainnet operators who want VDP must opt in explicitly. If they didn't,
+  # warn loudly — VDP enrollment requires MF metrics access, and discovering
+  # this post-install means re-running setup later. Not a hard fail because
+  # some mainnet validators legitimately don't participate in VDP.
+  if (( WITH_VDP_OTEL_EXPLICIT == 0 )) && [[ "$NETWORK" == "mainnet" ]]; then
+    warn "Mainnet install without --with-vdp-otel."
+    warn "  If you intend to participate in VDP, MF requires metrics push to"
+    warn "  otel-external.monadinfra.com:443 with your secp_key label. Re-run"
+    warn "  this script with --with-vdp-otel after the node syncs to enable it."
+    warn "  Pass --no-vdp-otel to silence this warning if you don't want VDP."
+  fi
 }
 
 run() {
@@ -2879,7 +2891,7 @@ ${C_BOLD}═══════════════════════�
   The script set up the node software. To actually become a validator
   in the active set you still need to do these on your laptop / wallet:
 
-  ${C_BOLD}1) Wait for sync${C_RESET} (1–4 h on testnet):
+  ${C_BOLD}1) Wait for sync${C_RESET} ($(if [[ "$NETWORK" == "mainnet" ]]; then echo "after mainnet snapshot, minutes to hours depending on backlog"; else echo "1–4 h on testnet after fresh start"; fi)):
        sudo $DOCTOR_PATH   # confirms sync.gap = 0 and block.age low
 
   ${C_BOLD}2) Call addValidator() on-chain${C_RESET} (needs your wallet + MON tokens):
@@ -2888,7 +2900,7 @@ ${C_BOLD}═══════════════════════�
        ACTIVE_VALIDATOR_STAKE  = 10_000_000 MON (total stake to enter set)
        ACTIVE_VALSET_SIZE      = 200 validators (rank by stake weight)
      Tool: https://github.com/monad-developers/staking-sdk-cli
-     Or:   testnet staking dApp (when published)
+$(if [[ "$NETWORK" == "testnet" ]]; then echo "     Or:   testnet staking dApp (when published)"; else echo "     RPC:  set --rpc-url to https://rpc.monad.xyz or a private mainnet endpoint"; fi)
      SECP pubkey for the call: cat /home/monad/pubkey-secp-bls
      BLS  pubkey for the call: cat /home/monad/pubkey-secp-bls
 
@@ -2897,9 +2909,9 @@ ${C_BOLD}═══════════════════════�
        Fields: moniker, website, description, contact, location
      Required for Foundation visibility, delegation, VDP listing.
 
-  ${C_BOLD}4) (Optional) Enroll in VDP — Validator Delegation Program${C_RESET}:
+  ${C_BOLD}4) $(if [[ "$NETWORK" == "mainnet" ]]; then echo "VDP — Validator Delegation Program (mainnet validator must allow MF metrics)"; else echo "(Optional) Enroll in VDP — Validator Delegation Program"; fi)${C_RESET}:
      Eligibility (per docs/validator-delegation-program):
-       - testnet uptime ≥ 4 weeks before applying
+       - testnet uptime ≥ 4 weeks before applying (counted across both nets)
        - 98% uptime minimum (3 weekly violations in 3 months → removal)
        - KYC/KYB completed
        - commission cap ≤ 10% (currently 15% transitional)
@@ -2907,6 +2919,7 @@ ${C_BOLD}═══════════════════════�
        - no external RPC, no LST/LRT building
      Then: apply via form at docs.monad.xyz/node-ops/validator-delegation-program
      Tiers grant 25M–90M MON delegation.
+$(if [[ "$NETWORK" == "mainnet" && "$WITH_VDP_OTEL" == "0" ]]; then echo "     ${C_YELLOW}⚠ --with-vdp-otel was NOT passed for this mainnet install. If you intend to"; echo "       participate in VDP, re-run with --with-vdp-otel after node syncs.${C_RESET}"; fi)
 
   ${C_BOLD}5) Apply config changes without restart${C_RESET} (when editing node.toml later):
        sudo -u monad monad-debug-node \\
@@ -3109,7 +3122,7 @@ ${C_BOLD}This script will install a Monad node end-to-end (25 steps, ~5–10 min
   ${C_BLUE}⑫${C_RESET} Sign Auth UDP name-record + inject into node.toml
   ${C_BLUE}⑬${C_RESET} Install + enable otelcol (metrics collector)
   ${C_BLUE}⑭${C_RESET} Configure UFW firewall + iptables UDP-DDoS filter
-  ${C_BLUE}⑮${C_RESET} ${C_BOLD}Snapshot restore (per docs hard-reset, default ON)${C_RESET} — testnet < 5 min
+  ${C_BLUE}⑮${C_RESET} ${C_BOLD}Snapshot restore (per docs hard-reset, default ON)${C_RESET} — testnet < 5 min, mainnet 1-5 min
   ${C_BLUE}⑯${C_RESET} ${C_BOLD}Ask you: start services now? (FINAL — goes live on the network)${C_RESET}
 
 ${C_BOLD}You'll be prompted ONLY at destructive / operator-specific steps.${C_RESET}
