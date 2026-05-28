@@ -50,6 +50,12 @@ GAP_ALERT="${GAP_ALERT:-2000}"     # blocks behind network head that is clearly 
 # Corroborating-only (NEVER triggers a restart):
 SESS_TARGET="${SESS_TARGET:-3}"    # NUM_UPSTREAM_VALIDATORS target, for alert context
 
+# Stuck-statesync detector: a node too far behind can sit at statesync_syncing=1
+# forever while no peer serves the snapshot — block height never advances and a
+# restart will NOT help (needs a Hard Reset / snapshot restore). We don't restart
+# in this state; we ALERT after the synced height has been frozen this long.
+STATESYNC_STALL_MIN="${STATESYNC_STALL_MIN:-30}"   # minutes of frozen height while syncing → alert
+
 RESTART_COOLDOWN="${RESTART_COOLDOWN:-1800}"            # min seconds between restarts
 ALLOW_VALIDATOR_RESTART="${ALLOW_VALIDATOR_RESTART:-0}" # safety gate, see header
 NODE_TOML="${NODE_TOML:-/home/monad/monad-bft/config/node.toml}"
@@ -103,16 +109,36 @@ PREV=$(cat "$STATE_FILE" 2>/dev/null || echo 0)
 
 # guard (point 2): local RPC unreachable / statesync in progress → never restart on a blind 0.
 # During statesync the RPC is intentionally down until sync completes, so we
-# must not alert-spam every run. If statesync_syncing=1 we log quietly and do
-# nothing; only a genuine RPC-down-without-statesync escalates to an alert.
-# (Limitation: a STUCK statesync also reads syncing=1 — it shows as repeated
-#  log lines rather than an alert, so eyeball the log if recovery drags on.)
+# must not alert-spam every run. If statesync_syncing=1 we check that the synced
+# height is actually advancing: advancing → quiet log; frozen past
+# STATESYNC_STALL_MIN → ALERT (peer statesync that can't complete needs a Hard
+# Reset, which we never auto-perform). A genuine RPC-down-without-statesync also
+# escalates to an alert.
 if [ "$LOCAL" -eq 0 ]; then
   SYNCING=$(otel_gauge 'monad_statesync_syncing'); SYNCING="${SYNCING%%.*}"
   if [ "${SYNCING:-0}" = "1" ]; then
-    log "local RPC down but statesync_syncing=1 → node is legitimately recovering. No action."
+    # Legitimately recovering — BUT verify statesync is actually advancing.
+    # If the synced height stays frozen while syncing=1, peer statesync is
+    # stuck (no peer serving state at our target) and only a Hard Reset fixes
+    # it. Track height+timestamp across runs; alert once frozen too long.
+    SS_H=$(otel_gauge 'monad_execution_ledger_block_num'); SS_H="${SS_H%%.*}"
+    SS_FILE="$STATE_DIR/statesync_progress"
+    NOW=$(date +%s)
+    read -r PREV_H PREV_T < "$SS_FILE" 2>/dev/null || { PREV_H=""; PREV_T=""; }
+    if [ -z "$PREV_H" ] || [ "${SS_H:-0}" != "$PREV_H" ]; then
+      echo "${SS_H:-0} $NOW" > "$SS_FILE"   # advancing (or first sample) → reset stall timer
+      log "statesync_syncing=1, height=${SS_H:-?} advancing → recovering. No action."
+      exit 0
+    fi
+    FROZEN_S=$(( NOW - ${PREV_T:-$NOW} ))
+    if [ "$FROZEN_S" -ge "$(( STATESYNC_STALL_MIN * 60 ))" ]; then
+      alert "statesync STALLED — syncing=1 but height frozen at ${SS_H:-?} for ${FROZEN_S}s (>= ${STATESYNC_STALL_MIN}m). Peer statesync not completing — needs Hard Reset / snapshot restore. NOT auto-performing destructive recovery."
+      exit 2
+    fi
+    log "statesync_syncing=1, height ${SS_H:-?} frozen ${FROZEN_S}s (alert at ${STATESYNC_STALL_MIN}m). No action yet."
     exit 0
   fi
+  rm -f "$STATE_DIR/statesync_progress" 2>/dev/null   # not syncing → clear stall tracker
   alert "local RPC unreachable or returning 0 (services down?). Not auto-restarting on a blind 0 — check manually."
   exit 2
 fi

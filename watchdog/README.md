@@ -33,9 +33,13 @@ watchdog so the recovery is automatic next time.
   fewer than `MIN_ADVANCE` blocks since last run) or a large `GAP` behind the
   network head. The local RPC is read on the host and guarded — if it is
   unreachable we **alert and do nothing** (never restart on a blind `0`).
-- **Statesync-aware:** when the RPC is down *and* `monad_statesync_syncing=1`,
-  the node is legitimately recovering — we log quietly and take no action
-  instead of alert-spamming every run.
+- **Statesync-aware, with a stall detector:** when the RPC is down *and*
+  `monad_statesync_syncing=1` the node is recovering — we don't restart. But a
+  node too far behind can sit at `syncing=1` forever while no peer serves the
+  snapshot (block height never advances and a restart will NOT help — it needs a
+  Hard Reset / snapshot restore). So we track the synced height across runs:
+  advancing → quiet log; frozen past `STATESYNC_STALL_MIN` → **alert** (never an
+  auto-restart). This is a real failure mode we hit, not a hypothetical.
 - **Session count is context only.** It is read locally from otelcol
   (`:8889/metrics`, no Prometheus dependency) using
   `monad_wireauth_udp_state_transport_sessions` (established sessions, **not**
@@ -71,6 +75,7 @@ sudo install -m 0755 watchdog/monad-watchdog /usr/local/bin/monad-watchdog
 | `SERVICES` | `monad-bft monad-execution monad-rpc` | services to restart |
 | `MIN_ADVANCE` | `50` | min blocks/run the local head must gain to count as alive |
 | `GAP_ALERT` | `2000` | blocks behind network head that is clearly unhealthy |
+| `STATESYNC_STALL_MIN` | `30` | minutes of frozen synced-height while `syncing=1` before alerting a stalled statesync |
 | `RESTART_COOLDOWN` | `1800` | min seconds between restarts |
 | `ALLOW_VALIDATOR_RESTART` | `0` | set `1` to allow restarting a node with a non-burn beneficiary |
 | `NODE_TOML` | `/home/monad/monad-bft/config/node.toml` | path used for the validator gate |
