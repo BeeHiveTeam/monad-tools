@@ -83,9 +83,17 @@ rpc_block() {
 # read a single gauge value from the local otelcol exposition. The metric line
 # is `name{labels} value timestamp`, so anchor on name + `{` or space, then the
 # value is field 2 after awk splits on whitespace.
+#
+# Prometheus renders large gauge values in scientific notation
+# (e.g. block height 34688141 → "3.4688141e+07"). Bash arithmetic and the
+# `${var%%.*}` truncation callers use would mangle that ("3.46…" → "3"), so we
+# normalize to a plain integer here via printf "%.0f". All gauges read by this
+# watchdog (session counts, statesync_syncing 0/1, ledger block_num) are
+# integer-valued, so rounding is exact.
 otel_gauge() {
   curl -s -m5 "$OTEL" 2>/dev/null \
-    | grep -E "^$1[ {]" | awk '{print $2}' | head -1
+    | grep -E "^$1[ {]" | head -1 \
+    | awk '{ if ($2 == "") exit; printf "%.0f\n", $2 }'
 }
 # established sessions only — read locally, no Prometheus dependency
 otel_transport_sessions() { otel_gauge 'monad_wireauth_udp_state_transport_sessions'; }

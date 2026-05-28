@@ -70,6 +70,7 @@ WITH_TRIEDB_FORMAT=0        # if 1, systemctl start monad-mpt (one-shot triedb f
 WITH_SNAPSHOT_RESTORE=1     # default ON per docs full-node-installation step 15; use --no-snapshot-restore to skip
 WITH_SNAPSHOT_RESTORE_EXPLICIT=0   # set if --snapshot-restore or --no-snapshot-restore was passed
 ALLOW_NVME_REFORMAT=0       # if 1, --non-interactive may invoke nvme format --lbaf=0
+ALLOW_SNAPSHOT_OVERWRITE=0  # if 1, --non-interactive may overwrite an EXISTING populated triedb
 BENEFICIARY=""              # 0x... address — auto-injected into node.toml if set
 NODE_NAME=""                # unique moniker — auto-injected into node.toml if set
 WITH_KEYS=0                 # if 1, run monad-keystore create with KEYSTORE_PASSWORD source
@@ -78,6 +79,9 @@ WITH_SIGN_NAME_RECORD=0     # if 1, run monad-sign-name-record + inject into nod
 WITH_START_SERVICES=0       # if 1, systemctl enable+start monad-* services (FINAL)
 NODE_RECONFIGURED=0         # set to 1 when a step modifies node.toml or keys
 ROLE_TRANSITION=""          # "full→validator" / "validator→full" / "" when changed
+LEDGER_SUSPECT=0            # 1 only when the chain state may be invalid (node.toml
+                            # template swap). A beneficiary-only promotion does NOT
+                            # set this — triedb state is identical, no re-snapshot.
 NETWORK=""                  # testnet | mainnet — asked interactively if empty
 NODE_TYPE="full"            # full | validator — default per docs validator-installation:
                             # "Start by configuring a node according to the full node installation
@@ -186,6 +190,7 @@ while [[ $# -gt 0 ]]; do
     --snapshot-restore) WITH_SNAPSHOT_RESTORE=1; WITH_SNAPSHOT_RESTORE_EXPLICIT=1 ;;
     --no-snapshot-restore) WITH_SNAPSHOT_RESTORE=0; WITH_SNAPSHOT_RESTORE_EXPLICIT=1 ;;
     --allow-nvme-reformat) ALLOW_NVME_REFORMAT=1 ;;
+    --allow-snapshot-overwrite) ALLOW_SNAPSHOT_OVERWRITE=1 ;;
     --start-services)  WITH_START_SERVICES=1 ;;
     --network=*)       NETWORK="${1#*=}" ;;
     --node-type=*)     NODE_TYPE="${1#*=}"; NODE_TYPE_EXPLICIT=1 ;;
@@ -253,6 +258,8 @@ FLAGS (all optional)
   --triedb-partition=DEV            DESTRUCTIVE: partition this NVMe for triedb.
   --triedb-dev=DEV                  IO-scheduler target (no partitioning).
   --allow-nvme-reformat             Allow nvme format --lbaf=0 under --non-interactive.
+  --allow-snapshot-overwrite        Allow overwriting an EXISTING populated triedb under
+                                    --non-interactive (otherwise refused, to protect synced state).
   --beneficiary=0x...               Rewards address; written into node.toml.
   --node-name=NAME                  Unique moniker; written into node.toml.
   --generate-keys                   monad-keystore create SECP + BLS keys.
@@ -1490,7 +1497,9 @@ PYEOF
 # Docs full-node-installation step 15 explicitly tells operators to run
 # hard-reset to seed the triedb so monad-bft doesn't sync from genesis
 # (testnet: hours; mainnet: weeks). Default ON for fresh installs; auto-
-# skip when the ledger already has data unless ROLE_TRANSITION happened.
+# skip when the ledger already has data unless LEDGER_SUSPECT (a node.toml
+# template swap that may invalidate chain state). A beneficiary-only
+# full→validator promotion keeps its synced triedb — never re-snapshots.
 step_snapshot_restore() {
   if (( WITH_SNAPSHOT_RESTORE == 0 )); then
     info "Skipping snapshot restore (--no-snapshot-restore was passed)"
@@ -1529,8 +1538,8 @@ step_snapshot_restore() {
   fi
   # 100 MB threshold — empty fresh install is < 1 MB; even short genesis
   # sync produces tens of MB; "real" data starts in the hundreds.
-  if (( ledger_bytes > 104857600 )) && [[ -z "$ROLE_TRANSITION" ]]; then
-    info "Ledger already populated ($(( ledger_bytes / 1048576 )) MB) and no role change — skipping snapshot."
+  if (( ledger_bytes > 104857600 )) && (( LEDGER_SUSPECT == 0 )); then
+    info "Ledger already populated ($(( ledger_bytes / 1048576 )) MB) and chain state intact — skipping snapshot."
     info "To force re-import: rm -rf $ledger_dir/* && re-run with --snapshot-restore"
     # If we stopped services for this check, restart them.
     if (( services_were_active )); then
@@ -1539,8 +1548,8 @@ step_snapshot_restore() {
     fi
     return 0
   fi
-  if [[ -n "$ROLE_TRANSITION" ]]; then
-    warn "Role transition detected ($ROLE_TRANSITION) — proceeding with snapshot restore regardless of existing ledger."
+  if (( LEDGER_SUSPECT == 1 )); then
+    warn "Ledger suspect (template swap: $ROLE_TRANSITION) — proceeding with snapshot restore regardless of existing ledger."
   fi
 
   local snap_url="${MF_BUCKET}/scripts/${NETWORK}/restore-from-snapshot.sh"
@@ -1552,7 +1561,26 @@ step_snapshot_restore() {
 
   warn "About to download + apply a DB snapshot for ${NETWORK}."
   warn "This OVERWRITES /dev/triedb contents (testnet < 5 min, mainnet 1-5 min)."
-  if ! confirm "Run snapshot restore now?"; then
+
+  # Two cases:
+  #   * Fresh install (ledger empty): nothing to lose — a normal confirm is
+  #     fine, and --non-interactive auto-proceeds (seeding triedb is the
+  #     expected fresh-install behavior, avoids days of genesis sync).
+  #   * Existing populated ledger being overwritten (LEDGER_SUSPECT after a
+  #     template swap): this DESTROYS synced state — gate behind
+  #     confirm_destructive so an automated re-run can't silently wipe it.
+  #     Opt in via ALLOW_SNAPSHOT_OVERWRITE=1 for non-interactive.
+  local proceed=0
+  if (( ledger_bytes > 104857600 )); then
+    if confirm_destructive "Run snapshot restore now? This OVERWRITES an existing $(( ledger_bytes / 1048576 )) MB ledger." "${ALLOW_SNAPSHOT_OVERWRITE:-0}"; then
+      proceed=1
+    fi
+  else
+    if confirm "Run snapshot restore now? (fresh install — seeds triedb)"; then
+      proceed=1
+    fi
+  fi
+  if (( proceed == 0 )); then
     info "Skipped — re-run with --snapshot-restore (or stop services + curl manually)"
     if (( services_were_active )); then
       run "restarting services" systemctl start monad-bft monad-execution monad-rpc || true
@@ -2006,6 +2034,9 @@ step_config_files() {
         ok "Replaced $node_toml with ${NODE_TYPE} template"
         NODE_RECONFIGURED=1
         ROLE_TRANSITION="${existing_type}→${NODE_TYPE}"
+        # A full template swap can invalidate the on-disk chain state, so the
+        # ledger is suspect and a snapshot re-import is justified here.
+        LEDGER_SUSPECT=1
       else
         warn "Download failed — restoring backup"
         cp -a "${node_toml}.${existing_type}-backup.${TS}" "$node_toml"
@@ -2441,6 +2472,22 @@ EOF
       fi
       target_version="$candidate"
       info "Apt repo candidate: monad=${C_BOLD}${target_version}${C_RESET}"
+    fi
+
+    # Mainnet guard: the auto-detected version (GitHub releases/latest or apt
+    # candidate) is network-agnostic, but mainnet routinely runs a version
+    # BEHIND testnet — docs.monad.xyz pins different versions per network.
+    # Installing the global latest on mainnet can put the node ahead of the
+    # network. Only fires on the auto path (operator didn't pin a version).
+    if [[ "$NETWORK" == "mainnet" ]]; then
+      warn "Auto-detected monad=${target_version} for MAINNET."
+      warn "Mainnet often lags testnet — verify ${target_version} matches the mainnet"
+      warn "version at docs.monad.xyz/node-ops/full-node-installation."
+      warn "To pin explicitly: MONAD_PKG_VERSION_MAINNET=X.Y.Z ./monad-validator-setup ..."
+      if ! confirm "Proceed installing monad=${target_version} on mainnet?"; then
+        err "Aborted. Re-run with MONAD_PKG_VERSION_MAINNET=<correct mainnet version>."
+        return 1
+      fi
     fi
   fi
 
