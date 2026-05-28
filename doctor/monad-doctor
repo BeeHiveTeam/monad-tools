@@ -323,13 +323,21 @@ check_cpu() {
 }
 
 check_ram() {
-  local total_gb avail_gb
+  local total_gb avail_gb total_kb
+  total_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
   total_gb=$(awk '/MemTotal/ {printf "%d", $2/1024/1024}' /proc/meminfo)
   avail_gb=$(awk '/MemAvailable/ {printf "%d", $2/1024/1024}' /proc/meminfo)
 
-  if (( total_gb >= RAM_GB_REC )); then
+  # Compare in KiB with a 5% tolerance, NOT truncated GiB. /proc/meminfo
+  # MemTotal already excludes firmware/kernel-reserved RAM, so a "32 GB" stick
+  # reports ~31.2 GiB → truncating to 31 and testing `31 >= 32` false-FAILed
+  # every 32 GB box. 95% of the threshold absorbs that reserve.
+  local min_kb=$(( RAM_GB_MIN * 1024 * 1024 * 95 / 100 ))
+  local rec_kb=$(( RAM_GB_REC * 1024 * 1024 * 95 / 100 ))
+
+  if (( total_kb >= rec_kb )); then
     emit hardware "ram.total"   PASS "${total_gb} GB total (${avail_gb} GB available)"
-  elif (( total_gb >= RAM_GB_MIN )); then
+  elif (( total_kb >= min_kb )); then
     emit hardware "ram.total"   WARN "${total_gb} GB — meets min ($RAM_GB_MIN), recommend ${RAM_GB_REC}+"
   else
     emit hardware "ram.total"   FAIL "${total_gb} GB — below minimum $RAM_GB_MIN GB" \
@@ -350,7 +358,13 @@ check_ram() {
 check_disks() {
   local topo nvme_count total_size_gb
   topo=$(disk_topology)
-  nvme_count=$(echo "$topo" | grep -c . || echo 0)
+  # grep -c always prints the count (even 0) then exits 1 on no match; the old
+  # `|| echo 0` appended a SECOND "0", producing "0\n0" which crashed the
+  # `(( nvme_count == 0 ))` below (arithmetic syntax error) and fell through to
+  # a false PASS on a machine with no NVMe. `|| true` masks the exit code
+  # without adding a line.
+  nvme_count=$(echo "$topo" | grep -c . || true)
+  nvme_count=${nvme_count:-0}
   total_size_gb=$(lsblk -bdn -o NAME,SIZE 2>/dev/null \
     | awk '/^nvme/ {s+=$2} END {printf "%d", s/1024/1024/1024}')
 
@@ -411,7 +425,10 @@ check_disks() {
     triedb_part=$(readlink -f /dev/triedb)
     triedb_part="${triedb_part##*/}"
     triedb_disk=$(lsblk -no PKNAME "/dev/${triedb_part}" 2>/dev/null | head -1)
-    if [[ -n "$triedb_disk" ]] && grep -q "${triedb_disk}p" /proc/mdstat 2>/dev/null; then
+    # mdstat lists members as `<dev>[role]`, e.g. `nvme1n1p1[0]` (partition) or
+    # `nvme1n1[0]` (whole-disk). Match both: optional `pN` then `[`. The old
+    # `${disk}p` pattern missed whole-disk md membership entirely.
+    if [[ -n "$triedb_disk" ]] && grep -qE "${triedb_disk}(p[0-9]+)?\[" /proc/mdstat 2>/dev/null; then
       emit hardware "disk.triedb-raid" WARN "triedb device $triedb_disk is part of RAID — wasted writes" \
            $'Action:      Provision a dedicated NVMe for triedb (no RAID, no other partitions).\n             Then re-point /dev/triedb udev rule at the new device PARTUUID.\nWhy:         triedb is already write-heavy; RAID1 doubles writes and shortens NVMe TBW;\n             RAID5/6 adds parity write amplification on top.'
     fi
@@ -453,7 +470,10 @@ check_disks() {
 
   # Free space on root (OS partition — docs say 500 GB)
   local free_root_gb
-  free_root_gb=$(df -BG / | awk 'NR==2 {gsub("G","",$4); print $4}')
+  # -P (POSIX) forces single-line output: without it, a long device name (LVM
+  # /dev/mapper/…) wraps onto its own line, so NR==2 captures only the name and
+  # $4 (Avail) is empty → arithmetic error → false FAIL.
+  free_root_gb=$(df -P -BG / | awk 'NR==2 {gsub("G","",$4); print $4}')
   if (( free_root_gb >= DISK_GB_OS_MIN )); then
     emit hardware "disk.os"     PASS "${free_root_gb} GB free on / (need ≥${DISK_GB_OS_MIN} GB)"
   else

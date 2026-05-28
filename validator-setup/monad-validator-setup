@@ -351,8 +351,8 @@ confirm() {
 }
 
 # Like confirm() but for DESTRUCTIVE actions (data loss possible): requires
-# the operator to type 'y' or 'yes' explicitly — Enter / empty input is
-# treated as 'no'. Prevents accidentally wiping a disk by hitting Enter.
+# the operator to type the full word 'yes' explicitly — a bare 'y', Enter, or
+# empty input is treated as 'no'. Prevents accidentally wiping a disk.
 confirm_destructive() {
   if (( NON_INTERACTIVE == 1 )); then
     # Non-interactive auto-Yes only when the operator explicitly enables it
@@ -366,7 +366,9 @@ confirm_destructive() {
   fi
   local ans=""
   prompt_read ans "${C_RED}${C_BOLD}!${C_RESET} $1 (type 'yes' to proceed) "
-  [[ "$ans" == "yes" || "$ans" == "y" ]]
+  # Require the full word "yes" — a bare "y" must NOT trigger a destructive
+  # action. The prompt asks for 'yes' specifically; honor that contract.
+  [[ "$ans" == "yes" ]]
 }
 
 # Detect ports SSH actually listens on. We must NEVER hardcode 22/tcp into the
@@ -1528,19 +1530,29 @@ step_snapshot_restore() {
     run "stopping services" systemctl stop monad-bft monad-execution monad-rpc || true
   fi
 
-  # Skip if ledger already has data AND no role transition. Tens of GB
-  # download is wasteful when triedb is already populated and the node
-  # only needs to catch up from current snapshot via normal sync.
+  # Skip if ledger already has data AND no role transition AND the operator
+  # didn't explicitly force a restore. Tens of GB download is wasteful when
+  # triedb is already populated and the node only needs to catch up via sync.
   local ledger_dir=/home/monad/monad-bft/ledger
   local ledger_bytes=0
   if [[ -d "$ledger_dir" ]]; then
-    ledger_bytes=$(du -sb "$ledger_dir" 2>/dev/null | awk '{print $1+0}')
+    ledger_bytes=$(du -sb "$ledger_dir" 2>/dev/null | awk 'NR==1{print $1}')
+    # du failure (broken mount, perms) yields empty/non-numeric — treat as
+    # POPULATED so we never mistake an unmeasurable ledger for empty and skip
+    # the confirm_destructive guard. Fail safe toward protecting existing data.
+    if ! [[ "$ledger_bytes" =~ ^[0-9]+$ ]]; then
+      warn "Could not measure $ledger_dir size (du failed) — assuming populated to be safe."
+      ledger_bytes=999999999999
+    fi
   fi
   # 100 MB threshold — empty fresh install is < 1 MB; even short genesis
   # sync produces tens of MB; "real" data starts in the hundreds.
-  if (( ledger_bytes > 104857600 )) && (( LEDGER_SUSPECT == 0 )); then
+  # WITH_SNAPSHOT_RESTORE_EXPLICIT: an explicit --snapshot-restore forces a
+  # re-import even past a populated ledger (the confirm_destructive below still
+  # protects against an accidental wipe).
+  if (( ledger_bytes > 104857600 )) && (( LEDGER_SUSPECT == 0 )) && (( WITH_SNAPSHOT_RESTORE_EXPLICIT == 0 )); then
     info "Ledger already populated ($(( ledger_bytes / 1048576 )) MB) and chain state intact — skipping snapshot."
-    info "To force re-import: rm -rf $ledger_dir/* && re-run with --snapshot-restore"
+    info "To force re-import: re-run with --snapshot-restore (triedb is truncated automatically)."
     # If we stopped services for this check, restart them.
     if (( services_were_active )); then
       info "Restarting services that were stopped pre-check…"
@@ -1586,6 +1598,30 @@ step_snapshot_restore() {
       run "restarting services" systemctl start monad-bft monad-execution monad-rpc || true
     fi
     return 0
+  fi
+
+  # Truncate an already-initialized triedb BEFORE the MF restore script runs.
+  # The MF restore-from-snapshot.sh only `monad-mpt --create`s an *uninitialized*
+  # triedb; on an already-initialized one it does nothing and then runs
+  # `monad-cli --load_binary_snapshot` on top — which fails with
+  # "database must be hard reset" on a node that has synced past the snapshot.
+  # `rm -rf ledger/*` does NOT help: the ledger dir is on the filesystem, the
+  # triedb lives on the raw /dev/triedb partition. monad-mpt --truncate is the
+  # documented hard-reset for the DB. We only reach here after the operator has
+  # confirmed the (destructive) restore, so truncating is the intended action.
+  if [[ -e /dev/triedb ]] && command -v monad-mpt >/dev/null 2>&1; then
+    if monad-mpt --storage /dev/triedb 2>&1 | grep -q FATAL; then
+      info "triedb not yet initialized — MF restore will --create it."
+    else
+      info "Truncating existing triedb before snapshot import (prevents 'database must be hard reset')…"
+      if ! run "truncating triedb" monad-mpt --storage /dev/triedb --truncate --yes; then
+        err "monad-mpt --truncate failed — aborting restore to avoid a half-imported DB."
+        if (( services_were_active )); then
+          run "restarting services" systemctl start monad-bft monad-execution monad-rpc || true
+        fi
+        return 1
+      fi
+    fi
   fi
 
   info "Fetching + running $snap_url …"
@@ -2869,7 +2905,7 @@ step_report() {
   "os": "$(. /etc/os-release; echo "$PRETTY_NAME")",
   "monad_version": "$(dpkg-query -W -f='${Version}' monad 2>/dev/null || echo "not-installed")",
   "tuning": {
-    "sysctl_conf": "/etc/sysctl.d/99-monad-validator.conf",
+    "sysctl_conf": "/etc/sysctl.d/90-monad-network-buffer.conf (package-owned; this script no longer writes 99-monad-validator.conf)",
     "limits_conf": "/etc/security/limits.d/99-monad-validator.conf",
     "udev_scheduler": "/etc/udev/rules.d/60-monad-triedb-scheduler.rules"
   },
