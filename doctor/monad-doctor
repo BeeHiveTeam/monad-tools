@@ -630,7 +630,13 @@ check_ulimits() {
     local svc_limit
     svc_limit=$(systemctl show monad-bft -p LimitNOFILE 2>/dev/null | cut -d= -f2)
     svc_limit=${svc_limit:-0}
-    if (( svc_limit >= ULIMIT_MIN )); then
+    # systemd reports an unbounded limit as the literal "infinity" — stronger
+    # than the numeric target, so it's a PASS. Gate the numeric comparison
+    # behind ^[0-9]+$ so a non-numeric value can never reach (( )) and abort
+    # the whole script under `set -u` (mirrors the limits.conf branch below).
+    if [[ "$svc_limit" == "infinity" ]]; then
+      emit os "ulimit.service"  PASS "monad-bft LimitNOFILE=infinity (unlimited)"
+    elif [[ "$svc_limit" =~ ^[0-9]+$ ]] && (( svc_limit >= ULIMIT_MIN )); then
       emit os "ulimit.service"  PASS "monad-bft LimitNOFILE=$svc_limit"
     else
       emit os "ulimit.service"  WARN "monad-bft LimitNOFILE=$svc_limit — recommend ≥$ULIMIT_MIN" \
