@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+#
+# monad-watchdog.sh — detect & recover a stuck Monad FULL-NODE.
+#
+# ┌─ READ THIS ───────────────────────────────────────────────────────────────┐
+# │ FULL-NODES ONLY by default. This script `systemctl restart`s the monad     │
+# │ services. On a full-node that is safe. On an ACTIVE VALIDATOR a restart in  │
+# │ your proposal slot = MISSED BLOCKS (and possible penalties). The script     │
+# │ auto-detects a non-burn beneficiary in node.toml and REFUSES to restart     │
+# │ unless ALLOW_VALIDATOR_RESTART=1 is set explicitly.                         │
+# └─────────────────────────────────────────────────────────────────────────────┘
+#
+# Targets the "local timeout deadlock": a full-node that drops below the
+# upstream-validator target stops receiving proposals, loops on `local timeout`,
+# freezes its block-tree root, and can NEVER self-recover (its auto-statesync
+# trigger is gated behind a restart that won't self-fire). A process restart is
+# the required recovery.
+#
+# DECISION MODEL (important — designed to avoid false restarts):
+#   * The ONLY restart triggers are RPC-derived: block FROZEN or large GAP.
+#     The local node RPC is read directly on the host and guarded — if the RPC
+#     is unreachable we ALERT and do nothing (never restart on a blind 0).
+#   * Session count is read LOCALLY from otelcol (:8889/metrics), NOT from
+#     Prometheus (which may be remote or absent on a clean validator). It is
+#     used only as alert CONTEXT — it NEVER triggers a restart by itself. If it
+#     is unreadable we simply omit it; the RPC signals still drive the decision.
+#   * Sessions use monad_wireauth_udp_state_TRANSPORT_sessions (established
+#     sessions), NOT *_total_sessions — total includes in-progress
+#     initiating/responding handshakes and an isolated node hammering handshakes
+#     can show total>=3 while transport=0. (Matches the Grafana "Active peers" fix.)
+#
+# Cron (every 5 min):
+#   */5 * * * * /usr/local/bin/monad-watchdog >> /var/log/monad-watchdog.log 2>&1
+#
+set -uo pipefail
+
+# ---- config (override via env) ----
+RPC="${RPC:-http://localhost:8080}"                   # local node RPC
+NET_RPC="${NET_RPC:-https://testnet-rpc.monad.xyz}"   # network head reference
+OTEL="${OTEL:-http://127.0.0.1:8889/metrics}"         # LOCAL otelcol exporter (no Prometheus dep)
+SERVICES="${SERVICES:-monad-bft monad-execution monad-rpc}"
+
+# Restart triggers (RPC-derived only):
+#   Testnet runs ~750 blocks / 5 min (~2.5 bps). A healthy synced node advances
+#   far more than MIN_ADVANCE each run; below it the node is effectively dead
+#   even if not at a hard 0. Tune MIN_ADVANCE to your cron interval + network bps.
+MIN_ADVANCE="${MIN_ADVANCE:-50}"   # min blocks local head must gain per run to count as alive
+GAP_ALERT="${GAP_ALERT:-2000}"     # blocks behind network head that is clearly unhealthy
+
+# Corroborating-only (NEVER triggers a restart):
+SESS_TARGET="${SESS_TARGET:-3}"    # NUM_UPSTREAM_VALIDATORS target, for alert context
+
+RESTART_COOLDOWN="${RESTART_COOLDOWN:-1800}"            # min seconds between restarts
+ALLOW_VALIDATOR_RESTART="${ALLOW_VALIDATOR_RESTART:-0}" # safety gate, see header
+NODE_TOML="${NODE_TOML:-/home/monad/monad-bft/config/node.toml}"
+ALERT_WEBHOOK="${ALERT_WEBHOOK:-}"                      # optional Slack/Discord/Telegram webhook
+
+STATE_DIR="${STATE_DIR:-/var/lib/monad-watchdog}"
+STATE_FILE="$STATE_DIR/last_block"
+COOLDOWN_FILE="$STATE_DIR/last_restart"
+mkdir -p "$STATE_DIR"
+
+ts()  { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
+log() { echo "$(ts) $*"; }
+alert() {
+  log "ALERT: $*"
+  [ -n "$ALERT_WEBHOOK" ] && curl -fsS -m5 -X POST "$ALERT_WEBHOOK" \
+    -H 'Content-Type: application/json' \
+    --data "{\"text\":\"[monad-watchdog $(hostname)] $*\"}" >/dev/null 2>&1 || true
+}
+
+rpc_block() {
+  curl -s -m5 -X POST "$1" -H 'Content-Type: application/json' \
+    --data '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' \
+    | grep -oE '0x[0-9a-f]+' | head -1
+}
+# read a single gauge value from the local otelcol exposition. The metric line
+# is `name{labels} value timestamp`, so anchor on name + `{` or space, then the
+# value is field 2 after awk splits on whitespace.
+otel_gauge() {
+  curl -s -m5 "$OTEL" 2>/dev/null \
+    | grep -E "^$1[ {]" | awk '{print $2}' | head -1
+}
+# established sessions only — read locally, no Prometheus dependency
+otel_transport_sessions() { otel_gauge 'monad_wireauth_udp_state_transport_sessions'; }
+
+# ---- validator safety gate (point 4) ----
+GATE_BLOCK_RESTART=0
+if [ "$ALLOW_VALIDATOR_RESTART" != "1" ] && [ -r "$NODE_TOML" ]; then
+  BEN=$(grep -E '^\s*beneficiary' "$NODE_TOML" 2>/dev/null | grep -oiE '0x[0-9a-f]+' | head -1)
+  if [ -n "$BEN" ] && [ "$BEN" != "0x0000000000000000000000000000000000000000" ]; then
+    log "node.toml beneficiary=$BEN (non-burn) → looks like a VALIDATOR. Will NOT auto-restart."
+    log "  override with ALLOW_VALIDATOR_RESTART=1 (WARNING: restart in a proposal slot drops blocks)."
+    GATE_BLOCK_RESTART=1
+  fi
+fi
+
+# ---- gather RPC signals (authoritative restart triggers) ----
+LOCAL_HEX=$(rpc_block "$RPC");    LOCAL=$(printf '%d' "$LOCAL_HEX" 2>/dev/null || echo 0)
+HEAD_HEX=$(rpc_block "$NET_RPC"); HEAD=$(printf '%d' "$HEAD_HEX" 2>/dev/null || echo 0)
+PREV=$(cat "$STATE_FILE" 2>/dev/null || echo 0)
+[ "$LOCAL" -gt 0 ] && echo "$LOCAL" > "$STATE_FILE"
+
+# guard (point 2): local RPC unreachable / statesync in progress → never restart on a blind 0.
+# During statesync the RPC is intentionally down until sync completes, so we
+# must not alert-spam every run. If statesync_syncing=1 we log quietly and do
+# nothing; only a genuine RPC-down-without-statesync escalates to an alert.
+# (Limitation: a STUCK statesync also reads syncing=1 — it shows as repeated
+#  log lines rather than an alert, so eyeball the log if recovery drags on.)
+if [ "$LOCAL" -eq 0 ]; then
+  SYNCING=$(otel_gauge 'monad_statesync_syncing'); SYNCING="${SYNCING%%.*}"
+  if [ "${SYNCING:-0}" = "1" ]; then
+    log "local RPC down but statesync_syncing=1 → node is legitimately recovering. No action."
+    exit 0
+  fi
+  alert "local RPC unreachable or returning 0 (services down?). Not auto-restarting on a blind 0 — check manually."
+  exit 2
+fi
+
+GAP=0; [ "$HEAD" -gt 0 ] && GAP=$(( HEAD - LOCAL ))
+ADVANCED=$(( LOCAL - PREV ))
+# FROZEN catches slow-crawl, not just a hard stop (point 3). Needs a prior sample.
+FROZEN=0; [ "$PREV" -gt 0 ] && [ "$ADVANCED" -lt "$MIN_ADVANCE" ] && FROZEN=1
+
+# ---- corroborating-only session count (point 1 + 2: local, transport, never a trigger) ----
+SESS_RAW=$(otel_transport_sessions); SESS="${SESS_RAW%%.*}"
+if [ -n "${SESS:-}" ]; then
+  SESS_CTX="transport_sessions=$SESS"; [ "$SESS" -lt "$SESS_TARGET" ] && SESS_CTX="$SESS_CTX(<$SESS_TARGET target!)"
+else
+  SESS_CTX="transport_sessions=unreadable"
+fi
+
+log "block=$LOCAL head=$HEAD gap=$GAP advanced=${ADVANCED}/run frozen=$FROZEN $SESS_CTX"
+
+# ---- healthy? (decided by RPC signals only) ----
+if [ "$FROZEN" -eq 0 ] && [ "$GAP" -lt "$GAP_ALERT" ]; then
+  log "OK — advancing ${ADVANCED}/run, gap=$GAP"
+  exit 0
+fi
+
+log "UNHEALTHY (RPC): frozen=$FROZEN advanced=$ADVANCED gap=$GAP | context: $SESS_CTX"
+
+# validator gate
+if [ "$GATE_BLOCK_RESTART" = "1" ]; then
+  alert "stalled (frozen=$FROZEN gap=$GAP $SESS_CTX) but node looks like a VALIDATOR — NOT auto-restarting (would miss slots). Manual action needed."
+  exit 2
+fi
+
+# ---- cooldown: restarted recently and STILL stuck → escalate, don't loop ----
+NOW=$(date +%s)
+LAST=$(cat "$COOLDOWN_FILE" 2>/dev/null || echo 0)
+if [ $(( NOW - LAST )) -lt "$RESTART_COOLDOWN" ]; then
+  alert "still stuck $(( NOW - LAST ))s after a restart (gap=$GAP $SESS_CTX). Restart didn't recover — likely needs Hard Reset / snapshot restore. NOT auto-performing destructive recovery."
+  exit 2
+fi
+
+# ---- recovery: restart services ----
+log "ACTION: restarting services: $SERVICES"
+echo "$NOW" > "$COOLDOWN_FILE"
+if systemctl restart $SERVICES; then
+  alert "restarted [$SERVICES] — was frozen=$FROZEN gap=$GAP $SESS_CTX. Re-checking next run."
+  exit 1
+else
+  alert "systemctl restart FAILED for [$SERVICES] — manual intervention needed."
+  exit 2
+fi
