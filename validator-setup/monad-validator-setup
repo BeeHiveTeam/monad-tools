@@ -1610,7 +1610,12 @@ step_snapshot_restore() {
   # documented hard-reset for the DB. We only reach here after the operator has
   # confirmed the (destructive) restore, so truncating is the intended action.
   if [[ -e /dev/triedb ]] && command -v monad-mpt >/dev/null 2>&1; then
-    if monad-mpt --storage /dev/triedb 2>&1 | grep -q FATAL; then
+    # Decide "uninitialized" by EXIT CODE first (monad-mpt opens an existing DB
+    # with exit 0; an uninitialized device errors non-zero), with the FATAL
+    # string as a fallback — grepping stdout alone was fragile against the
+    # tool's wording. Either signal → skip truncate and let MF restore --create.
+    mpt_probe=$(monad-mpt --storage /dev/triedb 2>&1); mpt_rc=$?
+    if (( mpt_rc != 0 )) || grep -q FATAL <<<"$mpt_probe"; then
       info "triedb not yet initialized — MF restore will --create it."
     else
       info "Truncating existing triedb before snapshot import (prevents 'database must be hard reset')…"

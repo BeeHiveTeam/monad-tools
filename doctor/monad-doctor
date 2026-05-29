@@ -824,14 +824,14 @@ check_ports_free() {
     esac
 
     local listening_line who
-    listening_line=$(ss $ss_flag 2>/dev/null | awk -v p=":${port}" '$0 ~ p {print; exit}')
+    listening_line=$(ss $ss_flag 2>/dev/null | awk -v p=":${port}" '$4 ~ (p"$") {print; exit}')
     if [[ -z "$listening_line" ]]; then
       emit network "net.port.$spec" PASS "port ${port}/${proto} free"
       continue
     fi
 
     # Try to identify the listening process (-p needs root)
-    who=$(ss "${ss_flag}p" 2>/dev/null | awk -v p=":${port}" '$0 ~ p {print; exit}' \
+    who=$(ss "${ss_flag}p" 2>/dev/null | awk -v p=":${port}" '$4 ~ (p"$") {print; exit}' \
           | grep -oE 'users:\(\("[^"]+"' | grep -oE '"[^"]+"' | tr -d '"' | head -1)
     if [[ "$who" =~ ^monad ]]; then
       emit network "net.port.$spec" PASS "port ${port}/${proto} owned by $who (node already running)"

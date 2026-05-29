@@ -17,9 +17,11 @@
 # the required recovery.
 #
 # DECISION MODEL (important — designed to avoid false restarts):
-#   * The ONLY restart triggers are RPC-derived: block FROZEN or large GAP.
-#     The local node RPC is read directly on the host and guarded — if the RPC
-#     is unreachable we ALERT and do nothing (never restart on a blind 0).
+#   * The ONLY restart trigger is RPC-derived: block FROZEN (not advancing).
+#     A large GAP while the node is still ADVANCING is alert-only — a restart
+#     can't help a node that is already processing blocks, it would only discard
+#     progress. The local node RPC is read directly on the host and guarded — if
+#     the RPC is unreachable we ALERT and do nothing (never restart on a blind 0).
 #   * Session count is read LOCALLY from otelcol (:8889/metrics), NOT from
 #     Prometheus (which may be remote or absent on a clean validator). It is
 #     used only as alert CONTEXT — it NEVER triggers a restart by itself. If it
@@ -166,8 +168,16 @@ fi
 
 log "block=$LOCAL head=$HEAD gap=$GAP advanced=${ADVANCED}/run frozen=$FROZEN $SESS_CTX"
 
-# ---- healthy? (decided by RPC signals only) ----
-if [ "$FROZEN" -eq 0 ] && [ "$GAP" -lt "$GAP_ALERT" ]; then
+# ---- healthy / catching-up? ----
+# A restart only recovers a FROZEN (deadlocked) node. If the node is ADVANCING
+# (FROZEN=0) it is processing blocks — a restart would just discard progress,
+# even when it is still far behind (e.g. replaying right after statesync). So a
+# large GAP while advancing is ALERT-only, never a restart trigger.
+if [ "$FROZEN" -eq 0 ]; then
+  if [ "$GAP" -ge "$GAP_ALERT" ]; then
+    alert "node is $GAP blocks behind but ADVANCING (${ADVANCED}/run) — catching up, NOT restarting. Investigate if the gap is not shrinking."
+    exit 1
+  fi
   log "OK — advancing ${ADVANCED}/run, gap=$GAP"
   exit 0
 fi
