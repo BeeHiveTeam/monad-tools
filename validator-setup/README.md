@@ -22,7 +22,7 @@ Aligned with [docs.monad.xyz/node-ops/full-node-installation](https://docs.monad
 ```bash
 sudo ./monad-validator-setup --non-interactive \
   --network=testnet \
-  --triedb-partition=nvme1n1 --allow-nvme-reformat \
+  --triedb-partition=nvme1n1 --allow-nvme-reformat --allow-triedb-wipe \
   --start-services
 ```
 
@@ -39,7 +39,7 @@ Zero prompts. The script:
 1. **Pre-flight** — runs [`monad-doctor`](../doctor/), aborts on FAIL (`--skip-preflight` overrides; `--non-interactive` + FAIL = hard abort)
 2. **Dependencies** — `apt install -y curl gnupg nvme-cli aria2 jq ethtool ufw iptables parted python3` (`iptables-persistent` excluded — Conflicts with `ufw` on Ubuntu 24.04)
 3. **Monad user + dirs** — `useradd -m -s /bin/bash monad` + 4 directories under `/home/monad/monad-bft/`
-4. **🔧 OPTIONAL — Triedb partitioning** — lists free NVMe disks, operator picks (or `--triedb-partition=DEV`). Verifies LBA = 512 bytes (offers `nvme format --lbaf=0` if not). Runs `parted mklabel gpt` + `mkpart triedb 0% 100%`, writes udev rule with PARTUUID → `/dev/triedb` symlink. **DESTRUCTIVE: confirm() each step; `--allow-nvme-reformat` for non-interactive.**
+4. **🔧 OPTIONAL — Triedb partitioning** — lists free NVMe disks, operator picks (or `--triedb-partition=DEV`). Verifies LBA = 512 bytes (offers `nvme format --lbaf=0` if not). Runs `parted mklabel gpt` + `mkpart triedb 0% 100%`, writes udev rule with PARTUUID → `/dev/triedb` symlink. **DESTRUCTIVE: confirm() each step; non-interactive needs BOTH `--allow-triedb-wipe` (to partition) and `--allow-nvme-reformat` (to re-format LBA).**
 5. **ulimits** — `/etc/security/limits.d/99-monad-validator.conf` with `nofile=1048576`. Note: we **do NOT** write a sysctl drop-in for network buffers — the `monad` apt package ships `/etc/sysctl.d/90-monad-network-buffer.conf` with `rmem_max=62500000` itself; overriding it caused monad-bft panics in older script versions.
 6. **IO scheduler** — `mq-deadline` on triedb device (per docs). Persisted via udev rule (attribute-match, not by name).
 7. **TriedB SYMLINK udev rule** — `ENV{ID_PART_ENTRY_UUID}==<PARTUUID>, MODE="0666", SYMLINK+="triedb"`. Idempotent: skipped if step 4 already created it.
@@ -117,6 +117,8 @@ sudo ./monad-validator-setup --network=testnet --no-snapshot-restore
 --triedb-partition=DEV              DESTRUCTIVE: partition this NVMe for triedb.
 --triedb-dev=DEV                    IO-scheduler target (no partitioning).
 --allow-nvme-reformat               Allow nvme format --lbaf=0 under --non-interactive.
+--allow-triedb-wipe                 REQUIRED with --triedb-partition under --non-interactive:
+                                    authorises wiping the named disk.
 --beneficiary=0x...                 Rewards address; written into node.toml.
 --node-name=NAME                    Unique moniker; written into node.toml.
 --generate-keys                     monad-keystore create SECP + BLS keys.

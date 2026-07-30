@@ -27,7 +27,7 @@ sudo ./doctor/monad-doctor
 #    Snapshot restore is ON by default (--no-snapshot-restore to skip).
 #    --with-vdp-otel is auto-enabled for testnet (VDP eligibility starts there).
 sudo ./validator-setup/monad-validator-setup --network=testnet \
-  --triedb-partition=nvme1n1 --start-services
+  --triedb-partition=nvme1n1 --allow-triedb-wipe --start-services
 
 # 4. After node is fully synced AND you have ≥100k MON stake on the
 #    beneficiary address, PROMOTE to validator on the same machine:

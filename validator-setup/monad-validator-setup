@@ -269,6 +269,9 @@ FLAGS (all optional)
   --triedb-partition=DEV            DESTRUCTIVE: partition this NVMe for triedb.
   --triedb-dev=DEV                  IO-scheduler target (no partitioning).
   --allow-nvme-reformat             Allow nvme format --lbaf=0 under --non-interactive.
+  --allow-triedb-wipe               REQUIRED with --triedb-partition under --non-interactive:
+                                    authorises wiping the named disk. Without it the
+                                    partition step refuses and the install stays INCOMPLETE.
   --allow-snapshot-overwrite        Allow overwriting an EXISTING populated triedb under
                                     --non-interactive (otherwise refused, to protect synced state).
   --beneficiary=0x...               Rewards address; written into node.toml.
@@ -1655,18 +1658,25 @@ step_snapshot_restore() {
   # `monad-mpt --truncate` wiping a fully synced database. Ask triedb itself as well.
   local triedb_populated=0
   if [[ -L /dev/triedb || -b /dev/triedb ]] && command -v monad-mpt >/dev/null 2>&1; then
-    local mpt_out=""
-    mpt_out=$(monad-mpt --storage /dev/triedb 2>/dev/null || true)
-    # "Latest finalized is <N>" with a real block number ⇒ there is a live database here.
-    local fin
+    # Decide by EXIT CODE first, exactly like the truncate probe further down does. An
+    # uninitialized device makes monad-mpt abort (SIGABRT/FATAL) while still writing quill
+    # banners to stdout, so "output is non-empty but has no markers" is NOT evidence of a
+    # database — the earlier version fell into its else branch there and declared the device
+    # POPULATED. On a greenfield install that skipped the documented snapshot restore entirely
+    # and left the node syncing from genesis.
+    local mpt_out="" mpt_rc=0
+    mpt_out=$(timeout 60 monad-mpt --storage /dev/triedb 2>&1) || mpt_rc=$?
+    local fin=""
     fin=$(grep -oE 'Latest finalized is [0-9]+' <<<"$mpt_out" | grep -oE '[0-9]+' | head -1)
-    if [[ -n "$fin" ]] && (( fin > 0 )); then
+    if (( mpt_rc != 0 )) || grep -q FATAL <<<"$mpt_out"; then
+      info "triedb is not initialised yet (monad-mpt rc=${mpt_rc}) — snapshot restore applies."
+    elif [[ -n "$fin" ]] && (( fin > 0 )); then
       triedb_populated=1
       info "triedb reports a populated database (latest finalized ${fin})."
-    elif [[ -n "$mpt_out" ]] && grep -q 'Active timelines' <<<"$mpt_out"; then
+    elif grep -q 'Active timelines' <<<"$mpt_out"; then
       info "triedb is initialised but reports no finalized block yet."
     else
-      warn "Could not read triedb state via monad-mpt — assuming POPULATED to avoid wiping data."
+      warn "monad-mpt returned success but no recognisable state — assuming POPULATED to avoid wiping data."
       triedb_populated=1
     fi
   fi

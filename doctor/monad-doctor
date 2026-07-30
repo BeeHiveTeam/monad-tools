@@ -483,10 +483,11 @@ check_disks() {
   fi
 
   # IO scheduler — only the triedb device strictly needs mq-deadline
-  local triedb_disk_for_sched=""
-  if [[ -L /dev/triedb ]]; then
-    triedb_disk_for_sched=$(lsblk -no PKNAME "$(readlink -f /dev/triedb)" 2>/dev/null | head -1)
-  fi
+  # Reuse the already-resolved disk instead of repeating the lookup: the LBA check gained a
+  # whole-device fallback and -b support, this one did not, so with /dev/triedb pointing at a
+  # whole device the scheduler check matched no disk and printed NOTHING — not even a SKIP,
+  # because the LBA variable was non-empty. Exactly the defect the change claimed to fix.
+  local triedb_disk_for_sched="$triedb_disk_for_lba"
   while IFS=$'\t' read -r dev size role _; do
     [[ -z "$dev" ]] && continue
     local sched
@@ -516,7 +517,10 @@ check_disks() {
       local _bytes _gb
       _bytes=$(lsblk -bdn -o SIZE "/dev/$_dev" 2>/dev/null | head -1)
       [[ "$_bytes" =~ ^[0-9]+$ ]] || continue
-      _gb=$(( _bytes / 1000000000 ))
+      # GiB, not decimal GB: DISK_GB_TRIEDB_MIN is documented in GiB and the post-install
+      # size check uses GiB too. Mixing bases made the doctor recommend a 1.8 TB disk and
+      # then FAIL the very same disk after installation.
+      _gb=$(( _bytes / 1073741824 ))
       if (( _gb >= DISK_GB_TRIEDB_MIN )); then
         cand+="$_dev (${_gb} GB) "
       else
@@ -1736,8 +1740,8 @@ print_json() {
   printf '{\n'
   printf '  "host": "%s",\n' "$(hostname)"
   printf '  "date": "%s",\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  printf '  "summary": {"pass": %d, "warn": %d, "fail": %d, "info": %d},\n' \
-    "$COUNT_PASS" "$COUNT_WARN" "$COUNT_FAIL" "$COUNT_INFO"
+  printf '  "summary": {"pass": %d, "warn": %d, "fail": %d, "info": %d, "skip": %d},\n' \
+    "$COUNT_PASS" "$COUNT_WARN" "$COUNT_FAIL" "$COUNT_INFO" "$COUNT_SKIP"
   if (( COUNT_FAIL > 0 )); then printf '  "verdict": "NOT_READY",\n'
   elif (( COUNT_WARN > 0 )); then printf '  "verdict": "READY_WITH_WARNINGS",\n'
   else printf '  "verdict": "READY",\n'; fi
