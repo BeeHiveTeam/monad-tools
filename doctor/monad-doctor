@@ -1176,31 +1176,65 @@ check_authudp_config() {
   fi
 }
 
+# Which network is this node on? Needed because since 0.15.x testnet and mainnet
+# deliberately run DIFFERENT monad versions, so a network-agnostic "latest" check
+# gives mainnet operators a false "you are behind" and pushes them onto a version
+# MF has not sanctioned for mainnet. Prefer node.toml's network_name; fall back to
+# chain_id (testnet 10143 / mainnet 143).
+detect_network() {
+  local n="" cid=""
+  [[ -r "$MONAD_NODE_TOML" ]] || return 0
+  n=$(grep -oE '^[[:space:]]*network_name[[:space:]]*=[[:space:]]*"[a-z]+"' "$MONAD_NODE_TOML" 2>/dev/null \
+      | grep -oE '"[a-z]+"' | tr -d '"' | head -1)
+  if [[ -z "$n" ]]; then
+    cid=$(grep -oE '^[[:space:]]*chain_id[[:space:]]*=[[:space:]]*[0-9]+' "$MONAD_NODE_TOML" 2>/dev/null \
+          | grep -oE '[0-9]+' | head -1)
+    case "$cid" in
+      10143) n=testnet ;;
+      143)   n=mainnet ;;
+    esac
+  fi
+  printf '%s' "$n"
+}
+
 check_github_release() {
-  # Cross-check against the canonical GitHub release tag. Useful when apt is
-  # not yet configured (greenfield host) or its cache is stale.
-  # Independent source of truth — GitHub releases/latest excludes pre-releases.
+  # Cross-check the installed version against MF's target for THIS network.
+  # Priority: docs.monad.xyz/networks.json (per-network, machine-readable) →
+  # GitHub releases/latest (network-agnostic fallback).
   if ! command -v curl >/dev/null; then return; fi
-  local latest installed
+  local latest installed network net_target source
   installed=$(dpkg-query -W -f='${Version}' monad 2>/dev/null || true)
-  latest=$(curl -fsS -m 5 -H 'Accept: application/vnd.github+json' \
-    https://api.github.com/repos/category-labs/monad-bft/releases/latest 2>/dev/null \
-    | grep -oE '"tag_name":[^,]+' | head -1 \
-    | grep -oE 'v[0-9.]+(-[a-z0-9.]+)?' | sed 's/^v//')
+  network=$(detect_network)
+  if [[ -n "$network" ]]; then
+    net_target=$(curl -fsS -m 5 -H 'User-Agent: BeeHive/monad-tools' \
+      https://docs.monad.xyz/networks.json 2>/dev/null | tr -d ' \n' \
+      | grep -oE "\"${network}\":\{\"monad_version\":\"[0-9]+\.[0-9]+\.[0-9]+[^\"]*\"" \
+      | grep -oE '[0-9]+\.[0-9]+\.[0-9]+[^"]*' | head -1)
+  fi
+  if [[ -n "$net_target" ]]; then
+    latest="$net_target"
+    source="networks.json target for ${network}"
+  else
+    latest=$(curl -fsS -m 5 -H 'Accept: application/vnd.github+json' \
+      https://api.github.com/repos/category-labs/monad-bft/releases/latest 2>/dev/null \
+      | grep -oE '"tag_name":[^,]+' | head -1 \
+      | grep -oE 'v[0-9.]+(-[a-z0-9.]+)?' | sed 's/^v//')
+    source="GitHub latest stable (network unknown — verify against your network's target)"
+  fi
   if [[ -z "$latest" ]]; then
-    emit monad "monad.upstream" INFO "GitHub API unreachable (offline or rate-limited)"
+    emit monad "monad.upstream" INFO "networks.json and GitHub API unreachable (offline or rate-limited)"
     return
   fi
   if [[ -z "$installed" ]]; then
-    emit monad "monad.upstream" INFO "GitHub latest stable: v$latest (monad not installed yet)"
+    emit monad "monad.upstream" INFO "$source: v$latest (monad not installed yet)"
   elif [[ "$latest" == "$installed" ]]; then
-    emit monad "monad.upstream" PASS "matches GitHub latest stable (v$latest)"
+    emit monad "monad.upstream" PASS "matches $source (v$latest)"
   else
     # Distinguish "we're ahead" (e.g. on RC) vs "we're behind"
     if printf '%s\n%s\n' "$latest" "$installed" | sort -V -C 2>/dev/null; then
-      emit monad "monad.upstream" INFO "installed v$installed > GitHub latest stable v$latest (RC or pre-release?)"
+      emit monad "monad.upstream" INFO "installed v$installed > $source v$latest (RC, pre-release, or network not yet upgraded)"
     else
-      emit monad "monad.upstream" WARN "GitHub stable v$latest > installed v$installed" \
+      emit monad "monad.upstream" WARN "$source is v$latest > installed v$installed" \
            $'Quick fix:   sudo apt-mark unhold monad\n             sudo apt update && sudo apt install --only-upgrade monad\n             sudo apt-mark hold monad   # re-hold to prevent surprise upgrades\nVerify:      dpkg-query -W -f=\'${Version}\\n\' monad\nWhy:         lagging behind stable carries CVE and consensus-bug exposure;\n             release notes often include mandatory upgrades for network compatibility.\nNote:        upgrade during a low-stakes window — monad-bft restarts mid-epoch.'
     fi
   fi
