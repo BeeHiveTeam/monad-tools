@@ -22,6 +22,12 @@ set -u
 # Note: no pipefail — `grep -q` exits early on match, causing SIGPIPE on producers
 # like journalctl/apt/dpkg, which would propagate as false failures.
 
+# Fixed locale for every child command. Without it a comma-decimal locale (LC_NUMERIC=ru_RU,
+# de_DE — sshd forwards LC_* by default, so `curl … | sudo bash` inherits it) makes awk print
+# "4,75" and then parse that string back as 4, so a 4.75 GHz CPU failed the 4.5 GHz check.
+# The same class of breakage applies to parsing lsblk/df/ethtool/chronyc output.
+export LC_ALL=C
+
 # ===== Defaults / thresholds (tuneable via env or flags) =====
 # Sources:
 #   - https://docs.monad.xyz/node-ops/hardware-requirements
@@ -101,7 +107,7 @@ fi
 
 # ===== Result accumulation =====
 declare -a RESULTS_NAME RESULTS_STATUS RESULTS_MSG RESULTS_FIX RESULTS_SECTION
-declare -i COUNT_PASS=0 COUNT_WARN=0 COUNT_FAIL=0 COUNT_INFO=0
+declare -i COUNT_PASS=0 COUNT_WARN=0 COUNT_FAIL=0 COUNT_INFO=0 COUNT_SKIP=0
 
 emit() {
   # emit <section> <name> <status> <msg> [fix]
@@ -119,6 +125,12 @@ emit() {
     WARN) COUNT_WARN+=1 ;;
     FAIL) COUNT_FAIL+=1 ;;
     INFO) COUNT_INFO+=1 ;;
+    # SKIP = "this check did NOT run" (missing tool, unreadable source, ambiguous layout).
+    # Previously such cases silently emitted PASS or nothing at all, so an unperformed check
+    # was indistinguishable from a passed one and still produced `verdict: READY` / exit 0.
+    # Counted separately and always printed; deliberately does NOT change exit codes, so the
+    # documented contract (0 ok / 1 warnings / 2 failures) is unaffected.
+    SKIP) COUNT_SKIP+=1 ;;
   esac
 
   [[ $JSON_OUTPUT -eq 1 ]] && return
@@ -129,6 +141,7 @@ emit() {
     WARN) sym="!"; color="$C_YELLOW" ;;
     FAIL) sym="✗"; color="$C_RED"    ;;
     INFO) sym="i"; color="$C_BLUE"   ;;
+    SKIP) sym="?"; color="$C_YELLOW" ;;
   esac
 
   printf "  ${color}%s${C_RESET} %-30s %s\n" "$sym" "$name" "$msg"
@@ -192,7 +205,12 @@ disk_topology() {
 
     # Collect partition info.
     local parts mounts has_root has_triedb has_swap has_other
-    parts=$(lsblk -ln -o NAME,MOUNTPOINT "/dev/$disk" 2>/dev/null | tail -n +2)
+    # Отбрасываем строку САМОГО диска по имени, а не по позиции. `tail -n +2` исходило из
+    # того, что диск идёт первым, но вывод lsblk -l отсортирован по ИМЕНИ (здесь первыми
+    # идут md2/md3), поэтому выбрасывался легитимный дочерний узел. На LVM/btrfs-subvol
+    # это давало ложный WARN «OS on single disk (SPOF)».
+    parts=$(lsblk -ln -o NAME,MOUNTPOINT "/dev/$disk" 2>/dev/null \
+            | awk -v d="$disk" '$1 != d')
     has_root=0; has_triedb=0; has_swap=0; has_other=0
 
     while IFS= read -r line; do
@@ -295,21 +313,38 @@ check_cpu() {
     *)     emit hardware "cpu.smt"  INFO "SMT state unknown — verify in BIOS (must be off)" ;;
   esac
 
-  # CPU base clock — docs require 4.5 GHz+. Read from cpuinfo "MHz" field if available,
-  # otherwise from lscpu "CPU max MHz". Some servers report governed (current) clock not max.
-  local mhz_max
-  mhz_max=$(lscpu 2>/dev/null | awk -F: '/CPU max MHz/ {gsub(/ /,"",$2); print $2; exit}')
-  [[ -z "$mhz_max" ]] && mhz_max=$(awk -F: '/cpu MHz/ {gsub(/ /,"",$2); print $2; exit}' /proc/cpuinfo 2>/dev/null)
-  if [[ -n "$mhz_max" ]]; then
-    local ghz_max
-    ghz_max=$(awk -v m="$mhz_max" 'BEGIN {printf "%.2f", m/1000}')
-    if awk -v a="$ghz_max" -v b="$CPU_GHZ_MIN" 'BEGIN {exit !(a >= b)}'; then
-      emit hardware "cpu.clock"   PASS "${ghz_max} GHz max (≥${CPU_GHZ_MIN} GHz required)"
+  # CPU clock. Docs require 4.5 GHz+ *base* clock, but `CPU max MHz` from lscpu is the BOOST
+  # ceiling — always >= base, so comparing it against the requirement can never fail on any CPU
+  # (this host: boost 5.75 GHz vs base 4.3 GHz on an EPYC 4585PX → PASS regardless). And the old
+  # fallback read `cpu MHz` from /proc/cpuinfo, which is the CURRENT frequency: on a host without
+  # cpufreq exposed, an idling 4.7 GHz CPU reported ~1.2 GHz and produced a false WARN.
+  # We therefore report boost as INFO (cannot judge) and only PASS/WARN when a real base clock
+  # is available: model-name suffix (e.g. "@ 4.30GHz") or dmidecode's Current/Max Speed.
+  local mhz_boost mhz_base=""
+  mhz_boost=$(lscpu 2>/dev/null | awk -F: '/CPU max MHz/ {gsub(/[ \t]/,"",$2); print $2; exit}')
+  mhz_base=$(lscpu 2>/dev/null | awk -F: '/Model name/ {print $2; exit}' \
+             | grep -oE '@[[:space:]]*[0-9]+\.[0-9]+GHz' | grep -oE '[0-9]+\.[0-9]+' \
+             | awk '{printf "%.0f", $1*1000}')
+  if [[ -z "$mhz_base" ]] && require_cmd dmidecode; then
+    mhz_base=$(dmidecode -t processor 2>/dev/null \
+               | awk -F: '/Current Speed/ {gsub(/[^0-9]/,"",$2); if ($2>0) {print $2; exit}}')
+  fi
+  if [[ -n "$mhz_base" ]]; then
+    local ghz_base
+    ghz_base=$(awk -v m="$mhz_base" 'BEGIN {printf "%.2f", m/1000}')
+    if awk -v a="$ghz_base" -v b="$CPU_GHZ_MIN" 'BEGIN {exit !(a+0 >= b+0)}'; then
+      emit hardware "cpu.clock"   PASS "${ghz_base} GHz base (≥${CPU_GHZ_MIN} GHz required)"
     else
-      emit hardware "cpu.clock"   WARN "${ghz_max} GHz max — docs require ${CPU_GHZ_MIN} GHz+ base clock"
+      emit hardware "cpu.clock"   WARN "${ghz_base} GHz base — docs require ${CPU_GHZ_MIN} GHz+ base clock" \
+           $'Why:         base clock, not boost, is what docs specify. Boost cannot be sustained\n             across all cores under consensus + execution load.'
     fi
+  elif [[ -n "$mhz_boost" ]]; then
+    local ghz_boost
+    ghz_boost=$(awk -v m="$mhz_boost" 'BEGIN {printf "%.2f", m/1000}')
+    emit hardware "cpu.clock"   SKIP "base clock unknown; boost ceiling is ${ghz_boost} GHz (docs require ${CPU_GHZ_MIN} GHz+ BASE)" \
+         $'Action:      check the CPU model spec, or install dmidecode for Current Speed.\nWhy:         `CPU max MHz` is the boost ceiling and is always >= base, so comparing it\n             against the base-clock requirement would pass on every CPU.'
   else
-    emit hardware "cpu.clock"   INFO "could not read CPU max clock"
+    emit hardware "cpu.clock"   SKIP "could not read any CPU clock"
   fi
 
   # AVX2 / AVX-512 hints (BLS sig verification benefits)
@@ -395,9 +430,22 @@ check_disks() {
   # "Data Size should be set to 512 bytes and marked as (in use). If that
   #  is not the case, then you will need to set the TRIEDB_DRIVE to use
   #  512 byte LBA." → only enforce on the actual triedb device.
-  local triedb_disk_for_lba=""
-  if [[ -L /dev/triedb ]]; then
-    triedb_disk_for_lba=$(lsblk -no PKNAME "$(readlink -f /dev/triedb)" 2>/dev/null | head -1)
+  # PKNAME is EMPTY when /dev/triedb points at a whole device rather than a partition (a valid
+  # monad-mpt layout). That used to leave triedb_disk_for_lba empty, so neither the triedb nor
+  # the "unused" branch below matched any disk and the LBA + scheduler checks emitted NOTHING —
+  # two documented mandatory requirements silently unverified, verdict READY, exit 0.
+  local triedb_disk_for_lba="" triedb_real=""
+  if [[ -L /dev/triedb || -b /dev/triedb ]]; then
+    triedb_real=$(readlink -f /dev/triedb 2>/dev/null)
+    triedb_disk_for_lba=$(lsblk -no PKNAME "$triedb_real" 2>/dev/null | head -1)
+    # whole-device: fall back to the device itself
+    [[ -z "$triedb_disk_for_lba" ]] && triedb_disk_for_lba=$(basename "${triedb_real:-}")
+  fi
+  if [[ -z "$triedb_disk_for_lba" ]]; then
+    emit hardware "disk.lba"   SKIP "could not resolve the disk behind /dev/triedb — LBA size NOT verified" \
+         $'Action:      ls -l /dev/triedb ; lsblk -o NAME,PKNAME,TYPE\nWhy:         docs require the triedb drive to use 512-byte LBA; this check could not run.'
+    emit hardware "disk.sched" SKIP "could not resolve the disk behind /dev/triedb — IO scheduler NOT verified" \
+         $'Action:      cat /sys/block/<triedb-disk>/queue/scheduler   # expect mq-deadline'
   fi
   while IFS=$'\t' read -r dev _ role _; do
     [[ -z "$dev" ]] && continue
@@ -457,11 +505,29 @@ check_disks() {
   # is no free NVMe for triedb, so validator-setup will require --triedb-dev
   # or fail entirely (all disks are RAID members / mounted / swap).
   if [[ ! -L /dev/triedb ]]; then
-    local cand
-    cand=$(echo "$topo" | awk -F'\t' -v min="$DISK_GB_TRIEDB_MIN" \
-      '$3=="unused" {gsub(/[^0-9.]/,"",$2); if ($2+0 >= 0) print $1, $2}')
+    # Size must be compared in BYTES. The previous awk passed -v min=… and then never used it
+    # (`if ($2+0 >= 0)` is true for everything), and $2 was lsblk's human size, so
+    # gsub(/[^0-9.]/) turned "1.7T" into 1.7 and "894.3G" into 894.3 — had the threshold
+    # actually been applied, a correct 1.9 TB disk (1.7 < 1700) would have been rejected while
+    # an undersized 894 GB one passed.
+    local cand="" cand_small=""
+    while IFS=$'\t' read -r _dev _size _role _detail; do
+      [[ "$_role" == "unused" && -n "$_dev" ]] || continue
+      local _bytes _gb
+      _bytes=$(lsblk -bdn -o SIZE "/dev/$_dev" 2>/dev/null | head -1)
+      [[ "$_bytes" =~ ^[0-9]+$ ]] || continue
+      _gb=$(( _bytes / 1000000000 ))
+      if (( _gb >= DISK_GB_TRIEDB_MIN )); then
+        cand+="$_dev (${_gb} GB) "
+      else
+        cand_small+="$_dev (${_gb} GB, below ${DISK_GB_TRIEDB_MIN} GB) "
+      fi
+    done <<<"$topo"
     if [[ -n "$cand" ]]; then
-      emit hardware "disk.triedb-candidate" INFO "candidate(s) for /dev/triedb: $(echo "$cand" | tr '\n' ',' )"
+      emit hardware "disk.triedb-candidate" INFO "candidate(s) for /dev/triedb: ${cand% }"
+    elif [[ -n "$cand_small" ]]; then
+      emit hardware "disk.triedb-candidate" WARN "unused NVMe present but too small for triedb: ${cand_small% }" \
+           $'Why:         docs specify a dedicated ~2TB disk for triedb; an undersized disk will fill\n             up and stop the node. Provision a larger drive.'
     else
       emit hardware "disk.triedb-candidate" WARN "no unused NVMe for /dev/triedb — every disk is RAID/mounted/swap; validator-setup will need --triedb-dev or fail" \
            $'Option A:    Provision a dedicated NVMe for triedb (cleanest).\nOption B:    Reinstall with installimage placing the OS on ONE drive, leaving the\n             second NVMe untouched as the triedb candidate.\nWhy:         triedb sharing a disk with OS contends for IO; sharing with OS RAID\n             multiplies writes and breaks the "dedicated 2TB disk" docs spec.'
@@ -486,12 +552,27 @@ check_disks() {
     triedb_part=$(readlink -f /dev/triedb)
     triedb_part="${triedb_part##*/}"
     triedb_disk=$(lsblk -no PKNAME "/dev/${triedb_part}" 2>/dev/null | head -1)
-    triedb_size_gb=$(lsblk -bdn -o SIZE "/dev/${triedb_disk:-$triedb_part}" 2>/dev/null \
+    # Measure the PARTITION that /dev/triedb actually points at, not its parent disk. Reading
+    # the disk size reported a 1.9 TB PASS for a 300 GB triedb partition on a split drive —
+    # the node would then fill the partition and stop, with the doctor having said it was fine.
+    local triedb_part_gb triedb_disk_gb=""
+    triedb_part_gb=$(lsblk -bdn -o SIZE "/dev/${triedb_part}" 2>/dev/null \
                      | awk '{printf "%d", $1/1024/1024/1024}')
-    if [[ -n "$triedb_size_gb" ]] && (( triedb_size_gb >= DISK_GB_TRIEDB_MIN )); then
-      emit hardware "disk.triedb-size" PASS "/dev/triedb on /dev/${triedb_disk:-$triedb_part} (${triedb_size_gb} GB)"
-    elif [[ -n "$triedb_size_gb" ]]; then
-      emit hardware "disk.triedb-size" FAIL "triedb device only ${triedb_size_gb} GB — docs require ≥${DISK_GB_TRIEDB_MIN} GB"
+    [[ -n "$triedb_disk" ]] && triedb_disk_gb=$(lsblk -bdn -o SIZE "/dev/${triedb_disk}" 2>/dev/null \
+                     | awk '{printf "%d", $1/1024/1024/1024}')
+    triedb_size_gb="$triedb_part_gb"
+    local whole_note=""
+    if [[ -n "$triedb_disk_gb" && -n "$triedb_part_gb" ]] && (( triedb_disk_gb > triedb_part_gb + 1 )); then
+      whole_note=" — partition is ${triedb_part_gb} GB of a ${triedb_disk_gb} GB disk"
+    fi
+    if [[ -z "$triedb_size_gb" || "$triedb_size_gb" == "0" ]]; then
+      emit hardware "disk.triedb-size" SKIP "could not read the size of /dev/triedb (${triedb_part}) — size NOT verified" \
+           $'Action:      lsblk -b -o NAME,SIZE,TYPE $(readlink -f /dev/triedb)'
+    elif (( triedb_size_gb >= DISK_GB_TRIEDB_MIN )); then
+      emit hardware "disk.triedb-size" PASS "/dev/triedb → /dev/${triedb_part} (${triedb_size_gb} GB)${whole_note}"
+    else
+      emit hardware "disk.triedb-size" FAIL "triedb partition only ${triedb_size_gb} GB — docs require ≥${DISK_GB_TRIEDB_MIN} GB${whole_note}" \
+           $'Why:         the node writes triedb into this partition; the parent disk being larger\n             does not help. Re-partition to give triedb the full drive.'
     fi
   else
     emit hardware "disk.triedb-size" INFO "/dev/triedb not present — skipping size check (created on first install)"
@@ -740,8 +821,25 @@ check_sysctl() {
 
 check_ntp() {
   if require_cmd chronyc && systemctl is-active --quiet chrony 2>/dev/null; then
-    local off
-    off=$(chronyc tracking 2>/dev/null | awk -F': ' '/Last offset/ {print $2}' | awk '{print $1}')
+    local track off leap refid
+    track=$(chronyc tracking 2>/dev/null)
+    off=$(awk -F': ' '/Last offset/ {print $2}' <<<"$track" | awk '{print $1}')
+    leap=$(awk -F': ' '/Leap status/ {gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2}' <<<"$track")
+    refid=$(awk -F': ' '/Reference ID/ {print $2}' <<<"$track" | awk '{print $1}')
+    # `Last offset` alone is not evidence of synchronisation: it keeps the value from the last
+    # successful correction. With every source unreachable (NTP blocked upstream, DNS down) chrony
+    # stays active, reports a microscopic stale offset — and the old check said PASS while the
+    # clock drifted freely, which is exactly what inflates vote_delay and risks a jail.
+    if [[ -z "$off" ]]; then
+      emit os "ntp"             SKIP "chrony active but 'chronyc tracking' returned nothing — clock NOT verified" \
+           $'Action:      chronyc tracking ; chronyc sources -v ; systemctl status chrony'
+      return
+    fi
+    if [[ "$refid" == "00000000" || "$leap" == "Not synchronised" ]]; then
+      emit os "ntp"             FAIL "chrony is NOT synchronised (Reference ID=${refid:-?}, Leap status=${leap:-?}) — offset value is stale" \
+           $'Investigate: chronyc sources -v   # are any sources reachable/selectable?\nQuick fix:   check egress UDP/123 and DNS, then: sudo systemctl restart chrony; sleep 30; chronyc tracking\nWhy:         an unsynchronised clock drifts freely; `Last offset` keeps the value from the\n             last successful correction and looks healthy while time is wrong.'
+      return
+    fi
     local off_us
     off_us=$(awk -v o="$off" 'BEGIN {printf "%d", (o<0?-o:o)*1000000}')
     if (( off_us < 1000 )); then
@@ -826,7 +924,17 @@ check_ports_free() {
     local listening_line who
     listening_line=$(ss $ss_flag 2>/dev/null | awk -v p=":${port}" '$4 ~ (p"$") {print; exit}')
     if [[ -z "$listening_line" ]]; then
-      emit network "net.port.$spec" PASS "port ${port}/${proto} free"
+      # "Free" is only good news BEFORE install. Once the monad package is installed and
+      # monad-bft is enabled, a free consensus port means the node is NOT running — and the old
+      # code handed out three green PASSes for exactly that, so a dead node still produced
+      # `verdict: READY` / exit 0.
+      if _monad_pkg_installed && systemctl is-enabled --quiet monad-bft 2>/dev/null \
+         && ! systemctl is-active --quiet monad-bft 2>/dev/null; then
+        emit network "net.port.$spec" FAIL "port ${port}/${proto} free but monad-bft is installed+enabled and NOT running — the node is down" \
+             $'Investigate: systemctl status monad-bft --no-pager -l\n             journalctl -u monad-bft -n 200 --no-pager\nWhy:         an unused consensus port on a configured node means no consensus at all.'
+      else
+        emit network "net.port.$spec" PASS "port ${port}/${proto} free"
+      fi
       continue
     fi
 
@@ -844,20 +952,35 @@ check_ports_free() {
 
 check_firewall() {
   if require_cmd ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
-    local ufw_status missing=""
+    local ufw_status missing="" restricted=""
     ufw_status=$(ufw status 2>/dev/null)
     for spec in $NET_PORTS_REQUIRED; do
       local port="${spec%/*}" proto="${spec#*/}"
-      # ufw rules can appear as "8000/tcp ALLOW", "8000 ALLOW" (any proto), or "8000/udp ALLOW"
-      if echo "$ufw_status" | grep -qE "^${port}/${proto}.*ALLOW|^${port}[[:space:]].*ALLOW"; then
+      # ufw rules appear as "8000/tcp ALLOW IN Anywhere", "8000 ALLOW IN Anywhere" (any proto),
+      # or restricted to a source: "8000/udp ALLOW IN 203.0.113.5".
+      # The old pattern only looked at the "To" column and the word ALLOW, so a rule scoped to a
+      # single peer counted as an open port — the node was unreachable for the rest of the
+      # network (desync, no votes) while the doctor reported "all required pairs allowed".
+      # Consensus ports must be open to Anywhere; anything narrower is reported explicitly.
+      local rule_line
+      rule_line=$(awk -v p="$port" -v pr="$proto" '
+        $0 ~ "^"p"/"pr"[[:space:]]" || $0 ~ "^"p"[[:space:]]" {print; exit}' <<<"$ufw_status")
+      if [[ -n "$rule_line" ]] && grep -qE 'ALLOW' <<<"$rule_line"; then
+        if grep -qiE 'ALLOW[[:space:]]+(IN[[:space:]]+)?Anywhere' <<<"$rule_line"; then
+          continue
+        fi
+        restricted+="$spec "
         continue
       fi
       missing+="$spec "
     done
-    if [[ -z "$missing" ]]; then
-      emit network "net.firewall" PASS "ufw active, all required port/proto pairs allowed"
+    if [[ -z "$missing" && -n "$restricted" ]]; then
+      emit network "net.firewall" WARN "ufw allows $restricted only from specific sources — the rest of the network cannot reach this node" \
+           $'Quick fix:   for s in '"$restricted"$'; do sudo ufw allow $s; done\nVerify:      sudo ufw status numbered\nWhy:         consensus/raptorcast ports must accept traffic from any peer. A source-scoped\n             rule silently isolates the node: it stays up, but desyncs and stops voting.'
+    elif [[ -z "$missing" ]]; then
+      emit network "net.firewall" PASS "ufw active, all required port/proto pairs allowed from Anywhere"
     else
-      emit network "net.firewall" WARN "ufw active but missing rules for: $missing" \
+      emit network "net.firewall" WARN "ufw active but missing rules for: $missing${restricted:+ (source-restricted: $restricted)}" \
            $'Quick fix:   '"$(for s in $missing; do printf 'sudo ufw allow %s; ' "$s"; done)"$'\nAuto:        monad-validator-setup → step_firewall adds all required rules.\nVerify:      sudo ufw status verbose\nWhy:         peers cannot reach this node on the missing port → desyncs, no votes.'
     fi
 
@@ -916,10 +1039,33 @@ check_rpc_exposure() {
   #   "Not use a validator node to service external RPCs (Axelar, Wormhole, etc.)"
   # If RPC ports (8080/8081) are publicly open in UFW → operator violates VDP.
   if ! require_cmd ufw || ! ufw status >/dev/null 2>&1; then
+    emit security "rpc.exposure" SKIP "ufw unavailable — RPC exposure NOT verified" \
+         $'Action:      ss -tlnp | grep -E ":(8080|8081)" ; check your firewall manually'
     return
   fi
   local ufw_status flagged=()
   ufw_status=$(ufw status 2>/dev/null)
+  # `ufw status` exits 0 even when the firewall is INACTIVE. The rule scan below then finds no
+  # "ALLOW … Anywhere" lines and used to conclude PASS "no RPC ports publicly exposed" — while
+  # RPC on 0.0.0.0:8080 was in fact open to the whole internet. With no firewall the only
+  # meaningful evidence is the listen address, so check that instead of ufw rules.
+  if ! grep -qiE '^Status:[[:space:]]*active' <<<"$ufw_status"; then
+    local listening=()
+    for rpc_port in 8080 8081; do
+      if ss -tlnH 2>/dev/null | awk '{print $4}' \
+           | grep -qE "(^|[^0-9])(0\.0\.0\.0|\[::\]|\*):${rpc_port}\$"; then
+        listening+=("$rpc_port")
+      fi
+    done
+    if (( ${#listening[@]} > 0 )); then
+      emit security "rpc.exposure" FAIL "ufw INACTIVE and RPC port(s) ${listening[*]} bound to 0.0.0.0 — reachable from the internet" \
+           $'Quick fix:   sudo ufw enable   # after allowing your SSH port!\n             sudo ufw allow from <TRUSTED-IP> to any port 8080\nVerify:      sudo ufw status verbose ; ss -tlnp | grep -E ":(8080|8081)"\nWhy:         VDP forbids serving external RPC from a validator node, and an open RPC is\n             an abuse vector regardless of VDP.'
+    else
+      emit security "rpc.exposure" WARN "ufw is INACTIVE — exposure judged from listen addresses only (RPC not bound to 0.0.0.0)" \
+           $'Quick fix:   sudo ufw enable   # after allowing your SSH port!\nWhy:         without a firewall nothing prevents a future service from binding publicly.'
+    fi
+    return
+  fi
   for rpc_port in 8080 8081; do
     # Anywhere = publicly exposed; we accept rules limited to specific source IPs
     if echo "$ufw_status" \
@@ -965,16 +1111,27 @@ check_cve_2026_31431() {
   # kernel module has an LPE. Mitigation = blacklist OR don't have it loaded.
   # If the module isn't loaded right now, the server is not vulnerable —
   # we don't WARN, we just inform. WARN only when it's actively loaded.
+  # "Not loaded" is NOT "not vulnerable": algif_aead is auto-loaded on demand — an
+  # unprivileged socket(AF_ALG) + bind with an aead type triggers request_module(). That is
+  # precisely why the only real mitigation is a blacklist. The old logic emitted PASS whenever
+  # lsmod came up empty, i.e. handed a clean bill of health to an unmitigated host.
+  local blacklisted=0
+  if grep -rqsE '^[[:space:]]*(blacklist|install)[[:space:]]+algif_aead' /etc/modprobe.d/ 2>/dev/null; then
+    blacklisted=1
+  fi
   if lsmod 2>/dev/null | grep -q '^algif_aead'; then
-    if { [[ -f /etc/modprobe.d/disable-algif.conf ]] && grep -q 'algif_aead' /etc/modprobe.d/disable-algif.conf 2>/dev/null; } \
-       || { [[ -f /etc/modprobe.d/blacklist-algif_aead.conf ]] && grep -q '^blacklist algif_aead' /etc/modprobe.d/blacklist-algif_aead.conf 2>/dev/null; }; then
-      emit security "cve.2026-31431" PASS "algif_aead loaded but blacklisted (will not reload after rmmod/reboot)"
+    if (( blacklisted )); then
+      emit security "cve.2026-31431" WARN "algif_aead is blacklisted but STILL LOADED — unload it or reboot" \
+           $'Quick fix:   sudo rmmod algif_aead   # or reboot\nVerify:      lsmod | grep algif_aead   # empty\nWhy:         the blacklist only prevents future autoloads; the running module is exploitable now.'
     else
-      emit security "cve.2026-31431" WARN "algif_aead loaded and not blacklisted — CVE-2026-31431 (LPE) unmitigated" \
-           $'Quick fix:   echo \'blacklist algif_aead\' | sudo tee /etc/modprobe.d/blacklist-algif_aead.conf\n             sudo rmmod algif_aead   # unload now (or reboot)\nVerify:      lsmod | grep -v algif_aead   # gone\nWhy:         module is currently loaded AND not blacklisted — exploitable right now.'
+      emit security "cve.2026-31431" FAIL "algif_aead loaded and NOT blacklisted — CVE-2026-31431 (LPE) exploitable right now" \
+           $'Quick fix:   echo \'blacklist algif_aead\' | sudo tee /etc/modprobe.d/blacklist-algif_aead.conf\n             sudo rmmod algif_aead\nVerify:      lsmod | grep algif_aead ; grep -r algif_aead /etc/modprobe.d/\nWhy:         module is loaded AND autoload is unrestricted.'
     fi
+  elif (( blacklisted )); then
+    emit security "cve.2026-31431" PASS "algif_aead blacklisted in /etc/modprobe.d (autoload blocked)"
   else
-    emit security "cve.2026-31431" PASS "algif_aead not loaded — server not vulnerable to CVE-2026-31431"
+    emit security "cve.2026-31431" WARN "algif_aead not loaded, but NOT blacklisted — it autoloads on demand, so the host is still exposed" \
+         $'Quick fix:   echo \'blacklist algif_aead\' | sudo tee /etc/modprobe.d/blacklist-algif_aead.conf\nVerify:      grep -r algif_aead /etc/modprobe.d/\nWhy:         any local process can trigger the autoload with socket(AF_ALG); "not currently\n             loaded" is not a mitigation.'
   fi
 }
 
@@ -1106,10 +1263,39 @@ check_triedb_udev() {
   # Docs require a udev rule mapping the triedb partition's PARTUUID to the
   # /dev/triedb symlink so it survives reboot regardless of disk enumeration.
   # https://docs.monad.xyz/node-ops/full-node-installation (TrieDB section)
+  # Accept a rule under any filename in /etc/udev/rules.d — pinning the name to 99-triedb.rules
+  # produced a false WARN for an equivalent rule written as e.g. 70-triedb.rules.
   local rule=/etc/udev/rules.d/99-triedb.rules
+  if [[ ! -f "$rule" ]]; then
+    local alt
+    alt=$(grep -rlE 'SYMLINK\+="?triedb"?' /etc/udev/rules.d/ 2>/dev/null | head -1)
+    [[ -n "$alt" ]] && rule="$alt"
+  fi
   if [[ -f "$rule" ]]; then
     if grep -qE 'SYMLINK\+="?triedb"?' "$rule" 2>/dev/null; then
-      emit monad "monad.triedb-udev" PASS "$rule present with SYMLINK+=\"triedb\" rule"
+      # Presence of the rule is not enough: it must point at the partition that IS triedb.
+      # After replacing the NVMe or re-creating the partition (which this very tool recommends
+      # via `nvme format`), the PARTUUID changes and the stale rule silently stops producing
+      # /dev/triedb on the next boot — while the old check happily reported PASS.
+      local rule_uuid live_uuid
+      rule_uuid=$(grep -oE 'ID_PART_ENTRY_UUID\}?=="?[0-9a-fA-F-]+' "$rule" 2>/dev/null \
+                  | head -1 | grep -oE '[0-9a-fA-F-]{8,}')
+      live_uuid=""
+      if [[ -L /dev/triedb || -b /dev/triedb ]]; then
+        live_uuid=$(blkid -s PARTUUID -o value "$(readlink -f /dev/triedb)" 2>/dev/null)
+      fi
+      if [[ -z "$rule_uuid" ]]; then
+        emit monad "monad.triedb-udev" SKIP "$rule has SYMLINK+=\"triedb\" but no ID_PART_ENTRY_UUID — cannot verify it targets the right partition" \
+             $'Action:      blkid -s PARTUUID -o value $(readlink -f /dev/triedb)\n             ensure the rule matches that PARTUUID.'
+      elif [[ -z "$live_uuid" ]]; then
+        emit monad "monad.triedb-udev" SKIP "$rule targets PARTUUID ${rule_uuid} but /dev/triedb is absent — cannot cross-check" \
+             $'Why:         with no live device the rule cannot be validated; it may or may not fire on boot.'
+      elif [[ "${rule_uuid,,}" == "${live_uuid,,}" ]]; then
+        emit monad "monad.triedb-udev" PASS "$rule pins PARTUUID ${live_uuid} → matches the live /dev/triedb"
+      else
+        emit monad "monad.triedb-udev" FAIL "$rule pins PARTUUID ${rule_uuid}, but /dev/triedb is ${live_uuid} — /dev/triedb will NOT reappear after reboot" \
+             $'Quick fix:   sudo sed -i "s/${rule_uuid}/${live_uuid}/" '"$rule"$'\n             sudo udevadm control --reload && sudo udevadm trigger\nVerify:      ls -l /dev/triedb ; and re-check after the next reboot\nWhy:         the rule points at a partition that no longer exists (disk replaced or\n             re-partitioned); the node will fail to start with no triedb device.'
+      fi
     else
       emit monad "monad.triedb-udev" WARN "$rule exists but no SYMLINK+=\"triedb\" entry — /dev/triedb may not appear on reboot" \
            $'Action:      Find the triedb partition PARTUUID: blkid -s PARTUUID -o value /dev/<part>\n             Write the rule:\n               ENV{ID_PART_ENTRY_UUID}=="<PARTUUID>", MODE="0666", SYMLINK+="triedb"\n             to /etc/udev/rules.d/99-triedb.rules\n             udevadm control --reload && udevadm trigger\nVerify:      ls -l /dev/triedb   # after reboot too\nWhy:         disk enumeration is not stable across reboots; udev SYMLINK pins\n             /dev/triedb to a specific partition by PARTUUID.'
@@ -1278,7 +1464,7 @@ check_monad_install() {
   # Auth UDP check — wireauth log entries (DEBUG level, may need broader scan)
   if systemctl is-active --quiet monad-bft 2>/dev/null; then
     # Scan last 500 lines instead of time-based — DEBUG messages may be rotated
-    if journalctl -u monad-bft -n 500 --no-pager 2>/dev/null | grep -q monad_wireauth; then
+    if journalctl -u monad-bft --since "-10min" -n 200000 --no-pager 2>/dev/null | grep -q monad_wireauth; then
       emit monad "monad.authudp" PASS "Auth UDP active (wireauth sessions in logs)"
     else
       emit monad "monad.authudp" WARN "no wireauth log entries — Auth UDP may not be active or DEBUG logs disabled" \
@@ -1323,7 +1509,7 @@ check_authudp_peers() {
   fi
   # remote_addr may be IPv4 ("1.2.3.4:port") or IPv6 ("[::1]:port"). Match both.
   local peers
-  peers=$(journalctl -u monad-bft -n 2000 --no-pager 2>/dev/null \
+  peers=$(journalctl -u monad-bft --since "-10min" -n 200000 --no-pager 2>/dev/null \
     | grep 'sending keepalive packet' \
     | grep -oE 'remote_addr":"[^"]+' \
     | sort -u | wc -l)
@@ -1514,7 +1700,11 @@ print_summary() {
   printf "  ${C_GREEN}PASS${C_RESET}: %d   " "$COUNT_PASS"
   printf "${C_YELLOW}WARN${C_RESET}: %d   " "$COUNT_WARN"
   printf "${C_RED}FAIL${C_RESET}: %d   " "$COUNT_FAIL"
-  printf "${C_BLUE}INFO${C_RESET}: %d\n" "$COUNT_INFO"
+  printf "${C_BLUE}INFO${C_RESET}: %d   " "$COUNT_INFO"
+  printf "${C_YELLOW}SKIP${C_RESET}: %d\n" "$COUNT_SKIP"
+  if (( COUNT_SKIP > 0 )); then
+    printf "  ${C_YELLOW}%d check(s) did NOT run${C_RESET} — a SKIP is not a pass. Review them above.\n" "$COUNT_SKIP"
+  fi
   echo
 
   if (( COUNT_FAIL > 0 )); then
