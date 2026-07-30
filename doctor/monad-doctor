@@ -50,7 +50,11 @@ SYSTEM_FILE_MAX_MIN=${SYSTEM_FILE_MAX_MIN:-65536}  # system-wide fs.file-max cap
 #    – v6.8.0.59-generic (inclusive) that causes Monad clients to hang."
 KERNEL_MIN=${KERNEL_MIN:-6.8.0}
 KERNEL_MIN_PATCH=${KERNEL_MIN_PATCH:-60}      # apt name: 6.8.0-60-generic
-KERNEL_BUGGY_PATCHES=${KERNEL_BUGGY_PATCHES:-"56 57 58 59"}
+# 56-59: Monad client hangs. 136: monad-bft fails to start with
+# "failed to create buffer ring: Os { code: 22 }" — docs recommend 6.8.0.134 and an apt pin.
+# 136 was missing here, so a host that auto-upgraded into it got a green kernel check and
+# a node that would not come back after the next reboot.
+KERNEL_BUGGY_PATCHES=${KERNEL_BUGGY_PATCHES:-"56 57 58 59 136"}
 # Ubuntu 24.04+ required (apt repo only ships 'noble' suite per docs).
 UBUNTU_VERSION_MIN=${UBUNTU_VERSION_MIN:-24.04}
 # 8000 = TCP+UDP P2P, 8001 = UDP-only Auth UDP per docs.
@@ -693,6 +697,31 @@ kernel_upgrade_tip() {
     printf '%s\n' \
       "Action:      Reinstall with Ubuntu ${UBUNTU_VERSION_MIN}+ — HWE on older releases does not reach ${KERNEL_MIN}-${KERNEL_MIN_PATCH}." \
       "Why:         apt repo is noble-only and docs target the noble HWE stack."
+  fi
+}
+
+# Is 6.8.0-136 actually blocked? The presence of a file in preferences.d proves nothing: apt
+# IGNORES names containing a dot unless the extension is .pref, so the filename the MF docs
+# suggest (block-kernel-6.8.0-136) is silently inert. Verified by experiment — with a dotted name
+# the candidate stays installable, with .pref it becomes (none). One of our own nodes ran for
+# weeks with an ineffective pin and unattended-upgrades enabled: one reboot from a dead node.
+check_kernel_pin() {
+  if ! require_cmd apt-cache; then
+    emit os "kernel.pin" SKIP "apt-cache unavailable — 6.8.0-136 pin NOT verified"
+    return
+  fi
+  local cand
+  cand=$(apt-cache policy linux-image-6.8.0-136-generic 2>/dev/null | awk '/Candidate:/ {print $2}')
+  local fix
+  fix=$'Quick fix:   sudo tee /etc/apt/preferences.d/block-kernel-136.pref <<\'EOF\'\n             Package: linux-image-6.8.0-136-generic linux-headers-6.8.0-136-generic linux-modules-6.8.0-136-generic linux-modules-extra-6.8.0-136-generic\n             Pin: release *\n             Pin-Priority: -1\n             EOF\nVerify:      apt-cache policy linux-image-6.8.0-136-generic   # expect Candidate: (none)\nNote:        the filename MUST end in .pref — apt ignores dotted names such as\n             block-kernel-6.8.0-136, which is the name the MF docs suggest.\nWhy:         monad-bft does not start on 6.8.0-136 ("failed to create buffer ring:\n             Os { code: 22 }"), so the node will not come back after the next reboot.'
+  if [[ -z "$cand" ]]; then
+    emit os "kernel.pin" SKIP "could not query linux-image-6.8.0-136-generic — pin NOT verified"
+  elif [[ "$cand" == "(none)" ]]; then
+    emit os "kernel.pin" PASS "kernel 6.8.0-136 pinned out (apt offers no candidate)"
+  elif systemctl is-active --quiet unattended-upgrades 2>/dev/null; then
+    emit os "kernel.pin" FAIL "kernel 6.8.0-136 is installable ($cand) AND unattended-upgrades is active" "$fix"
+  else
+    emit os "kernel.pin" WARN "kernel 6.8.0-136 is installable ($cand) — pin it before enabling unattended upgrades" "$fix"
   fi
 }
 
@@ -1664,7 +1693,7 @@ run_section() {
 main() {
   header
   run_section hardware  check_baremetal check_cpu check_ram check_disks check_iops
-  run_section os        check_os check_kernel check_ulimits check_sysctl check_ntp
+  run_section os        check_os check_kernel check_kernel_pin check_ulimits check_sysctl check_ntp
   run_section network   check_public_ip check_bandwidth check_ports_free check_firewall
   run_section security  check_ssh_hardening check_unattended_upgrades check_fail2ban \
                         check_rpc_exposure check_iptables_udp_filter check_cve_2026_31431 \

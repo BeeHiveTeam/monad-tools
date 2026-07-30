@@ -814,8 +814,45 @@ EOF
       return 1
     fi
     info "Using --triedb-partition=$target (operator-specified)"
-    warn "Auto-scan safety checks are BYPASSED for an explicitly named disk. Current layout:"
-    lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT "/dev/$target" 2>/dev/null | sed 's/^/    /' >&2
+    # HARD REFUSAL for the catastrophic cases. Naming a disk explicitly used to bypass every
+    # safety criterion the auto-scan applies, leaving only the `-b` test. A one-character typo
+    # is enough — and the layouts are adjacent (nvme0n1/nvme1n1, and on our second node they
+    # are swapped relative to this one) — sending `nvme format --lbaf=0 --force` and
+    # `parted mklabel gpt` at the live OS disk.
+    # The flag legitimately exists for disks the scan rejects (leftover partitions, stale
+    # filesystem signatures), so those stay allowed behind confirmation; hosting the OS or
+    # carrying an active mount never is.
+    local _root_src _root_dev
+    _root_src=$(findmnt -no SOURCE / 2>/dev/null)
+    _root_dev="${_root_src##*/}"
+    if lsblk -ln -o MOUNTPOINT "/dev/$target" 2>/dev/null | grep -qx "/"; then
+      err "--triedb-partition=$target hosts the root filesystem. Refusing."
+      return 1
+    fi
+    if [[ -n "$_root_dev" && -e "/sys/block/$_root_dev/md" ]]; then
+      local _m
+      while IFS= read -r _m; do
+        if lsblk -ln -o NAME "/dev/$target" 2>/dev/null | grep -qx "$_m"; then
+          err "--triedb-partition=$target is a member of the root RAID array ($_root_dev). Refusing."
+          return 1
+        fi
+      done < <(ls "/sys/block/$_root_dev/md/" 2>/dev/null | sed -n 's/^dev-//p')
+    fi
+    local _mnts
+    _mnts=$(lsblk -ln -o MOUNTPOINT "/dev/$target" 2>/dev/null | grep -vE '^$' | tr '\n' ' ')
+    if [[ -n "$_mnts" ]]; then
+      err "--triedb-partition=$target has active mounts: $_mnts"
+      err "Unmount them first if this disk really is the intended target. Refusing."
+      return 1
+    fi
+    # Non-fatal, but it must be visible: print to STDOUT, not stderr as before, so the layout
+    # actually shows up in CI logs where the operator would notice a wrong disk.
+    if lsblk -ln -o FSTYPE "/dev/$target" 2>/dev/null | grep -vE '^$' | grep -q .; then
+      warn "$target carries filesystem signatures — they will be DESTROYED:"
+    else
+      info "Target layout:"
+    fi
+    lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT "/dev/$target" 2>/dev/null | sed 's/^/    /'
   elif (( ${#candidates[@]} == 0 )); then
     info "No free NVMe disks found (all are in OS RAID / mounted / partitioned / carry a filesystem)"
     info "If you want to partition a specific disk anyway, pass --triedb-partition=DEV"
@@ -2467,6 +2504,46 @@ ACTION==\"add|change\", SUBSYSTEM==\"block\", KERNEL==\"nvme*\", \\
 # reboot mid-block-proposal misses votes).
 step_cve_mitigation() {
   section "Security mitigations (Foundation advisory)"
+
+  # Block the kernel this node cannot run on. docs.monad.xyz/node-ops/full-node-installation:
+  # "Linux Kernel >= 6.8.0.60 and not 6.8.0.136" — on 6.8.0.136 monad-bft dies at start with
+  #   failed to create buffer ring: Os { code: 22, kind: InvalidInput }
+  # and the docs prescribe this exact apt pin. The installer never wrote it while deliberately
+  # leaving unattended-upgrades enabled below, so a host would quietly pull 136 and fail to come
+  # back after the next reboot. Idempotent: same content is simply rewritten.
+  # NOTE the .pref extension. apt IGNORES files in preferences.d whose name contains a dot
+  # unless the extension is .pref — so the filename the MF docs suggest
+  # (block-kernel-6.8.0-136) is silently inert. Verified: with a dotted name the candidate
+  # stays installable; with .pref it becomes (none). One of our own nodes was running with
+  # an ineffective pin and unattended-upgrades enabled.
+  local kpin=/etc/apt/preferences.d/block-kernel-136.pref
+  if (( DRY_RUN )); then
+    echo "  ${C_DIM}[dry-run] write $kpin (block linux-image-6.8.0-136-generic)${C_RESET}"
+  else
+    cat > "$kpin" <<'PIN'
+# Written by monad-validator-setup — see docs.monad.xyz/node-ops/full-node-installation
+# monad-bft fails to start on 6.8.0-136-generic:
+#   failed to create buffer ring: Os { code: 22, kind: InvalidInput }
+# Recommended kernel: 6.8.0-134-generic
+Package: linux-image-6.8.0-136-generic linux-headers-6.8.0-136-generic linux-modules-6.8.0-136-generic linux-modules-extra-6.8.0-136-generic
+Pin: release *
+Pin-Priority: -1
+PIN
+    chmod 0644 "$kpin"
+    chmod 0644 "$kpin"
+    # Trust nothing: confirm apt actually honours it.
+    if apt-cache policy linux-image-6.8.0-136-generic 2>/dev/null | grep -qE 'Candidate:[[:space:]]*\(none\)'; then
+      ok "apt pin blocking kernel 6.8.0-136 is in effect ($kpin)"
+    else
+      warn "Wrote $kpin but apt still offers 6.8.0-136 — check for a conflicting pin."
+    fi
+  fi
+  local running_patch
+  running_patch=$(uname -r | sed -nE 's/^[0-9]+\.[0-9]+\.[0-9]+-([0-9]+).*/\1/p')
+  if [[ "$running_patch" == "136" ]]; then
+    warn "This host is RUNNING 6.8.0-136 — monad-bft will not start on it."
+    warn "  Install 6.8.0-134-generic and reboot into it before starting the node."
+  fi
 
   # algif_aead blacklist — idempotent, harmless if already present.
   local conf=/etc/modprobe.d/blacklist-algif_aead.conf
