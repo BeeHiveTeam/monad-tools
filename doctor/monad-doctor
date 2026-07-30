@@ -446,10 +446,19 @@ check_disks() {
     [[ -z "$triedb_disk_for_lba" ]] && triedb_disk_for_lba=$(basename "${triedb_real:-}")
   fi
   if [[ -z "$triedb_disk_for_lba" ]]; then
-    emit hardware "disk.lba"   SKIP "could not resolve the disk behind /dev/triedb — LBA size NOT verified" \
-         $'Action:      ls -l /dev/triedb ; lsblk -o NAME,PKNAME,TYPE\nWhy:         docs require the triedb drive to use 512-byte LBA; this check could not run.'
-    emit hardware "disk.sched" SKIP "could not resolve the disk behind /dev/triedb — IO scheduler NOT verified" \
-         $'Action:      cat /sys/block/<triedb-disk>/queue/scheduler   # expect mq-deadline'
+    # No /dev/triedb at all is the NORMAL pre-install state — this is a pre-flight tool, and
+    # the device is created during installation. Reporting it as "a check did not run" turned
+    # every greenfield run into 2 spurious SKIPs. SKIP is reserved for the genuinely ambiguous
+    # case: the device exists but we cannot resolve which disk backs it.
+    if [[ ! -e /dev/triedb ]]; then
+      emit hardware "disk.lba"   INFO "/dev/triedb not present — LBA check applies after installation"
+      emit hardware "disk.sched" INFO "/dev/triedb not present — IO scheduler check applies after installation"
+    else
+      emit hardware "disk.lba"   SKIP "/dev/triedb exists but its backing disk could not be resolved — LBA size NOT verified" \
+           $'Action:      ls -l /dev/triedb ; lsblk -o NAME,PKNAME,TYPE'
+      emit hardware "disk.sched" SKIP "/dev/triedb exists but its backing disk could not be resolved — IO scheduler NOT verified" \
+           $'Action:      cat /sys/block/<triedb-disk>/queue/scheduler   # expect mq-deadline'
+    fi
   fi
   while IFS=$'\t' read -r dev _ role _; do
     [[ -z "$dev" ]] && continue
@@ -715,7 +724,9 @@ check_kernel_pin() {
   local fix
   fix=$'Quick fix:   sudo tee /etc/apt/preferences.d/block-kernel-136.pref <<\'EOF\'\n             Package: linux-image-6.8.0-136-generic linux-headers-6.8.0-136-generic linux-modules-6.8.0-136-generic linux-modules-extra-6.8.0-136-generic\n             Pin: release *\n             Pin-Priority: -1\n             EOF\nVerify:      apt-cache policy linux-image-6.8.0-136-generic   # expect Candidate: (none)\nNote:        the filename MUST end in .pref — apt ignores dotted names such as\n             block-kernel-6.8.0-136, which is the name the MF docs suggest.\nWhy:         monad-bft does not start on 6.8.0-136 ("failed to create buffer ring:\n             Os { code: 22 }"), so the node will not come back after the next reboot.'
   if [[ -z "$cand" ]]; then
-    emit os "kernel.pin" SKIP "could not query linux-image-6.8.0-136-generic — pin NOT verified"
+    # apt knows nothing about the package at all — wrong release (the 6.8 kernels are noble)
+    # or no index yet. Nothing to pin, so this is informational, not an unperformed check.
+    emit os "kernel.pin" INFO "linux-image-6.8.0-136-generic is not in the apt index — nothing to pin on this release"
   elif [[ "$cand" == "(none)" ]]; then
     emit os "kernel.pin" PASS "kernel 6.8.0-136 pinned out (apt offers no candidate)"
   elif systemctl is-active --quiet unattended-upgrades 2>/dev/null; then
