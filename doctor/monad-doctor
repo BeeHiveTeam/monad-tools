@@ -729,6 +729,14 @@ check_kernel_pin() {
     emit os "kernel.pin" INFO "linux-image-6.8.0-136-generic is not in the apt index — nothing to pin on this release"
   elif [[ "$cand" == "(none)" ]]; then
     emit os "kernel.pin" PASS "kernel 6.8.0-136 pinned out (apt offers no candidate)"
+  elif ! _monad_pkg_installed; then
+    # PRE-INSTALL: the installer writes this pin itself, in step_cve_mitigation. But that step
+    # runs AFTER step_preflight, so returning FAIL here made the doctor exit 2, which
+    # step_preflight turns into a fatal under --non-interactive — the installer refused to run
+    # because of a condition only the installer could fix. A deadlock on stock Ubuntu 24.04,
+    # where the package is installable and unattended-upgrades is on by default.
+    # Same convention as check_unattended_upgrades: inform before install, judge after.
+    emit os "kernel.pin" INFO "kernel 6.8.0-136 is installable ($cand) — monad-validator-setup → step_cve_mitigation writes the pin on install"
   elif systemctl is-active --quiet unattended-upgrades 2>/dev/null; then
     emit os "kernel.pin" FAIL "kernel 6.8.0-136 is installable ($cand) AND unattended-upgrades is active" "$fix"
   else
@@ -745,6 +753,15 @@ check_kernel() {
 
   # Reject buggy 6.8.0-{56..59} range explicitly (docs cite this hang bug)
   if [[ "$base" == "6.8.0" && -n "$patch" ]]; then
+    # 136 needs its OWN advice: the generic kernel_upgrade_tip suggests linux-generic-hwe-24.04,
+    # which on noble pulls the newest generic — i.e. 6.8.0-136 itself — so the "fix" leaves the
+    # host on the broken kernel, and its Verify step (uname -r >= 6.8.0-60) passes there too.
+    # The symptom differs as well: 136 does not hang, monad-bft refuses to start.
+    if [[ "$patch" == "136" ]]; then
+      emit os "kernel.version"  FAIL "kernel $full — monad-bft will not start on 6.8.0-136 (failed to create buffer ring: Os { code: 22 })" \
+           $'Quick fix:   sudo apt install -y linux-image-6.8.0-134-generic linux-headers-6.8.0-134-generic\n             sudo tee /etc/apt/preferences.d/block-kernel-136.pref <<EOF\n             Package: linux-image-6.8.0-136-generic linux-headers-6.8.0-136-generic linux-modules-6.8.0-136-generic linux-modules-extra-6.8.0-136-generic\n             Pin: release *\n             Pin-Priority: -1\n             EOF\n             sudo reboot   # into 6.8.0-134\nVerify:      uname -r   # expect 6.8.0-134-generic, NOT 136\nWhy:         docs.monad.xyz recommends 6.8.0.134 and pinning 136 out. Do NOT install\n             linux-generic-hwe-24.04 here — on noble it pulls 136 straight back.'
+      return
+    fi
     for bad in $KERNEL_BUGGY_PATCHES; do
       if [[ "$patch" == "$bad" ]]; then
         emit os "kernel.version"  FAIL "kernel $full — known buggy range 6.8.0-${KERNEL_BUGGY_PATCHES// /,} (causes Monad client hangs)" \

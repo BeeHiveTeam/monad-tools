@@ -70,6 +70,8 @@ WITH_TRIEDB_FORMAT=0        # if 1, systemctl start monad-mpt (one-shot triedb f
 WITH_SNAPSHOT_RESTORE=1     # default ON per docs full-node-installation step 15; use --no-snapshot-restore to skip
 WITH_SNAPSHOT_RESTORE_EXPLICIT=0   # set if --snapshot-restore or --no-snapshot-restore was passed
 ALLOW_NVME_REFORMAT=0       # if 1, --non-interactive may invoke nvme format --lbaf=0
+MPT_PROBE_TIMEOUT=${MPT_PROBE_TIMEOUT:-180}  # seconds; opening a large populated triedb is slow,
+                            # and a timeout must never be read as "device is empty"
 ALLOW_TEMPLATE_REPLACE=0    # if 1, --non-interactive may overwrite an existing node.toml
 ALLOW_TRIEDB_WIPE=0        # if 1, --non-interactive may partition the triedb disk (destructive).
                             # Without it confirm_destructive always refuses under
@@ -852,6 +854,17 @@ EOF
     fi
     # Non-fatal, but it must be visible: print to STDOUT, not stderr as before, so the layout
     # actually shows up in CI logs where the operator would notice a wrong disk.
+    # A live triedb has neither FSTYPE nor a mountpoint, so it passes every hard refusal above
+    # and used to get the quietest possible message. Refuse it outright: a partition labelled
+    # "triedb" on the target is the node's database.
+    if lsblk -ln -o PARTLABEL "/dev/$target" 2>/dev/null | grep -qx "triedb"; then
+      err "--triedb-partition=$target already carries a partition labelled 'triedb' — that is a node database."
+      err "Re-partitioning it destroys the chain state. Refusing; wipe it deliberately if that is the intent."
+      return 1
+    fi
+    # Keep the bypass warning unconditional: the new hard refusals cover the OS disk, not the
+    # broader class of "this disk has something on it".
+    warn "Auto-scan safety checks are BYPASSED for an explicitly named disk."
     if lsblk -ln -o FSTYPE "/dev/$target" 2>/dev/null | grep -vE '^$' | grep -q .; then
       warn "$target carries filesystem signatures — they will be DESTROYED:"
     else
@@ -1724,11 +1737,21 @@ step_snapshot_restore() {
     # POPULATED. On a greenfield install that skipped the documented snapshot restore entirely
     # and left the node syncing from genesis.
     local mpt_out="" mpt_rc=0
-    mpt_out=$(timeout 60 monad-mpt --storage /dev/triedb 2>&1) || mpt_rc=$?
+    mpt_out=$(timeout "$MPT_PROBE_TIMEOUT" monad-mpt --storage /dev/triedb 2>&1) || mpt_rc=$?
     local fin=""
     fin=$(grep -oE 'Latest finalized is [0-9]+' <<<"$mpt_out" | grep -oE '[0-9]+' | head -1)
-    if (( mpt_rc != 0 )) || grep -q FATAL <<<"$mpt_out"; then
+    # A TIMEOUT is not evidence of an empty device — quite the opposite: opening a large,
+    # populated mainnet triedb is exactly what takes a long time. Treating rc=124 as
+    # "uninitialised" would skip the protective gate below, and the second probe further down
+    # (which has the same timeout now) could then truncate a fully synced database. Fail safe.
+    if (( mpt_rc == 124 )); then
+      warn "monad-mpt timed out after ${MPT_PROBE_TIMEOUT}s — assuming POPULATED to avoid wiping data."
+      triedb_populated=1
+    elif (( mpt_rc != 0 )) && grep -qE 'FATAL|has not been initialised' <<<"$mpt_out"; then
       info "triedb is not initialised yet (monad-mpt rc=${mpt_rc}) — snapshot restore applies."
+    elif (( mpt_rc != 0 )); then
+      warn "monad-mpt failed (rc=${mpt_rc}) without saying the device is uninitialised — assuming POPULATED."
+      triedb_populated=1
     elif [[ -n "$fin" ]] && (( fin > 0 )); then
       triedb_populated=1
       info "triedb reports a populated database (latest finalized ${fin})."
@@ -1830,12 +1853,19 @@ step_snapshot_restore() {
     err "Failed to download $snap_url — nothing destroyed, triedb is untouched."
     err "Check connectivity to the bucket and re-run."
     rm -f "$snap_script"
+    # We stopped the node above; a failed download must not leave it down.
+    if (( services_were_active )); then
+      run "restarting services" systemctl start monad-bft monad-execution monad-rpc || true
+    fi
     return 1
   fi
   if [[ ! -s "$snap_script" ]] || ! head -1 "$snap_script" | grep -qE '^#!|^#|^set '; then
     err "Downloaded snapshot script looks wrong (empty or not a shell script) — triedb untouched:"
     head -3 "$snap_script" | sed 's/^/    /' >&2
     rm -f "$snap_script"
+    if (( services_were_active )); then
+      run "restarting services" systemctl start monad-bft monad-execution monad-rpc || true
+    fi
     return 1
   fi
 
@@ -1844,8 +1874,18 @@ step_snapshot_restore() {
     # with exit 0; an uninitialized device errors non-zero), with the FATAL
     # string as a fallback — grepping stdout alone was fragile against the
     # tool's wording. Either signal → skip truncate and let MF restore --create.
-    mpt_probe=$(monad-mpt --storage /dev/triedb 2>&1); mpt_rc=$?
-    if (( mpt_rc != 0 )) || grep -q FATAL <<<"$mpt_probe"; then
+    # Same timeout as the probe above: two probes of the same device with different timeouts
+    # could disagree, and the disagreement is precisely what would let a truncate through.
+    mpt_probe=$(timeout "$MPT_PROBE_TIMEOUT" monad-mpt --storage /dev/triedb 2>&1); mpt_rc=$?
+    if (( mpt_rc == 124 )); then
+      err "monad-mpt timed out probing /dev/triedb — refusing to truncate a device we cannot read."
+      rm -f "$snap_script"
+      if (( services_were_active )); then
+        run "restarting services" systemctl start monad-bft monad-execution monad-rpc || true
+      fi
+      return 1
+    fi
+    if (( mpt_rc != 0 )) && grep -qE 'FATAL|has not been initialised' <<<"$mpt_probe"; then
       info "triedb not yet initialized — MF restore will --create it."
     else
       info "Truncating existing triedb before snapshot import (prevents 'database must be hard reset')…"
@@ -2296,7 +2336,14 @@ step_config_files() {
       existing_type="full"
     fi
     if [[ -z "$existing_type" ]]; then
-      info "node.toml template type is not conclusive (max_num_peers=${_peers:-?}) — leaving it untouched."
+      # Loud, not quiet: a tuned max_num_peers makes the type inconclusive, which skips the whole
+      # replace branch — including the documented full→validator promotion. Reporting that as
+      # info let the run finish "successfully" while the operator believed they had been
+      # promoted and the old template was still on disk.
+      warn "Cannot determine the node.toml template type (max_num_peers=${_peers:-?}, beneficiary=${_ben:-?})."
+      warn "  Leaving node.toml untouched — NO template swap, NO role transition."
+      warn "  If you intended to promote/demote, edit node.toml by hand or pass --allow-template-replace"
+      warn "  after verifying the file is the one you expect."
     fi
   fi
 
@@ -2587,7 +2634,6 @@ Package: linux-image-6.8.0-136-generic linux-headers-6.8.0-136-generic linux-mod
 Pin: release *
 Pin-Priority: -1
 PIN
-    chmod 0644 "$kpin"
     chmod 0644 "$kpin"
     # Trust nothing: confirm apt actually honours it.
     if apt-cache policy linux-image-6.8.0-136-generic 2>/dev/null | grep -qE 'Candidate:[[:space:]]*\(none\)'; then
