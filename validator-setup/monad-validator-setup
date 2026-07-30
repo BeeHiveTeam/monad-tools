@@ -1666,11 +1666,28 @@ step_snapshot_restore() {
   # If services are running, stop them — restoring under a live node would
   # corrupt state. Remember we did this so step_start_services later starts
   # them back up.
+  # Check ALL THREE units, not just monad-bft. They are independent, and the classic failure
+  # state is "bft crashed, execution still running" — in which case this saw nothing active,
+  # stopped nothing, and then ran `monad-mpt --truncate --yes` while monad-execution still held
+  # the device open.
   local services_were_active=0
-  if systemctl is-active --quiet monad-bft 2>/dev/null; then
+  local _svc _running=""
+  for _svc in monad-bft monad-execution monad-rpc; do
+    systemctl is-active --quiet "$_svc" 2>/dev/null && _running+="$_svc "
+  done
+  if [[ -n "$_running" ]]; then
     services_were_active=1
-    warn "monad-bft is active — stopping services for snapshot restore"
+    warn "Active services (${_running% }) — stopping them for snapshot restore"
     run "stopping services" systemctl stop monad-bft monad-execution monad-rpc || true
+    # Confirm nothing still holds /dev/triedb before we truncate it.
+    local _still=""
+    for _svc in monad-bft monad-execution monad-rpc; do
+      systemctl is-active --quiet "$_svc" 2>/dev/null && _still+="$_svc "
+    done
+    if [[ -n "$_still" ]]; then
+      err "Could not stop: ${_still% } — refusing to truncate triedb while it may be in use."
+      return 1
+    fi
   fi
 
   # Skip if ledger already has data AND no role transition AND the operator
@@ -1797,6 +1814,31 @@ step_snapshot_restore() {
   # triedb lives on the raw /dev/triedb partition. monad-mpt --truncate is the
   # documented hard-reset for the DB. We only reach here after the operator has
   # confirmed the (destructive) restore, so truncating is the intended action.
+  # DOWNLOAD AND VALIDATE BEFORE TRUNCATING. The truncate used to run first, so a DNS failure,
+  # a 503 from the bucket or a --max-time cut left the operator with an empty triedb and no
+  # snapshot — the code even admitted it ("triedb has already been truncated"). Fetching first
+  # costs nothing and closes that window entirely.
+  # Download to a file, THEN execute. `curl … | bash` here had no -f (so an HTTP 404/503
+  # error page was piped into bash) and no pipefail (so curl's exit code was discarded and only
+  # bash's was checked). A transfer cut short by --max-time could deliver a syntactically valid
+  # PREFIX of the script, which would run partially and exit 0 — and this happens AFTER
+  # `monad-mpt --truncate`, i.e. with the database already wiped, while reporting
+  # "Snapshot restore completed". Same download-then-run pattern as the VDP step already uses.
+  local snap_script="/tmp/monad-restore-from-snapshot-$$.sh"
+  info "Fetching $snap_url …"
+  if ! curl -fsSL --max-time 120 -o "$snap_script" "$snap_url"; then
+    err "Failed to download $snap_url — nothing destroyed, triedb is untouched."
+    err "Check connectivity to the bucket and re-run."
+    rm -f "$snap_script"
+    return 1
+  fi
+  if [[ ! -s "$snap_script" ]] || ! head -1 "$snap_script" | grep -qE '^#!|^#|^set '; then
+    err "Downloaded snapshot script looks wrong (empty or not a shell script) — triedb untouched:"
+    head -3 "$snap_script" | sed 's/^/    /' >&2
+    rm -f "$snap_script"
+    return 1
+  fi
+
   if [[ -e /dev/triedb ]] && command -v monad-mpt >/dev/null 2>&1; then
     # Decide "uninitialized" by EXIT CODE first (monad-mpt opens an existing DB
     # with exit 0; an uninitialized device errors non-zero), with the FATAL
@@ -1809,33 +1851,13 @@ step_snapshot_restore() {
       info "Truncating existing triedb before snapshot import (prevents 'database must be hard reset')…"
       if ! run "truncating triedb" monad-mpt --storage /dev/triedb --truncate --yes; then
         err "monad-mpt --truncate failed — aborting restore to avoid a half-imported DB."
+        rm -f "$snap_script"
         if (( services_were_active )); then
           run "restarting services" systemctl start monad-bft monad-execution monad-rpc || true
         fi
         return 1
       fi
     fi
-  fi
-
-  # Download to a file first, THEN execute. `curl … | bash` here had no -f (so an HTTP 404/503
-  # error page was piped into bash) and no pipefail (so curl's exit code was discarded and only
-  # bash's was checked). A transfer cut short by --max-time could deliver a syntactically valid
-  # PREFIX of the script, which would run partially and exit 0 — and this happens AFTER
-  # `monad-mpt --truncate`, i.e. with the database already wiped, while reporting
-  # "Snapshot restore completed". Same download-then-run pattern as the VDP step already uses.
-  local snap_script="/tmp/monad-restore-from-snapshot-$$.sh"
-  info "Fetching $snap_url …"
-  if ! curl -fsSL --max-time 120 -o "$snap_script" "$snap_url"; then
-    err "Failed to download $snap_url — triedb has already been truncated."
-    err "Re-run this step (or apply the snapshot manually) before starting the node."
-    rm -f "$snap_script"
-    return 1
-  fi
-  if [[ ! -s "$snap_script" ]] || ! head -1 "$snap_script" | grep -qE '^#!|^#|^set '; then
-    err "Downloaded snapshot script looks wrong (empty or not a shell script):"
-    head -3 "$snap_script" | sed 's/^/    /' >&2
-    rm -f "$snap_script"
-    return 1
   fi
   info "Running $snap_script …"
   if ! bash "$snap_script"; then
@@ -2294,10 +2316,17 @@ step_config_files() {
     elif confirm_destructive "Replace node.toml with the ${NODE_TYPE} template? This DISCARDS local edits (peers, prometheus, round_span, node_name, name-record signature). Backup is created." "${ALLOW_TEMPLATE_REPLACE:-0}"; then
       # Stop services if running — replacing node.toml under a live node
       # would cause an immediate config-reload mid-flight.
+      # Same trap as the snapshot step: the three units are independent, so testing only
+      # monad-bft misses "bft crashed, execution still running" and rewrites node.toml under a
+      # live process.
       local services_were_active=0
-      if systemctl is-active --quiet monad-bft 2>/dev/null; then
+      local _svc _running=""
+      for _svc in monad-bft monad-execution monad-rpc; do
+        systemctl is-active --quiet "$_svc" 2>/dev/null && _running+="$_svc "
+      done
+      if [[ -n "$_running" ]]; then
         services_were_active=1
-        warn "Stopping monad-bft/execution/rpc before replacing node.toml…"
+        warn "Stopping active services (${_running% }) before replacing node.toml…"
         run "stopping services" systemctl stop monad-bft monad-execution monad-rpc || true
       fi
       cp -a "$node_toml" "${node_toml}.${existing_type}-backup.${TS}"
