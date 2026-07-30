@@ -9,6 +9,14 @@
 #   sudo ./monad-doctor --quick                # skip slow checks (fio IOPS)
 #   sudo ./monad-doctor --section hardware     # only one section
 #   sudo ./monad-doctor --no-color             # no ANSI colors
+#   sudo ./monad-doctor --mode fullnode        # validator | fullnode | auto (default)
+#
+# --mode affects the VDP checks only. The Validator Delegation Program applies to
+# validators, so a full node must not be FAILed for not pushing metrics to the
+# Foundation — and validator-setup installs a full node by default, which made that
+# false FAIL the default outcome. node.toml cannot tell the two apart
+# ([fullnode_raptorcast] and enable_publisher are present in validator templates too),
+# so this is declared, not guessed: undeclared yields WARN, never a silent pass.
 #
 # One-liner from internet:
 #   curl -fsSL https://raw.githubusercontent.com/BeeHiveTeam/monad-tools/main/doctor/monad-doctor | sudo bash
@@ -69,6 +77,13 @@ JSON_OUTPUT=0
 QUICK_MODE=0
 SECTION=""
 USE_COLOR=1
+# validator | fullnode | auto. Drives the VDP section only: the Validator Delegation Program
+# applies to validators, so demanding VDP compliance from a full node is a false FAIL — and
+# validator-setup installs a full node BY DEFAULT, so that was the default outcome.
+# There is no reliable signal for this in node.toml: [fullnode_raptorcast] and enable_publisher
+# appear in validator templates too (that is what broke the old detector, MT-2). So it is
+# operator-declared, with an explicit third state rather than a guess.
+NODE_MODE=${NODE_MODE:-auto}
 
 # Valid sections — keep in sync with run_section calls in main()
 VALID_SECTIONS=("hardware" "os" "network" "security" "monad")
@@ -78,6 +93,8 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --json)      JSON_OUTPUT=1 ;;
     --quick)     QUICK_MODE=1 ;;
+    --mode)      NODE_MODE="${2:-}"; shift ;;
+    --mode=*)    NODE_MODE="${1#*=}" ;;
     --section)   SECTION="${2:-}"; shift ;;
     --section=*) SECTION="${1#*=}" ;;
     --no-color)  USE_COLOR=0 ;;
@@ -88,6 +105,11 @@ while [[ $# -gt 0 ]]; do
   esac
   shift
 done
+
+case "$NODE_MODE" in
+  validator|fullnode|auto) ;;
+  *) echo "Unknown --mode '$NODE_MODE'. Valid: validator, fullnode, auto" >&2; exit 64 ;;
+esac
 
 # Validate --section if provided (catches typos like 'hardwear')
 if [[ -n "$SECTION" ]]; then
@@ -1611,7 +1633,7 @@ check_vdp_otel_collector() {
     fi
   done
   if [[ -z "$active" ]]; then
-    emit monad "vdp.otel-collector" FAIL "no active OTel collector — VDP requires metrics push to MF" \
+    emit monad "vdp.otel-collector" "$(_vdp_severity)" "no active OTel collector — VDP requires metrics push to MF$(_vdp_note)" \
          $'Quick fix:   sudo systemctl enable --now otelcol   # if already installed by `monad` pkg\nIf missing:  sudo apt install -y monad   # otelcol is bundled with the monad package\nVDP setup:   sudo ./monad-validator-setup --with-vdp-otel   # downloads & runs MF script\nVerify:      systemctl is-active otelcol && curl -s localhost:8888/metrics | head\nWhy:         VDP eligibility requires push of monad_* metrics to\n             otel-external.monadinfra.com:443. No collector → no metrics → excluded.'
     return
   fi
@@ -1647,6 +1669,27 @@ check_vdp_otel_version() {
   fi
 }
 
+# VDP checks apply to VALIDATORS. Full nodes are not in the Delegation Program, so a missing
+# OTel push is not a defect for them — but it IS one for a validator, and silently downgrading
+# it there would cost real VDP eligibility. Hence three outcomes, not two:
+#   validator -> FAIL (as before)
+#   fullnode  -> INFO (not applicable, does not touch the verdict)
+#   auto      -> WARN + tell the operator to declare the mode
+_vdp_severity() {
+  case "$NODE_MODE" in
+    validator) echo FAIL ;;
+    fullnode)  echo INFO ;;
+    *)         echo WARN ;;
+  esac
+}
+_vdp_note() {
+  case "$NODE_MODE" in
+    fullnode)  echo " (full node — VDP applies to validators only)" ;;
+    validator) echo "" ;;
+    *)         echo " (node mode undeclared — re-run with --mode validator|fullnode)" ;;
+  esac
+}
+
 check_vdp_secp_key_label() {
   # MF VDP compliance check: every monad_* metric served by local Prometheus
   # exporter on :8889 must carry a secp_key="<pubkey>" label so MF can identify
@@ -1665,7 +1708,7 @@ check_vdp_secp_key_label() {
   local secp
   secp=$(printf '%s\n' "$payload" | grep -oE 'secp_key="[0-9a-f]{2,}"' | head -1 | sed 's/secp_key="\([0-9a-f]*\)"/\1/')
   if [[ -z "$secp" ]]; then
-    emit monad "vdp.secp-key-label" FAIL "metrics on :8889 lack 'secp_key' label — NOT VDP-compliant" \
+    emit monad "vdp.secp-key-label" "$(_vdp_severity)" "metrics on :8889 lack 'secp_key' label — NOT VDP-compliant$(_vdp_note)" \
          "Run MF setup (testnet first): curl -fsSL -o /tmp/x.sh bucket.monadinfra.com/tmp/otel-validator-setup.sh && verify sha256 then sudo bash /tmp/x.sh"
     return
   fi
