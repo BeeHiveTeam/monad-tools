@@ -38,7 +38,22 @@ set -uo pipefail
 
 # ---- config (override via env) ----
 RPC="${RPC:-http://localhost:8080}"                   # local node RPC
-NET_RPC="${NET_RPC:-https://testnet-rpc.monad.xyz}"   # network head reference
+# Network head reference. Do NOT hardcode testnet: on a mainnet node a testnet reference either
+# spams "N blocks behind" forever (testnet ahead) or makes the lag detector silently dead
+# (testnet behind → GAP negative → threshold never trips). Resolve from the local chain_id
+# unless the operator pinned NET_RPC explicitly.
+chain_id_local() {
+  curl -s -m5 -X POST "$RPC" -H 'Content-Type: application/json' \
+    --data '{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}' 2>/dev/null \
+    | grep -oiE '"result":"0x[0-9a-f]+"' | grep -oiE '0x[0-9a-f]+'
+}
+if [ -z "${NET_RPC:-}" ]; then
+  case "$(chain_id_local)" in
+    0x279f|0x279F) NET_RPC="https://testnet-rpc.monad.xyz" ;;   # 10143 testnet
+    0x8f|0x8F)     NET_RPC="https://rpc.monad.xyz" ;;           # 143 mainnet
+    *)             NET_RPC="" ;;                                # unknown → gap check disabled below
+  esac
+fi
 OTEL="${OTEL:-http://127.0.0.1:8889/metrics}"         # LOCAL otelcol exporter (no Prometheus dep)
 SERVICES="${SERVICES:-monad-bft monad-execution monad-rpc}"
 
@@ -78,9 +93,14 @@ alert() {
 }
 
 rpc_block() {
+  # Empty endpoint (unknown chain) → no reference height, callers treat as "no data".
+  [ -n "$1" ] || return 0
+  # Extract the `result` field specifically and accept UPPERCASE hex: a proxy/CDN returning
+  # `0x2EF127F` used to match only `0x2` here, yielding LOCAL=2 and a bogus "frozen" verdict
+  # that restarted a perfectly healthy node.
   curl -s -m5 -X POST "$1" -H 'Content-Type: application/json' \
     --data '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' \
-    | grep -oE '0x[0-9a-f]+' | head -1
+    | sed -n 's/.*"result"[[:space:]]*:[[:space:]]*"\(0[xX][0-9a-fA-F]*\)".*/\1/p' | head -1
 }
 # read a single gauge value from the local otelcol exposition. The metric line
 # is `name{labels} value timestamp`, so anchor on name + `{` or space, then the
@@ -101,12 +121,24 @@ otel_gauge() {
 otel_transport_sessions() { otel_gauge 'monad_wireauth_udp_state_transport_sessions'; }
 
 # ---- validator safety gate (point 4) ----
+# FAIL-CLOSED: an unreadable / missing node.toml must NOT disable the gate. Previously the
+# whole block sat inside `&& [ -r "$NODE_TOML" ]`, so `chmod 700 /home/monad`, running from a
+# non-root cron, or MF moving the config path in a future release silently removed the
+# protection and the watchdog would restart an ACTIVE VALIDATOR — the exact thing this gate
+# exists to prevent. When we cannot tell, we assume validator and refuse to restart.
 GATE_BLOCK_RESTART=0
-if [ "$ALLOW_VALIDATOR_RESTART" != "1" ] && [ -r "$NODE_TOML" ]; then
-  BEN=$(grep -E '^\s*beneficiary' "$NODE_TOML" 2>/dev/null | grep -oiE '0x[0-9a-f]+' | head -1)
-  if [ -n "$BEN" ] && [ "$BEN" != "0x0000000000000000000000000000000000000000" ]; then
-    log "node.toml beneficiary=$BEN (non-burn) → looks like a VALIDATOR. Will NOT auto-restart."
-    log "  override with ALLOW_VALIDATOR_RESTART=1 (WARNING: restart in a proposal slot drops blocks)."
+if [ "$ALLOW_VALIDATOR_RESTART" != "1" ]; then
+  if [ -r "$NODE_TOML" ]; then
+    BEN=$(grep -E '^\s*beneficiary' "$NODE_TOML" 2>/dev/null | grep -oiE '0x[0-9a-f]+' | head -1)
+    if [ -n "$BEN" ] && [ "$BEN" != "0x0000000000000000000000000000000000000000" ]; then
+      log "node.toml beneficiary=$BEN (non-burn) → looks like a VALIDATOR. Will NOT auto-restart."
+      log "  override with ALLOW_VALIDATOR_RESTART=1 (WARNING: restart in a proposal slot drops blocks)."
+      GATE_BLOCK_RESTART=1
+    fi
+  else
+    log "ALERT: node.toml not readable at $NODE_TOML — cannot tell validator from full-node."
+    log "  Assuming VALIDATOR (fail-closed). Will NOT auto-restart."
+    log "  Fix the path/permissions, or set ALLOW_VALIDATOR_RESTART=1 if this is a full-node."
     GATE_BLOCK_RESTART=1
   fi
 fi
@@ -193,6 +225,10 @@ fi
 # ---- cooldown: restarted recently and STILL stuck → escalate, don't loop ----
 NOW=$(date +%s)
 LAST=$(cat "$COOLDOWN_FILE" 2>/dev/null || echo 0)
+# A truncated/empty cooldown file (write interrupted, disk full) used to make `$(( NOW - LAST ))`
+# an arithmetic error → empty substitution → the `-lt` test became a one-argument test that
+# succeeded → cooldown BYPASSED and the node restarted every 5 minutes.
+[[ "$LAST" =~ ^[0-9]+$ ]] || LAST=0
 if [ $(( NOW - LAST )) -lt "$RESTART_COOLDOWN" ]; then
   alert "still stuck $(( NOW - LAST ))s after a restart (gap=$GAP $SESS_CTX). Restart didn't recover — likely needs Hard Reset / snapshot restore. NOT auto-performing destructive recovery."
   exit 2
@@ -201,10 +237,30 @@ fi
 # ---- recovery: restart services ----
 log "ACTION: restarting services: $SERVICES"
 echo "$NOW" > "$COOLDOWN_FILE"
-if systemctl restart $SERVICES; then
-  alert "restarted [$SERVICES] — was frozen=$FROZEN gap=$GAP $SESS_CTX. Re-checking next run."
+# Restart unit-by-unit and skip units that do not exist on this host. A single missing unit
+# (e.g. a full-node without monad-rpc.service, or a build naming it differently) used to make
+# `systemctl restart $SERVICES` return non-zero even though the units that DO exist restarted
+# fine — reporting "manual intervention needed" for a successful recovery.
+RESTART_FAILED=""
+RESTART_DONE=""
+for s in $SERVICES; do
+  if ! systemctl cat "$s" >/dev/null 2>&1; then
+    log "  unit $s not present on this host — skipping"
+    continue
+  fi
+  if systemctl restart "$s"; then
+    RESTART_DONE="$RESTART_DONE $s"
+  else
+    RESTART_FAILED="$RESTART_FAILED $s"
+  fi
+done
+if [ -z "$RESTART_FAILED" ] && [ -n "$RESTART_DONE" ]; then
+  alert "restarted [${RESTART_DONE# }] — was frozen=$FROZEN gap=$GAP $SESS_CTX. Re-checking next run."
   exit 1
+elif [ -n "$RESTART_DONE" ]; then
+  alert "PARTIAL restart: ok [${RESTART_DONE# }], FAILED [${RESTART_FAILED# }] — check those units."
+  exit 2
 else
-  alert "systemctl restart FAILED for [$SERVICES] — manual intervention needed."
+  alert "systemctl restart FAILED for [${RESTART_FAILED# }] — manual intervention needed."
   exit 2
 fi
