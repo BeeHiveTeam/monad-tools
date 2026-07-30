@@ -1377,16 +1377,29 @@ step_sign_name_record() {
     warn "Detected '$pubip' doesn't look like an IPv4 address — discarding"
     pubip=""
   fi
+  # monad 0.15.2 replaced `--address <ip>:<port>` with separate --ip / --tcp-port /
+  # --udp-port (see docs.monad.xyz/node-ops/upgrade-instructions/v0.15.2). Older
+  # pinned versions (MONAD_PKG_VERSION=0.14.x) still expect --address, so ask the
+  # installed binary what it accepts instead of hardcoding either form.
+  local snr_help="" snr_addr_args=""
+  snr_help=$(monad-sign-name-record --help 2>&1 || true)
+  if grep -qE '(^|[[:space:]])--ip([[:space:]]|<|$)' <<<"$snr_help"; then
+    snr_addr_args="--ip PUBIP --tcp-port 8000 --udp-port 8000 --authenticated-udp-port 8001"
+  else
+    snr_addr_args="--address PUBIP:8000 --authenticated-udp-port 8001"
+  fi
+
   if [[ -z "$pubip" ]]; then
     err "Could not auto-detect public IP — skipping. Run manually:"
-    err "  monad-sign-name-record --address <YOUR_IP>:8000 --authenticated-udp-port 8001 \\"
+    err "  monad-sign-name-record ${snr_addr_args//PUBIP/<YOUR_IP>} \\"
     err "    --keystore-path /home/monad/monad-bft/config/id-secp \\"
     err "    --password \"\$KEYSTORE_PASSWORD\" --self-record-seq-num 1"
     return 1
   fi
+  snr_addr_args="${snr_addr_args//PUBIP/$pubip}"
 
   if (( DRY_RUN )); then
-    echo "  ${C_DIM}[dry-run] monad-sign-name-record --address ${pubip}:8000 ...${C_RESET}"
+    echo "  ${C_DIM}[dry-run] monad-sign-name-record ${snr_addr_args} ...${C_RESET}"
     return 0
   fi
 
@@ -1398,8 +1411,7 @@ step_sign_name_record() {
   if ! sig_output=$(bash -c "
     source /home/monad/.env
     monad-sign-name-record \
-      --address ${pubip}:8000 \
-      --authenticated-udp-port 8001 \
+      ${snr_addr_args} \
       --keystore-path /home/monad/monad-bft/config/id-secp \
       --password \"\$KEYSTORE_PASSWORD\" \
       --self-record-seq-num 1
@@ -2469,9 +2481,11 @@ EOF
 
   # Resolve final install target. Sources of truth, in priority order:
   #   1. MONAD_PKG_VERSION env (operator pinned explicitly)
-  #   2. GitHub releases/latest (Category Labs publishes stable tags there;
-  #      /releases/latest endpoint excludes pre-releases by design)
-  #   3. apt-cache candidate (fallback when GitHub unreachable) — BUT only
+  #   2. docs.monad.xyz/networks.json — MF's machine-readable PER-NETWORK target.
+  #      Since 0.15.x testnet and mainnet deliberately run different versions
+  #      (testnet 0.15.2 / mainnet 0.15.1), a network-agnostic "latest" is wrong.
+  #   3. GitHub releases/latest (network-agnostic; excludes pre-releases)
+  #   4. apt-cache candidate (fallback when both unreachable) — BUT only
   #      if it's not a pre-release suffix (~rc, ~beta, ~alpha, ~dev).
   #      apt's "Candidate" greedily picks the highest version including RCs;
   #      auto-installing an RC silently is a footgun.
@@ -2480,6 +2494,21 @@ EOF
     target_version="$MONAD_PKG_VERSION"
     info "Installing pinned version: monad=${target_version}"
   else
+    # --- 2. per-network target from MF ---
+    local net_target=""
+    if [[ -n "$NETWORK" ]] && command -v curl >/dev/null 2>&1; then
+      net_target=$(curl -fsS -m 5 -H 'User-Agent: BeeHive/monad-tools' \
+        https://docs.monad.xyz/networks.json 2>/dev/null \
+        | tr -d ' \n' \
+        | grep -oE "\"${NETWORK}\":\{\"monad_version\":\"[0-9]+\.[0-9]+\.[0-9]+[^\"]*\"" \
+        | grep -oE '[0-9]+\.[0-9]+\.[0-9]+[^"]*' | head -1)
+    fi
+    if [[ -n "$net_target" ]]; then
+      target_version="$net_target"
+      info "Target for ${C_BOLD}${NETWORK}${C_RESET} per docs.monad.xyz/networks.json: monad=${C_BOLD}${target_version}${C_RESET}"
+    fi
+
+    if [[ -z "$target_version" ]]; then
     local gh_latest=""
     if command -v curl >/dev/null 2>&1; then
       # GitHub API rejects unauthenticated requests without User-Agent with
@@ -2500,7 +2529,7 @@ EOF
       candidate=$(apt-cache policy monad 2>/dev/null | awk '/Candidate:/ {print $2; exit}')
       if [[ -z "$candidate" || "$candidate" == "(none)" ]]; then
         err "Could not determine a monad version to install."
-        err "Neither GitHub releases/latest nor apt-cache returned a usable version."
+        err "Neither networks.json, GitHub releases/latest nor apt-cache returned a usable version."
         err "Pin manually: MONAD_PKG_VERSION=X.Y.Z ./monad-validator-setup ..."
         return 1
       fi
@@ -2514,17 +2543,26 @@ EOF
       target_version="$candidate"
       info "Apt repo candidate: monad=${C_BOLD}${target_version}${C_RESET}"
     fi
+    fi
 
-    # Mainnet guard: the auto-detected version (GitHub releases/latest or apt
-    # candidate) is network-agnostic, but mainnet routinely runs a version
-    # BEHIND testnet — docs.monad.xyz pins different versions per network.
-    # Installing the global latest on mainnet can put the node ahead of the
-    # network. Only fires on the auto path (operator didn't pin a version).
-    if [[ "$NETWORK" == "mainnet" ]]; then
-      warn "Auto-detected monad=${target_version} for MAINNET."
+    # Mainnet guard: only needed when the version came from a NETWORK-AGNOSTIC
+    # source (GitHub releases/latest or apt candidate). Mainnet routinely runs a
+    # version BEHIND testnet, so installing the global latest can put the node
+    # ahead of the network. When networks.json already gave us the mainnet-
+    # specific target there is nothing to second-guess, so we skip the prompt.
+    # NOTE: confirm() auto-answers Yes under --non-interactive, so an unattended
+    # run must NOT be allowed to proceed on a guessed mainnet version — bail out
+    # explicitly and make the operator pin it.
+    if [[ "$NETWORK" == "mainnet" && -z "$net_target" ]]; then
+      warn "Auto-detected monad=${target_version} for MAINNET from a network-agnostic source."
       warn "Mainnet often lags testnet — verify ${target_version} matches the mainnet"
-      warn "version at docs.monad.xyz/node-ops/full-node-installation."
+      warn "version at docs.monad.xyz/networks.json."
       warn "To pin explicitly: MONAD_PKG_VERSION_MAINNET=X.Y.Z ./monad-validator-setup ..."
+      if (( NON_INTERACTIVE )); then
+        err "Refusing to auto-install a guessed version on MAINNET in --non-interactive mode."
+        err "Re-run with MONAD_PKG_VERSION_MAINNET=<correct mainnet version>."
+        return 1
+      fi
       if ! confirm "Proceed installing monad=${target_version} on mainnet?"; then
         err "Aborted. Re-run with MONAD_PKG_VERSION_MAINNET=<correct mainnet version>."
         return 1
