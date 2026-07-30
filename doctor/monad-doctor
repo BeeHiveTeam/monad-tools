@@ -1388,7 +1388,7 @@ check_github_release() {
   # Priority: docs.monad.xyz/networks.json (per-network, machine-readable) →
   # GitHub releases/latest (network-agnostic fallback).
   if ! command -v curl >/dev/null; then return; fi
-  local latest installed network net_target source
+  local latest="" installed="" network="" net_target="" source=""
   installed=$(dpkg-query -W -f='${Version}' monad 2>/dev/null || true)
   network=$(detect_network)
   if [[ -n "$network" ]]; then
