@@ -117,6 +117,8 @@ sudo ./monad-validator-setup --network=testnet --no-snapshot-restore
 --triedb-partition=DEV              DESTRUCTIVE: partition this NVMe for triedb.
 --triedb-dev=DEV                    IO-scheduler target (no partitioning).
 --allow-nvme-reformat               Allow nvme format --lbaf=0 under --non-interactive.
+--allow-template-replace            Permit overwriting an existing node.toml under
+                                    --non-interactive (discards local edits).
 --allow-triedb-wipe                 REQUIRED with --triedb-partition under --non-interactive:
                                     authorises wiping the named disk.
 --beneficiary=0x...                 Rewards address; written into node.toml.

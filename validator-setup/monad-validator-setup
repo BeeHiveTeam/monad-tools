@@ -70,6 +70,7 @@ WITH_TRIEDB_FORMAT=0        # if 1, systemctl start monad-mpt (one-shot triedb f
 WITH_SNAPSHOT_RESTORE=1     # default ON per docs full-node-installation step 15; use --no-snapshot-restore to skip
 WITH_SNAPSHOT_RESTORE_EXPLICIT=0   # set if --snapshot-restore or --no-snapshot-restore was passed
 ALLOW_NVME_REFORMAT=0       # if 1, --non-interactive may invoke nvme format --lbaf=0
+ALLOW_TEMPLATE_REPLACE=0    # if 1, --non-interactive may overwrite an existing node.toml
 ALLOW_TRIEDB_WIPE=0        # if 1, --non-interactive may partition the triedb disk (destructive).
                             # Without it confirm_destructive always refuses under
                             # --non-interactive, which silently made the documented
@@ -201,6 +202,7 @@ while [[ $# -gt 0 ]]; do
     --no-snapshot-restore) WITH_SNAPSHOT_RESTORE=0; WITH_SNAPSHOT_RESTORE_EXPLICIT=1 ;;
     --allow-nvme-reformat) ALLOW_NVME_REFORMAT=1 ;;
     --allow-triedb-wipe)   ALLOW_TRIEDB_WIPE=1 ;;
+    --allow-template-replace) ALLOW_TEMPLATE_REPLACE=1 ;;
     --allow-snapshot-overwrite) ALLOW_SNAPSHOT_OVERWRITE=1 ;;
     --start-services)  WITH_START_SERVICES=1 ;;
     --network=*)       NETWORK="${1#*=}" ;;
@@ -269,6 +271,9 @@ FLAGS (all optional)
   --triedb-partition=DEV            DESTRUCTIVE: partition this NVMe for triedb.
   --triedb-dev=DEV                  IO-scheduler target (no partitioning).
   --allow-nvme-reformat             Allow nvme format --lbaf=0 under --non-interactive.
+  --allow-template-replace          Permit replacing an existing node.toml with the stock
+                                    template under --non-interactive (DISCARDS local edits:
+                                    peers, prometheus, round_span, node_name, name-record sig).
   --allow-triedb-wipe               REQUIRED with --triedb-partition under --non-interactive:
                                     authorises wiping the named disk. Without it the
                                     partition step refuses and the install stays INCOMPLETE.
@@ -2242,15 +2247,34 @@ step_config_files() {
   # asked for full-node (or vice versa), backup + replace. This catches
   # the common "I installed as validator before stake, now want to be a
   # full node so peers will talk to me" recovery flow.
+  # Which template is this? The old heuristic keyed on enable_publisher, assuming false for
+  # full-node templates. All four live MF templates have enable_publisher = true — downloaded
+  # and checked: testnet/node.toml, testnet/full-node-node.toml, mainnet/node.toml,
+  # mainnet/full-node-node.toml. So EVERY config was classified "validator", which made the
+  # documented full→validator promotion a no-op and, worse, made a plain re-run with the default
+  # NODE_TYPE=full see a mismatch and offer to replace a working config.
+  #
+  # Discriminate on max_num_peers instead — it genuinely differs per template
+  # (validator 250/350, full-node 450/600) — and fall back to the burn beneficiary. When
+  # neither is conclusive we return "" and the replace branch below never runs: keeping a
+  # working config is always safer than swapping it on a guess.
   local existing_type=""
   if [[ -f "$node_toml" ]]; then
-    # Heuristic: validator template has enable_publisher=true and a real
-    # beneficiary; full-node template has enable_publisher=false and
-    # beneficiary = 0x0000…0000.
-    if grep -qE '^enable_publisher[[:space:]]*=[[:space:]]*true' "$node_toml" 2>/dev/null; then
-      existing_type="validator"
-    elif grep -qE '^enable_publisher[[:space:]]*=[[:space:]]*false' "$node_toml" 2>/dev/null; then
+    local _peers _ben
+    _peers=$(grep -oE '^[[:space:]]*max_num_peers[[:space:]]*=[[:space:]]*[0-9]+' "$node_toml" 2>/dev/null \
+             | grep -oE '[0-9]+' | head -1)
+    _ben=$(grep -oE '^[[:space:]]*beneficiary[[:space:]]*=[[:space:]]*"[^"]*"' "$node_toml" 2>/dev/null \
+           | sed -E 's/.*"([^"]*)".*/\1/' | head -1)
+    case "$_peers" in
+      250|350) existing_type="validator" ;;
+      450|600) existing_type="full" ;;
+    esac
+    if [[ -z "$existing_type" && "$_ben" =~ ^0x0+$ ]]; then
+      # Burn address is only ever shipped in the full-node template.
       existing_type="full"
+    fi
+    if [[ -z "$existing_type" ]]; then
+      info "node.toml template type is not conclusive (max_num_peers=${_peers:-?}) — leaving it untouched."
     fi
   fi
 
@@ -2262,7 +2286,12 @@ step_config_files() {
     fi
     if (( DRY_RUN )); then
       echo "  ${C_DIM}[dry-run] backup + replace $node_toml with ${toml_name}${C_RESET}"
-    elif confirm "Replace node.toml with the ${NODE_TYPE} template (backup created)?"; then
+    # confirm_destructive, not confirm: replacing node.toml discards bootstrap.peers,
+    # fullnode_dedicated, [prometheus], a tuned round_span, node_name and the name-record
+    # signature on a running node. confirm() treats a bare Enter as YES and auto-answers YES
+    # under --non-interactive, so a re-run could wipe a working config without anyone agreeing
+    # to it. Requires typing "yes", or ALLOW_TEMPLATE_REPLACE=1 for unattended runs.
+    elif confirm_destructive "Replace node.toml with the ${NODE_TYPE} template? This DISCARDS local edits (peers, prometheus, round_span, node_name, name-record signature). Backup is created." "${ALLOW_TEMPLATE_REPLACE:-0}"; then
       # Stop services if running — replacing node.toml under a live node
       # would cause an immediate config-reload mid-flight.
       local services_were_active=0
