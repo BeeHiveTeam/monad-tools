@@ -70,6 +70,10 @@ WITH_TRIEDB_FORMAT=0        # if 1, systemctl start monad-mpt (one-shot triedb f
 WITH_SNAPSHOT_RESTORE=1     # default ON per docs full-node-installation step 15; use --no-snapshot-restore to skip
 WITH_SNAPSHOT_RESTORE_EXPLICIT=0   # set if --snapshot-restore or --no-snapshot-restore was passed
 ALLOW_NVME_REFORMAT=0       # if 1, --non-interactive may invoke nvme format --lbaf=0
+ALLOW_TRIEDB_WIPE=0        # if 1, --non-interactive may partition the triedb disk (destructive).
+                            # Without it confirm_destructive always refuses under
+                            # --non-interactive, which silently made the documented
+                            # "zero prompts" install never partition anything.
 ALLOW_SNAPSHOT_OVERWRITE=0  # if 1, --non-interactive may overwrite an EXISTING populated triedb
 BENEFICIARY=""              # 0x... address — auto-injected into node.toml if set
 NODE_NAME=""                # unique moniker — auto-injected into node.toml if set
@@ -91,6 +95,12 @@ NODE_TYPE="full"            # full | validator — default per docs validator-in
 NODE_TYPE_EXPLICIT=0        # set if --full-node, --validator, or --node-type= was passed
 ACTION="install"
 LOG_FILE="/tmp/monad-validator-setup-$(date +%Y%m%d-%H%M%S).log"
+# Create the log 0600 up front. stderr of monad-keystore / monad-sign-name-record is appended
+# here, and a keystore password can end up in it (e.g. a password starting with '-' is echoed
+# back by clap as "unexpected argument '-Str0ngPass!'"). With the default root umask the file
+# was 0644 — world-readable, and left behind in /tmp afterwards. Scoped umask: a global one
+# would also strip group/other read from node.toml and friends, which the monad user needs.
+( umask 077; : >>"$LOG_FILE" ) 2>/dev/null || true
 TS=$(date -u +%Y%m%d-%H%M%S)
 DOCTOR_PATH="$(dirname "$0")/../doctor/monad-doctor"
 REPORT_FILE="/var/lib/monad-validator-setup/report-${TS}.json"
@@ -190,6 +200,7 @@ while [[ $# -gt 0 ]]; do
     --snapshot-restore) WITH_SNAPSHOT_RESTORE=1; WITH_SNAPSHOT_RESTORE_EXPLICIT=1 ;;
     --no-snapshot-restore) WITH_SNAPSHOT_RESTORE=0; WITH_SNAPSHOT_RESTORE_EXPLICIT=1 ;;
     --allow-nvme-reformat) ALLOW_NVME_REFORMAT=1 ;;
+    --allow-triedb-wipe)   ALLOW_TRIEDB_WIPE=1 ;;
     --allow-snapshot-overwrite) ALLOW_SNAPSHOT_OVERWRITE=1 ;;
     --start-services)  WITH_START_SERVICES=1 ;;
     --network=*)       NETWORK="${1#*=}" ;;
@@ -690,9 +701,18 @@ list_free_nvme_disks() {
     (( skip )) && continue
     # Skip if anything under this disk is mounted at /
     if lsblk -ln -o MOUNTPOINT "/dev/$disk" 2>/dev/null | grep -qx "/"; then continue; fi
-    # Skip if any non-swap mount on this disk (already in use)
+    # Skip if ANY mount exists on this disk — including swap. Swap used to be excluded here,
+    # so an active swap device was offered as "safe to partition"; wiping it takes the live
+    # system down and leaves a broken fstab.
     if lsblk -ln -o MOUNTPOINT "/dev/$disk" 2>/dev/null \
-       | grep -vE '^$|^\[SWAP\]$' | grep -q .; then continue; fi
+       | grep -vE '^$' | grep -q .; then continue; fi
+    # Skip if the disk or anything under it carries a filesystem/container signature.
+    # MOUNTPOINT alone is not enough: an LVM PV, a member of a NON-root md array, or a closed
+    # LUKS container are all unmounted yet full of somebody's data, and `parted mklabel gpt`
+    # destroys them silently.
+    if lsblk -ln -o FSTYPE "/dev/$disk" 2>/dev/null | grep -vE '^$' | grep -q .; then continue; fi
+    # Skip if the disk already has partitions (a previous install, another project).
+    if lsblk -ln -o TYPE "/dev/$disk" 2>/dev/null | grep -qx "part"; then continue; fi
     echo "$disk"
   done < <(lsblk -dn -o NAME,TYPE 2>/dev/null | awk '$2=="disk" && $1 ~ /^nvme/ {print $1}')
 }
@@ -718,16 +738,37 @@ step_triedb_partition() {
   # "triedb" but udev didn't get the rule / symlink. Re-running would
   # uselessly destroy the partition and start over; better to just re-emit
   # the udev rule with the existing partition's PARTUUID and trigger udev.
-  local existing_triedb_part=""
+  # Scope the scan: if the operator named a disk, only that disk's partitions may be adopted.
+  # Previously the first 'triedb'-labelled partition ANYWHERE on the system won, silently
+  # ignoring --triedb-partition — so with an old node's disk still attached, /dev/triedb was
+  # pointed back at the OLD database and the next step truncated it.
+  local -a triedb_parts=()
   while IFS= read -r blk; do
     local lbl
     lbl=$(lsblk -no PARTLABEL "/dev/$blk" 2>/dev/null | head -1 | tr -d ' ')
-    if [[ "$lbl" == "triedb" ]]; then
-      existing_triedb_part="$blk"
-      break
+    [[ "$lbl" == "triedb" ]] || continue
+    if [[ -n "$TRIEDB_PARTITION_DEV" ]]; then
+      local want parent
+      want="${TRIEDB_PARTITION_DEV#/dev/}"
+      parent=$(lsblk -no PKNAME "/dev/$blk" 2>/dev/null | head -1)
+      [[ "$blk" == "$want" || "$parent" == "$want" ]] || continue
     fi
+    triedb_parts+=("$blk")
   done < <(lsblk -ln -o NAME,TYPE 2>/dev/null | awk '$2=="part" {print $1}')
+
+  local existing_triedb_part=""
+  if (( ${#triedb_parts[@]} == 1 )); then
+    existing_triedb_part="${triedb_parts[0]}"
+  elif (( ${#triedb_parts[@]} > 1 )); then
+    warn "Multiple partitions labelled 'triedb' found: ${triedb_parts[*]}"
+    warn "Refusing to guess which one holds the database you want."
+    warn "Re-run with --triedb-partition=<disk> to disambiguate."
+    return 1
+  fi
   if [[ -n "$existing_triedb_part" ]]; then
+    warn "Adopting existing 'triedb' partition — this will become /dev/triedb:"
+    lsblk -o NAME,SIZE,TYPE,FSTYPE,PARTLABEL,MOUNTPOINT "/dev/$existing_triedb_part" 2>/dev/null \
+      | sed 's/^/    /' >&2
     local partuuid
     partuuid=$(lsblk -no PARTUUID "/dev/$existing_triedb_part" 2>/dev/null | tr -d ' ')
     if [[ -n "$partuuid" ]]; then
@@ -757,17 +798,25 @@ EOF
     [[ -n "$d" ]] && candidates+=("$d")
   done < <(list_free_nvme_disks)
 
-  if (( ${#candidates[@]} == 0 )); then
-    info "No free NVMe disks found (all are in OS RAID / mounted / partitioned)"
-    info "If you want to partition a specific disk, pass --triedb-partition=DEV"
-    return 0
-  fi
-
-  # Decide target: --triedb-partition flag wins, else interactive prompt.
+  # An explicitly named disk wins and must be handled BEFORE the "no free disks" bail-out:
+  # the flag exists precisely for disks the auto-scan rejects (leftover partitions, non-root
+  # md member). Previously the early `return 0` sat above this block, so --triedb-partition
+  # was unreachable exactly when it was needed — and the message in that branch advised the
+  # very flag it had just made impossible to use.
   local target=""
   if [[ -n "$TRIEDB_PARTITION_DEV" ]]; then
     target="${TRIEDB_PARTITION_DEV#/dev/}"
+    if [[ ! -b "/dev/$target" ]]; then
+      err "--triedb-partition=$target: /dev/$target is not a block device"
+      return 1
+    fi
     info "Using --triedb-partition=$target (operator-specified)"
+    warn "Auto-scan safety checks are BYPASSED for an explicitly named disk. Current layout:"
+    lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT "/dev/$target" 2>/dev/null | sed 's/^/    /' >&2
+  elif (( ${#candidates[@]} == 0 )); then
+    info "No free NVMe disks found (all are in OS RAID / mounted / partitioned / carry a filesystem)"
+    info "If you want to partition a specific disk anyway, pass --triedb-partition=DEV"
+    return 0
   elif (( NON_INTERACTIVE )); then
     info "No --triedb-partition= and --non-interactive — skipping"
     info "(operator will partition manually; re-run with --triedb-partition=DEV to automate)"
@@ -806,7 +855,14 @@ EOF
 
   echo
   warn "${C_BOLD}DESTRUCTIVE${C_RESET}: this will WIPE $dev. Any data on it is lost."
-  if ! confirm_destructive "Partition $dev as 'triedb' (single full-disk partition)?"; then
+  # Pass the opt-in through, otherwise confirm_destructive refuses unconditionally under
+  # --non-interactive and this step becomes a silent no-op (see ALLOW_TRIEDB_WIPE above).
+  if (( NON_INTERACTIVE )) && (( ALLOW_TRIEDB_WIPE == 0 )); then
+    warn "Refusing to partition $dev in --non-interactive without --allow-triedb-wipe."
+    warn "  Re-run with --allow-triedb-wipe to authorise wiping $dev, or partition manually."
+    return 0
+  fi
+  if ! confirm_destructive "Partition $dev as 'triedb' (single full-disk partition)?" "$ALLOW_TRIEDB_WIPE"; then
     info "Skipped by operator"
     return 0
   fi
@@ -1141,6 +1197,17 @@ PYEOF
 #   1) auto-generate (display once — must back up immediately)
 #   2) enter manually (twice for confirmation)
 # Skipped silently if keys already exist.
+# Make key material safe to leave on disk. Idempotent and safe to call when some of the files
+# do not exist yet — used both on the success path and before every early return, so a failed
+# or skipped key step can never leave private keys world-readable.
+lock_down_keys() {
+  chown monad:monad /home/monad/monad-bft/config/id-secp /home/monad/monad-bft/config/id-bls 2>/dev/null || true
+  chmod 0600 /home/monad/monad-bft/config/id-secp /home/monad/monad-bft/config/id-bls 2>/dev/null || true
+  chown monad:monad /home/monad/pubkey-secp-bls 2>/dev/null || true
+  chmod 0600 /home/monad/pubkey-secp-bls 2>/dev/null || true
+  chmod 0600 /opt/monad/backup/*-backup 2>/dev/null || true
+}
+
 step_generate_keys() {
   section "Validator key generation (optional)"
 
@@ -1153,7 +1220,11 @@ step_generate_keys() {
   # leaving the operator with a broken half-install that nothing detected.
   if [[ -s /home/monad/monad-bft/config/id-secp \
         && -s /home/monad/monad-bft/config/id-bls ]]; then
-    ok "Keys already exist in /home/monad/monad-bft/config/ — skipping"
+    # Re-assert ownership/permissions even when skipping: an earlier run that died between
+    # key creation and the chown left them root:root 0644, and this branch is exactly where
+    # every subsequent run ends up — so without this the bad state was never repaired.
+    lock_down_keys
+    ok "Keys already exist in /home/monad/monad-bft/config/ — skipping (perms re-asserted)"
     return 0
   fi
   # If only one of them is present (partial state from a previous run),
@@ -1290,6 +1361,13 @@ step_generate_keys() {
   # monad:monad at the end. /opt/monad/backup is also a root-owned dir per
   # docs. Running as 'monad' fails because /opt/monad/backup is 0755 root —
   # the user can't write there.
+  # Key generation ONLY. The `grep 'public key'` extraction used to be the last command inside
+  # this `set -e` block, so if its wording ever changed it returned 1, aborted the block and the
+  # function returned BEFORE the chown/chmod below — leaving freshly created keys (and the
+  # private-key backups in /opt/monad/backup) as root:root 0644 while reporting
+  # "monad-keystore create failed". Re-running never repaired it either, because the
+  # "keys already exist" branch skips this step entirely.
+  local keygen_failed=0
   if ! bash -c "
     set -e
     source /home/monad/.env
@@ -1299,23 +1377,31 @@ step_generate_keys() {
     monad-keystore create --key-type bls \
       --keystore-path /home/monad/monad-bft/config/id-bls \
       --password \"\$KEYSTORE_PASSWORD\" > /opt/monad/backup/bls-backup
-    grep 'public key' /opt/monad/backup/secp-backup /opt/monad/backup/bls-backup \
-      > /home/monad/pubkey-secp-bls
   " 2>>"$LOG_FILE"; then
+    keygen_failed=1
+  fi
+
+  # Lock down whatever DID get created, unconditionally and before any early return.
+  lock_down_keys
+  if (( keygen_failed )); then
     err "monad-keystore create failed — see $LOG_FILE"
     err "Common causes:"
     err "  - monad-keystore binary not found (monad pkg not installed?)"
     err "  - KEYSTORE_PASSWORD contains chars that broke shell escaping"
     err "  - /opt/monad/backup not writable"
-    err "Last 20 lines of log:"
+    err "Note: any partially created key files have been chowned/chmod'ed already."
+    err "Last 20 lines of log (may contain tool stderr):"
     tail -20 "$LOG_FILE" | sed 's/^/  /' >&2
     return 1
   fi
-  # chown the new files to monad (per docs at end of install).
-  chown monad:monad /home/monad/monad-bft/config/id-secp /home/monad/monad-bft/config/id-bls 2>/dev/null || true
-  chmod 0600 /home/monad/monad-bft/config/id-secp /home/monad/monad-bft/config/id-bls 2>/dev/null || true
-  chown monad:monad /home/monad/pubkey-secp-bls 2>/dev/null || true
-  chmod 0600 /opt/monad/backup/*-backup 2>/dev/null || true
+
+  # Public-key extraction is cosmetic — it must never fail the step.
+  if ! grep 'public key' /opt/monad/backup/secp-backup /opt/monad/backup/bls-backup \
+       > /home/monad/pubkey-secp-bls 2>>"$LOG_FILE"; then
+    warn "Could not extract 'public key' lines (tool output wording may have changed)."
+    warn "  Keys ARE created; read them from /opt/monad/backup/{secp,bls}-backup."
+  fi
+  lock_down_keys
   ok "Generated SECP + BLS keys in /home/monad/monad-bft/config/"
   ok "Public keys recorded in /home/monad/pubkey-secp-bls"
   warn "${C_BOLD}BACK UP THE PASSWORD NOW. Without it the keys are unrecoverable.${C_RESET}"
@@ -1562,6 +1648,37 @@ step_snapshot_restore() {
   # WITH_SNAPSHOT_RESTORE_EXPLICIT: an explicit --snapshot-restore forces a
   # re-import even past a populated ledger (the confirm_destructive below still
   # protects against an accidental wipe).
+  # The thing this gate protects is /dev/triedb, and the ledger directory is a poor proxy for
+  # it: right after a snapshot restore (or after monad-cruft.timer does its hourly cleanup) the
+  # ledger can be well under 100 MB while triedb holds hundreds of GB. The documented re-run
+  # `--skip-preflight --with-vdp-otel` keeps WITH_SNAPSHOT_RESTORE=1, so that window meant
+  # `monad-mpt --truncate` wiping a fully synced database. Ask triedb itself as well.
+  local triedb_populated=0
+  if [[ -L /dev/triedb || -b /dev/triedb ]] && command -v monad-mpt >/dev/null 2>&1; then
+    local mpt_out=""
+    mpt_out=$(monad-mpt --storage /dev/triedb 2>/dev/null || true)
+    # "Latest finalized is <N>" with a real block number ⇒ there is a live database here.
+    local fin
+    fin=$(grep -oE 'Latest finalized is [0-9]+' <<<"$mpt_out" | grep -oE '[0-9]+' | head -1)
+    if [[ -n "$fin" ]] && (( fin > 0 )); then
+      triedb_populated=1
+      info "triedb reports a populated database (latest finalized ${fin})."
+    elif [[ -n "$mpt_out" ]] && grep -q 'Active timelines' <<<"$mpt_out"; then
+      info "triedb is initialised but reports no finalized block yet."
+    else
+      warn "Could not read triedb state via monad-mpt — assuming POPULATED to avoid wiping data."
+      triedb_populated=1
+    fi
+  fi
+  if (( triedb_populated )) && (( WITH_SNAPSHOT_RESTORE_EXPLICIT == 0 )); then
+    info "triedb already holds a database — skipping snapshot restore (ledger size is not the deciding factor)."
+    info "To force re-import: re-run with --snapshot-restore (triedb is truncated automatically)."
+    if (( services_were_active )); then
+      info "Restarting services that were stopped pre-check…"
+      run "starting services" systemctl start monad-bft monad-execution monad-rpc || true
+    fi
+    return 0
+  fi
   if (( ledger_bytes > 104857600 )) && (( LEDGER_SUSPECT == 0 )) && (( WITH_SNAPSHOT_RESTORE_EXPLICIT == 0 )); then
     info "Ledger already populated ($(( ledger_bytes / 1048576 )) MB) and chain state intact — skipping snapshot."
     info "To force re-import: re-run with --snapshot-restore (triedb is truncated automatically)."
@@ -1595,7 +1712,14 @@ step_snapshot_restore() {
   #     confirm_destructive so an automated re-run can't silently wipe it.
   #     Opt in via ALLOW_SNAPSHOT_OVERWRITE=1 for non-interactive.
   local proceed=0
-  if (( ledger_bytes > 104857600 )); then
+  if (( triedb_populated )); then
+    # Reached only with an explicit --snapshot-restore. Still the destructive gate, because
+    # this is the branch that wipes a live database, and the ledger-size test above could not
+    # see it. ALLOW_SNAPSHOT_OVERWRITE=1 is required for an unattended run.
+    if confirm_destructive "Run snapshot restore now? This WIPES the populated triedb database." "${ALLOW_SNAPSHOT_OVERWRITE:-0}"; then
+      proceed=1
+    fi
+  elif (( ledger_bytes > 104857600 )); then
     if confirm_destructive "Run snapshot restore now? This OVERWRITES an existing $(( ledger_bytes / 1048576 )) MB ledger." "${ALLOW_SNAPSHOT_OVERWRITE:-0}"; then
       proceed=1
     fi
@@ -1641,14 +1765,36 @@ step_snapshot_restore() {
     fi
   fi
 
-  info "Fetching + running $snap_url …"
-  if ! curl -sSL --max-time 30 "$snap_url" | bash; then
+  # Download to a file first, THEN execute. `curl … | bash` here had no -f (so an HTTP 404/503
+  # error page was piped into bash) and no pipefail (so curl's exit code was discarded and only
+  # bash's was checked). A transfer cut short by --max-time could deliver a syntactically valid
+  # PREFIX of the script, which would run partially and exit 0 — and this happens AFTER
+  # `monad-mpt --truncate`, i.e. with the database already wiped, while reporting
+  # "Snapshot restore completed". Same download-then-run pattern as the VDP step already uses.
+  local snap_script="/tmp/monad-restore-from-snapshot-$$.sh"
+  info "Fetching $snap_url …"
+  if ! curl -fsSL --max-time 120 -o "$snap_script" "$snap_url"; then
+    err "Failed to download $snap_url — triedb has already been truncated."
+    err "Re-run this step (or apply the snapshot manually) before starting the node."
+    rm -f "$snap_script"
+    return 1
+  fi
+  if [[ ! -s "$snap_script" ]] || ! head -1 "$snap_script" | grep -qE '^#!|^#|^set '; then
+    err "Downloaded snapshot script looks wrong (empty or not a shell script):"
+    head -3 "$snap_script" | sed 's/^/    /' >&2
+    rm -f "$snap_script"
+    return 1
+  fi
+  info "Running $snap_script …"
+  if ! bash "$snap_script"; then
+    rm -f "$snap_script"
     err "Snapshot restore script failed — check log on its own (it writes to /var/log/monad-snapshot* or similar)"
     if (( services_were_active )); then
       run "restarting services" systemctl start monad-bft monad-execution monad-rpc || true
     fi
     return 1
   fi
+  rm -f "$snap_script"
   ok "Snapshot restore completed"
 }
 
