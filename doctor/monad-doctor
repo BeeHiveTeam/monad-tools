@@ -582,8 +582,11 @@ check_disks() {
   # /dev/mapper/…) wraps onto its own line, so NR==2 captures only the name and
   # $4 (Avail) is empty → arithmetic error → false FAIL.
   local size_root_gb
-  free_root_gb=$(df -P -BG / | awk 'NR==2 {gsub("G","",$4); print $4}')
-  size_root_gb=$(df -P -BG / | awk 'NR==2 {gsub("G","",$2); print $2}')
+  # DECIMAL GB, to match how the docs and every disk vendor state capacity. `df -BG` reports
+  # GiB: a disk sold as 500 GB shows 465 there, so comparing it against the documented 500
+  # failed a host that meets the requirement exactly. Compute from bytes and divide by 1000^3.
+  free_root_gb=$(df -P -B1 / | awk 'NR==2 {printf "%d", $4/1000/1000/1000}')
+  size_root_gb=$(df -P -B1 / | awk 'NR==2 {printf "%d", $2/1000/1000/1000}')
   # The docs requirement is "500GB Disk for MonadBFT / OS" — a disk SIZE, not free space.
   # Comparing FREE space against it failed any correctly-provisioned 500 GB host the moment it
   # had ~1 GB of anything on it, which is every host after installation. Size and headroom are
@@ -621,15 +624,15 @@ check_disks() {
     triedb_size_gb="$triedb_part_gb"
     local whole_note=""
     if [[ -n "$triedb_disk_gb" && -n "$triedb_part_gb" ]] && (( triedb_disk_gb > triedb_part_gb + 1 )); then
-      whole_note=" — partition is ${triedb_part_gb} GB of a ${triedb_disk_gb} GB disk"
+      whole_note=" — partition is ${triedb_part_gb} GiB of a ${triedb_disk_gb} GiB disk"
     fi
     if [[ -z "$triedb_size_gb" || "$triedb_size_gb" == "0" ]]; then
       emit hardware "disk.triedb-size" SKIP "could not read the size of /dev/triedb (${triedb_part}) — size NOT verified" \
            $'Action:      lsblk -b -o NAME,SIZE,TYPE $(readlink -f /dev/triedb)'
     elif (( triedb_size_gb >= DISK_GB_TRIEDB_MIN )); then
-      emit hardware "disk.triedb-size" PASS "/dev/triedb → /dev/${triedb_part} (${triedb_size_gb} GB)${whole_note}"
+      emit hardware "disk.triedb-size" PASS "/dev/triedb → /dev/${triedb_part} (${triedb_size_gb} GiB)${whole_note}"
     else
-      emit hardware "disk.triedb-size" FAIL "triedb partition only ${triedb_size_gb} GB — docs require ≥${DISK_GB_TRIEDB_MIN} GB${whole_note}" \
+      emit hardware "disk.triedb-size" FAIL "triedb partition only ${triedb_size_gb} GiB — need ≥${DISK_GB_TRIEDB_MIN} GiB (docs: 2 TB disk ≈ 1788 GiB)${whole_note}" \
            $'Why:         the node writes triedb into this partition; the parent disk being larger\n             does not help. Re-partition to give triedb the full drive.'
     fi
   else
@@ -668,7 +671,12 @@ check_iops() {
     return
   fi
 
-  emit hardware "disk.iops"     INFO "running fio on $target_dev (10s random read, non-destructive)…"
+  # This is a PROXY measurement. fio deliberately avoids the triedb disk so it cannot compete
+  # with production IO — but the number was then reported as though it described triedb, with
+  # advice about "the validator critical path". On a host whose OS disk is a consumer drive and
+  # whose triedb is datacenter-class (or the reverse), that verdict is about the wrong hardware.
+  # Say which device was measured, and do not FAIL on a disk the node never touches.
+  emit hardware "disk.iops"     INFO "running fio on $target_dev — a PROXY for triedb (${triedb_disk:-triedb disk} is in use and must not be disturbed)…"
   local iops
   iops=$(fio --name=mdr --filename="$target_dev" --rw=randread --bs=4k \
     --runtime=10 --time_based=1 --ioengine=libaio --iodepth=32 --direct=1 \
@@ -680,12 +688,22 @@ check_iops() {
     return
   fi
 
+  # Same device as triedb? Then the figure genuinely describes triedb and FAIL is warranted.
+  # A different device can only ever be an indication, so it must not drive the verdict.
+  local _measured="${target_dev##*/}" _is_triedb_disk=0
+  [[ -n "$triedb_disk" && "$_measured" == "$triedb_disk" ]] && _is_triedb_disk=1
+  local _scope=" on /dev/${_measured}"
+  (( _is_triedb_disk )) || _scope=" on /dev/${_measured} — NOT the triedb disk, indicative only"
+
   if (( iops >= NVME_IOPS_REC )); then
-    emit hardware "disk.iops"   PASS "${iops} 4k random read IOPS"
+    emit hardware "disk.iops"   PASS "${iops} 4k random read IOPS${_scope}"
   elif (( iops >= NVME_IOPS_MIN )); then
-    emit hardware "disk.iops"   WARN "${iops} IOPS — meets min ($NVME_IOPS_MIN), recommend $NVME_IOPS_REC+"
+    emit hardware "disk.iops"   WARN "${iops} IOPS${_scope} — meets min ($NVME_IOPS_MIN), recommend $NVME_IOPS_REC+"
+  elif (( _is_triedb_disk == 0 )); then
+    emit hardware "disk.iops"   WARN "${iops} IOPS${_scope} — below minimum $NVME_IOPS_MIN, but this is not the disk triedb uses" \
+         $'Action:      Measure the real thing while the node is stopped:\n               systemctl stop monad-execution\n               sudo fio --filename=/dev/triedb --rw=randread --bs=4k --iodepth=64 \\\n                   --runtime=30 --name=iops --direct=1\n               systemctl start monad-execution\nWhy:         a slow OS disk says little about triedb latency, and vice versa.'
   else
-    emit hardware "disk.iops"   FAIL "${iops} IOPS — below minimum $NVME_IOPS_MIN" \
+    emit hardware "disk.iops"   FAIL "${iops} IOPS${_scope} — below minimum $NVME_IOPS_MIN" \
          $'Action:      Replace with datacenter-class NVMe (Samsung PM9A3, WD SN850X, Micron 7450,\n             Intel D7-P5520). Consumer NVMe slows to 50-80k IOPS under sustained load.\nVerify:      sudo fio --filename=/dev/triedb --rw=randread --bs=4k --iodepth=64 \\\n                  --runtime=30 --name=iops --direct=1\nWhy:         triedb random reads define the validator critical path; <'"$NVME_IOPS_MIN"$' IOPS\n             produces slow blocks, missed votes and eventual jail.'
   fi
 }
@@ -1103,8 +1121,22 @@ check_firewall() {
     if [[ -n "$_ssh_ports_detected" ]]; then
       local _ssh_missing=""
       for _p in $_ssh_ports_detected; do
-        if ! echo "$ufw_status" | grep -qE "^${_p}/tcp.*ALLOW|^${_p}[[:space:]].*ALLOW"; then
-          _ssh_missing+="$_p "
+        # Accept every shape ufw actually prints for a permitted SSH port:
+        #   22/tcp        ALLOW    Anywhere         plain allow
+        #   22/tcp        LIMIT    Anywhere         `ufw limit ssh` — the RECOMMENDED hardening,
+        #                                           and it is not the word ALLOW
+        #   22/tcp (v6)   ALLOW    Anywhere (v6)    v6 row
+        #   OpenSSH       ALLOW    Anywhere         app profile — no port number in the row at all
+        # Matching only ALLOW-with-a-port meant a host hardened with `ufw limit` or the OpenSSH
+        # profile was reported as "ufw active but does NOT allow SSH" — a FAIL, with a DANGER
+        # notice, on a host that is more carefully protected than the one that passes.
+        if ! echo "$ufw_status" | grep -qE "^${_p}(/tcp)?( \(v6\))?[[:space:]]+(ALLOW|LIMIT)"; then
+          # Fall back to app profiles, which name a service instead of a port.
+          local _prof_ok=0
+          if [[ "$_p" == "22" ]] && echo "$ufw_status" | grep -qE '^(OpenSSH|SSH)( \(v6\))?[[:space:]]+(ALLOW|LIMIT)'; then
+            _prof_ok=1
+          fi
+          (( _prof_ok )) || _ssh_missing+="$_p "
         fi
       done
       if [[ -z "$_ssh_missing" ]]; then

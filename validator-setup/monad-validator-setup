@@ -80,6 +80,7 @@ ALLOW_TRIEDB_WIPE=0        # if 1, --non-interactive may partition the triedb di
 ALLOW_SNAPSHOT_OVERWRITE=0  # if 1, --non-interactive may overwrite an EXISTING populated triedb
 BENEFICIARY=""              # 0x... address — auto-injected into node.toml if set
 NODE_NAME=""                # unique moniker — auto-injected into node.toml if set
+RESIGN_NAME_RECORD=0      # set when a public-IP change forces a name-record re-sign
 WITH_KEYS=0                 # if 1, run monad-keystore create with KEYSTORE_PASSWORD source
 KEYSTORE_PASSWORD_INPUT=""  # "auto" | "prompt" | "" (interactive picks)
 WITH_SIGN_NAME_RECORD=0     # if 1, run monad-sign-name-record + inject into node.toml
@@ -1529,8 +1530,36 @@ step_sign_name_record() {
                            in_pd && /^[[:space:]]*self_name_record_sig[[:space:]]*=/ {print $2; exit}' \
                  "$node_toml" 2>/dev/null)
   if [[ -n "$existing_sig" && ! "$existing_sig" =~ [\<\>] ]]; then
-    ok "self_name_record_sig already in node.toml — skipping (avoids seq_num bump)"
-    return 0
+    # A signature covers a SPECIFIC address. Skipping purely because one exists meant that after
+    # the host changed public IP — new provider, failover, re-provision — the node kept
+    # advertising a record signed for the old address, with self_record_seq_num pinned at 1 so
+    # peers had no reason to prefer anything newer. It looked configured and could not be
+    # discovered. Re-sign when, and only when, the address actually differs.
+    local _cur_addr _live_ip=""
+    _cur_addr=$(awk -F\" '/^\[peer_discovery\]/ {in_pd=1; next}
+                          /^\[/ && !/^\[peer_discovery\]/ {in_pd=0}
+                          in_pd && /^[[:space:]]*self_address[[:space:]]*=/ {print $2; exit}' \
+                "$node_toml" 2>/dev/null)
+    if command -v curl >/dev/null 2>&1; then
+      _live_ip=$(curl -4 -fsS --max-time 5 https://api.ipify.org 2>/dev/null || true)
+    fi
+    if [[ -n "$_live_ip" && -n "$_cur_addr" && "${_cur_addr%%:*}" != "$_live_ip" ]]; then
+      warn "node.toml self_address is ${_cur_addr%%:*} but this host answers as ${_live_ip}."
+      warn "  The existing signature covers the OLD address — peers cannot discover this node."
+      if confirm "Re-sign the name record for ${_live_ip} (bumps self_record_seq_num)?"; then
+        RESIGN_NAME_RECORD=1
+      else
+        warn "Left as-is. Auth UDP peer discovery will keep failing until this is re-signed."
+        return 0
+      fi
+    elif [[ -z "$_live_ip" ]]; then
+      # Could not determine the public IP: say so rather than implying the record was verified.
+      ok "self_name_record_sig already in node.toml — skipping (public IP unknown, address NOT verified)"
+      return 0
+    else
+      ok "self_name_record_sig already in node.toml for ${_cur_addr%%:*} — matches this host, skipping"
+      return 0
+    fi
   fi
 
   # Auto-run when prereqs are met. Signing is not destructive (it just
@@ -1668,10 +1697,36 @@ def set_in_section(text, section, key, value, as_int=False):
             new = text + f'\n[{section}]\n{key} = {rhs}\n'
     return new
 
+def get_in_section(text, section, key):
+    """Current raw value of key inside [section], or None. Same section-bounded
+    matching as set_in_section, so it cannot pick up a same-named key elsewhere."""
+    pattern = re.compile(
+        r'\[' + re.escape(section) + r'\][^\[]*?'
+        r'^\s*' + re.escape(key) + r'\s*=\s*(.*)$',
+        flags=re.MULTILINE
+    )
+    m = pattern.search(text)
+    if not m:
+        return None
+    # Strip the trailing comment and quotes. The shipped node.toml writes
+    #   self_record_seq_num = 1                    # Should be 0 initially
+    # so the raw capture is not an integer, int() raised, and the bump silently
+    # fell back to 1 — i.e. exactly the no-op this change exists to prevent.
+    v = m.group(1)
+    v = re.sub(r'\s+#.*$', '', v).strip()
+    return v.strip('"').strip() or None
+
 # Strings → quoted; ports/seq → bare integers per docs
 text = set_in_section(text, 'peer_discovery', 'self_address',         f'{pubip}:8000')
 text = set_in_section(text, 'peer_discovery', 'self_auth_port',       '8001', as_int=True)
-text = set_in_section(text, 'peer_discovery', 'self_record_seq_num',  '1',    as_int=True)
+# Bump rather than pin. Peers keep the highest sequence number they have seen, so a re-signed
+# record that reuses 1 is indistinguishable from the record they already cached and gets ignored.
+_prev_seq = get_in_section(text, 'peer_discovery', 'self_record_seq_num')
+try:
+    _next_seq = int(str(_prev_seq).strip('"')) + 1 if _prev_seq else 1
+except (TypeError, ValueError):
+    _next_seq = 1
+text = set_in_section(text, 'peer_discovery', 'self_record_seq_num',  str(_next_seq), as_int=True)
 text = set_in_section(text, 'peer_discovery', 'self_name_record_sig', sig)
 
 with open(path, 'w') as f:
