@@ -46,7 +46,10 @@ CPU_CORES_REC=${CPU_CORES_REC:-16}
 CPU_GHZ_MIN=${CPU_GHZ_MIN:-4.5}         # docs: "4.5 GHz+ base clock speed"
 RAM_GB_MIN=${RAM_GB_MIN:-32}            # docs: "32 GB+ RAM"
 RAM_GB_REC=${RAM_GB_REC:-64}
-DISK_GB_OS_MIN=${DISK_GB_OS_MIN:-500}   # docs: "500GB Disk" for MonadBFT/OS
+DISK_GB_OS_MIN=${DISK_GB_OS_MIN:-500}   # docs: "500GB Disk" for MonadBFT/OS — this is disk SIZE
+# Free-space thresholds are a separate question from disk size; not in docs, BeeHive figures.
+DISK_GB_OS_FREE_MIN=${DISK_GB_OS_FREE_MIN:-100}
+DISK_GB_OS_FREE_WARN=${DISK_GB_OS_FREE_WARN:-40}
 DISK_GB_TRIEDB_MIN=${DISK_GB_TRIEDB_MIN:-1700}  # docs: "2TB dedicated disk" (real 2TB-class drives advertise ~1.92TB ≈ 1788 GiB)
 NVME_IOPS_MIN=${NVME_IOPS_MIN:-200000}  # not in docs — heuristic from operators
 NVME_IOPS_REC=${NVME_IOPS_REC:-500000}
@@ -578,11 +581,27 @@ check_disks() {
   # -P (POSIX) forces single-line output: without it, a long device name (LVM
   # /dev/mapper/…) wraps onto its own line, so NR==2 captures only the name and
   # $4 (Avail) is empty → arithmetic error → false FAIL.
+  local size_root_gb
   free_root_gb=$(df -P -BG / | awk 'NR==2 {gsub("G","",$4); print $4}')
-  if (( free_root_gb >= DISK_GB_OS_MIN )); then
-    emit hardware "disk.os"     PASS "${free_root_gb} GB free on / (need ≥${DISK_GB_OS_MIN} GB)"
+  size_root_gb=$(df -P -BG / | awk 'NR==2 {gsub("G","",$2); print $2}')
+  # The docs requirement is "500GB Disk for MonadBFT / OS" — a disk SIZE, not free space.
+  # Comparing FREE space against it failed any correctly-provisioned 500 GB host the moment it
+  # had ~1 GB of anything on it, which is every host after installation. Size and headroom are
+  # now separate questions.
+  if (( size_root_gb >= DISK_GB_OS_MIN )); then
+    emit hardware "disk.os"     PASS "${size_root_gb} GB disk on / (need ≥${DISK_GB_OS_MIN} GB), ${free_root_gb} GB free"
   else
-    emit hardware "disk.os"     FAIL "${free_root_gb} GB free on / — below ${DISK_GB_OS_MIN} GB minimum"
+    emit hardware "disk.os"     FAIL "${size_root_gb} GB disk on / — below ${DISK_GB_OS_MIN} GB minimum" \
+         $'Action:      Provision a larger OS disk, or move /home/monad to a bigger volume.\nWhy:         MonadBFT WAL + logs + apt cache grow on /; docs require a 500 GB disk.'
+  fi
+  # Headroom is its own check: a big disk that is nearly full is just as fatal as a small one,
+  # and the old check could not express that at all.
+  if (( free_root_gb >= DISK_GB_OS_FREE_MIN )); then
+    emit hardware "disk.os-free" PASS "${free_root_gb} GB free on / (≥${DISK_GB_OS_FREE_MIN} GB headroom)"
+  elif (( free_root_gb >= DISK_GB_OS_FREE_WARN )); then
+    emit hardware "disk.os-free" WARN "${free_root_gb} GB free on / — below ${DISK_GB_OS_FREE_MIN} GB, WAL growth will bite"
+  else
+    emit hardware "disk.os-free" FAIL "${free_root_gb} GB free on / — critically low"
   fi
 
   # TriedB device size — docs require 2 TB dedicated disk
@@ -1430,15 +1449,47 @@ check_authudp_config() {
     ' "$MONAD_NODE_TOML"
   }
 
-  local missing=""
-  for key in self_auth_port self_record_seq_num self_name_record_sig; do
-    toml_has_key_in_section peer_discovery "$key" || missing+="[peer_discovery].$key "
-  done
-  toml_has_key_in_section network authenticated_bind_address_port \
-    || missing+="[network].authenticated_bind_address_port "
+  # Read the VALUE of KEY under [SECTION], empty string if absent.
+  toml_value_in_section() {
+    local section="$1" key="$2"
+    awk -v sec="[$section]" -v key="$key" '
+      /^[[:space:]]*\[/ { current=$0; sub(/^[[:space:]]+/,"",current); sub(/[[:space:]]+$/,"",current) }
+      $0 ~ "^[[:space:]]*"key"[[:space:]]*=" {
+        if (current==sec) {
+          v=$0; sub(/^[^=]*=[[:space:]]*/,"",v); gsub(/^"|"$/,"",v);
+          sub(/[[:space:]]*#.*$/,"",v); gsub(/[[:space:]]+$/,"",v);
+          print v; exit
+        }
+      }
+    ' "$MONAD_NODE_TOML"
+  }
 
-  if [[ -z "$missing" ]]; then
-    emit monad "monad.authudp-cfg" PASS "node.toml has all Auth UDP keys in correct sections"
+  local missing="" empty=""
+  for key in self_auth_port self_record_seq_num self_name_record_sig; do
+    if ! toml_has_key_in_section peer_discovery "$key"; then
+      missing+="[peer_discovery].$key "
+    else
+      # Presence was the ONLY test, so a node.toml carrying the shipped placeholder — or an
+      # empty signature — reported "all Auth UDP keys in correct sections". That is precisely
+      # the node that will be rejected by the authenticated mesh, told it is configured.
+      local v; v=$(toml_value_in_section peer_discovery "$key")
+      if [[ -z "$v" || "$v" == "0" || "$v" =~ [\<\>] || "$v" == "PLACEHOLDER" || "$v" == "REPLACE_ME" ]]; then
+        empty+="[peer_discovery].$key=${v:-<empty>} "
+      fi
+    fi
+  done
+  if ! toml_has_key_in_section network authenticated_bind_address_port; then
+    missing+="[network].authenticated_bind_address_port "
+  else
+    local vp; vp=$(toml_value_in_section network authenticated_bind_address_port)
+    [[ -z "$vp" || "$vp" == "0" ]] && empty+="[network].authenticated_bind_address_port=${vp:-<empty>} "
+  fi
+
+  if [[ -n "$empty" ]]; then
+    emit monad "monad.authudp-cfg" FAIL "Auth UDP keys present but unset/placeholder: $empty" \
+         $'Action:      Fill the real values — a key that exists with an empty or <placeholder>\n             value is not configuration, and peers will reject the node all the same.\nGenerate sig: sudo -u monad monad-sign-name-record ...   # see docs for the exact CLI\nDocs:        https://docs.monad.xyz/node-ops/upgrade-instructions/auth-udp'
+  elif [[ -z "$missing" ]]; then
+    emit monad "monad.authudp-cfg" PASS "node.toml has all Auth UDP keys, with non-placeholder values"
   else
     emit monad "monad.authudp-cfg" FAIL "node.toml missing Auth UDP keys: $missing" \
          $'Action:      Edit '"$MONAD_NODE_TOML"$' and add the missing keys:\n               [peer_discovery]\n               self_auth_port = 8001\n               self_record_seq_num = 1\n               self_name_record_sig = "<run monad-sign-name-record>"\n               [network]\n               authenticated_bind_address_port = 8001\nGenerate sig: sudo -u monad monad-sign-name-record --help   # see docs for exact CLI\nDocs:        https://docs.monad.xyz/node-ops/upgrade-instructions/auth-udp\nWhy:         Auth UDP is mandatory ≥ v0.12.6; without these keys the node will not\n             join the authenticated mesh and peers will reject it.'

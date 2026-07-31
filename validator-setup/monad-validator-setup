@@ -196,7 +196,17 @@ while [[ $# -gt 0 ]]; do
     --triedb-partition=*) TRIEDB_PARTITION_DEV="${1#*=}" ;;
     --triedb-format)   WITH_TRIEDB_FORMAT=1 ;;
     --beneficiary=*)   BENEFICIARY="${1#*=}" ;;
-    --node-name=*)     NODE_NAME="${1#*=}" ;;
+    --node-name=*)
+      NODE_NAME="${1#*=}"
+      # Validate rather than escape. This value is substituted into a sed replacement and then
+      # into TOML: `&` expands to the whole match in a sed replacement, a `"` closes the TOML
+      # string early, and a backslash escapes whatever follows. Only `#` was handled. A moniker
+      # has no business containing any of that.
+      if [[ ! "$NODE_NAME" =~ ^[A-Za-z0-9._-]{1,64}$ ]]; then
+        err "--node-name must be 1-64 chars of A-Z a-z 0-9 . _ - (got: '$NODE_NAME')"
+        exit 64
+      fi
+      ;;
     --generate-keys)   WITH_KEYS=1 ;;
     --keys-password=*) KEYSTORE_PASSWORD_INPUT="${1#*=}" ;;
     --sign-name-record) WITH_SIGN_NAME_RECORD=1 ;;
@@ -357,6 +367,13 @@ fi
 # Falls back to STDIN if /dev/tty isn't available (e.g. true headless CI).
 prompt_read() {
   local var="$1" promptmsg="$2"
+  # Under --dry-run return an empty answer without blocking; every caller already treats empty
+  # as "use the default", and the caller prints what it would have done.
+  if (( DRY_RUN )); then
+    info "[dry-run] would prompt: ${promptmsg//$'\n'/ } — taking the default"
+    printf -v "$var" '%s' ""
+    return 0
+  fi
   if [[ -r /dev/tty ]]; then
     read -rp "$promptmsg" "$var" </dev/tty
   else
@@ -365,6 +382,11 @@ prompt_read() {
 }
 
 confirm() {
+  # A dry run must not block on a human. Several steps prompted before reaching their
+  # `if (( DRY_RUN ))` guard, so `--dry-run` sat waiting for input on a network choice, a
+  # node_name and a triedb partition — which also makes it useless in CI. Report the question
+  # and take the default instead.
+  (( DRY_RUN )) && { info "[dry-run] would ask: $1 — assuming Yes"; return 0; }
   [[ $NON_INTERACTIVE -eq 1 ]] && { info "(non-interactive: assuming Yes for: $1)"; return 0; }
   local ans=""
   prompt_read ans "${C_YELLOW}?${C_RESET} $1 [Y/n] "
@@ -375,6 +397,10 @@ confirm() {
 # the operator to type the full word 'yes' explicitly — a bare 'y', Enter, or
 # empty input is treated as 'no'. Prevents accidentally wiping a disk.
 confirm_destructive() {
+  # Declines under dry-run — the opposite of confirm(). Answering Yes here would walk the
+  # script down a data-destroying path on the strength of a flag whose entire promise is that
+  # it changes nothing.
+  (( DRY_RUN )) && { info "[dry-run] would ask (destructive): $1 — assuming No"; return 1; }
   if (( NON_INTERACTIVE == 1 )); then
     # Non-interactive auto-Yes only when the operator explicitly enables it
     # via the optional second arg (e.g. ALLOW_NVME_REFORMAT for nvme format).
@@ -1170,14 +1196,21 @@ step_node_toml_customize() {
   fi
   if [[ -z "$name_target" ]]; then
     if (( name_is_valid == 0 )); then
-      local default_name="BeeHive-$(hostname -s)"
+      # hostname can legally contain characters the moniker charset rejects; sanitise so the
+      # auto-default never trips the validation we just added.
+      local default_name="BeeHive-$(hostname -s 2>/dev/null | tr -c 'A-Za-z0-9._-' '-' | cut -c1-50)"
+      [[ "$default_name" =~ ^[A-Za-z0-9._-]{1,64}$ ]] || default_name="BeeHive-node"
       if (( NON_INTERACTIVE )); then
         name_target="$default_name"
         info "Auto node_name: $name_target (override with --node-name=)"
       else
         local input=""
-        prompt_read input "${C_YELLOW}?${C_RESET} node_name (Enter for '$default_name'): "
-        name_target="${input:-$default_name}"
+        while :; do
+          prompt_read input "${C_YELLOW}?${C_RESET} node_name (Enter for '$default_name'): "
+          name_target="${input:-$default_name}"
+          [[ "$name_target" =~ ^[A-Za-z0-9._-]{1,64}$ ]] && break
+          warn "node_name must be 1-64 chars of A-Z a-z 0-9 . _ - — try again."
+        done
       fi
     else
       ok "node_name already set: $cur_name"
