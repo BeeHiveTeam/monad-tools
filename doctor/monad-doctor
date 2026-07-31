@@ -1444,6 +1444,43 @@ check_triedb_udev() {
   fi
 }
 
+check_mip8_timeline() {
+  # MIP-8 page-storage migration. The node publishes monad_triedb_migration_phase on the OTel
+  # Prometheus endpoint: 0 = legacy/slot, 1 = dual-timeline (migration running), 2 = page-encoded.
+  # Nothing in this tool knew the migration existed, so an operator mid-Phase-A — with two
+  # timelines live and roughly double the write amplification — got a report that looked
+  # identical to a settled node.
+  if ! require_cmd curl; then
+    emit monad "monad.mip8-timeline" INFO "curl not installed — cannot read migration phase"
+    return
+  fi
+  local payload phase
+  payload=$(curl -sf --max-time 5 http://localhost:8889/metrics 2>/dev/null) || {
+    emit monad "monad.mip8-timeline" INFO "OTel :8889 unreachable — MIP-8 phase not determined"
+    return
+  }
+  # NOT $NF: the OTel Prometheus exposition appends a millisecond timestamp, so the last field
+  # is the clock, not the value —
+  #   monad_triedb_migration_phase{...} 0 1785475911990
+  # Strip the label block, then take the first remaining token.
+  phase=$(printf '%s\n' "$payload" \
+          | awk '/^monad_triedb_migration_phase/ {sub(/^[^ ]*[}] */,""); sub(/^monad_triedb_migration_phase */,""); print $1; exit}')
+  if [[ -z "$phase" ]]; then
+    # Absence is its own answer, and not the same as "phase 0": older node builds do not
+    # publish this series at all.
+    emit monad "monad.mip8-timeline" SKIP "monad_triedb_migration_phase not published by this node build — phase NOT verified"
+    return
+  fi
+  phase="${phase%%.*}"
+  case "$phase" in
+    0) emit monad "monad.mip8-timeline" PASS "legacy/slot storage (MIP-8 Phase A not started)" ;;
+    1) emit monad "monad.mip8-timeline" WARN "DUAL-TIMELINE — MIP-8 migration in progress" \
+            $'Expect:      elevated write amplification and triedb growth until it completes;\n             do not start a second migration or truncate the DB while this runs.\nVerify:      curl -s localhost:8889/metrics | grep monad_triedb_migration_phase\nWhy:         both encodings are live at once, so free space and IO look worse than\n             steady state — that is the migration, not a fault.' ;;
+    2) emit monad "monad.mip8-timeline" PASS "page-encoded storage (MIP-8 migration complete)" ;;
+    *) emit monad "monad.mip8-timeline" SKIP "unrecognised migration phase value '$phase' — phase NOT verified" ;;
+  esac
+}
+
 check_cruft_timer() {
   # monad-cruft.timer is a stock hourly cleanup unit shipped by the monad
   # package (drops old artifacts so disk doesn't fill). Docs list it among
@@ -1862,6 +1899,7 @@ main() {
     run_section monad     check_monad_user check_triedb_device check_triedb_udev \
                           check_cruft_timer check_monad_install \
                           check_github_release check_authudp_config check_authudp_peers \
+                          check_mip8_timeline \
                           check_vdp_otel_collector check_vdp_otel_version \
                           check_vdp_secp_key_label check_vdp_mf_push
   else
