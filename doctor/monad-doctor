@@ -1474,8 +1474,8 @@ check_mip8_timeline() {
   phase="${phase%%.*}"
   case "$phase" in
     0) emit monad "monad.mip8-timeline" PASS "legacy/slot storage (MIP-8 Phase A not started)" ;;
-    1) emit monad "monad.mip8-timeline" WARN "DUAL-TIMELINE — MIP-8 migration in progress" \
-            $'Expect:      elevated write amplification and triedb growth until it completes;\n             do not start a second migration or truncate the DB while this runs.\nVerify:      curl -s localhost:8889/metrics | grep monad_triedb_migration_phase\nWhy:         both encodings are live at once, so free space and IO look worse than\n             steady state — that is the migration, not a fault.' ;;
+    1) emit monad "monad.mip8-timeline" INFO "dual-timeline (MIP-8 Phase A done, awaiting Phase B hardfork)" \
+            $'Note:        this is the STEADY STATE after Phase A, not a migration in flight. The\n             node stays here until the Phase B hardfork, which MF has not scheduled.\nExpect:      both encodings live at once, so triedb is larger and writes heavier than\n             they will be afterwards. Watch headroom, not elapsed time.\nVerify:      curl -s localhost:8889/metrics | grep monad_triedb_migration_phase' ;;
     2) emit monad "monad.mip8-timeline" PASS "page-encoded storage (MIP-8 migration complete)" ;;
     *) emit monad "monad.mip8-timeline" SKIP "unrecognised migration phase value '$phase' — phase NOT verified" ;;
   esac
