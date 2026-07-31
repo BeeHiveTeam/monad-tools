@@ -2,7 +2,7 @@
 
 Pre-flight readiness check for Monad validator nodes. Single bash script, zero dependencies (except `fio` for the optional IOPS test, `ethtool` for bandwidth, `nvme-cli` for the LBA fix command), runs on any modern Ubuntu server.
 
-**55 checks across 5 sections** — tells you in 30 seconds whether your server is ready to be a Monad validator (incl. VDP OTel push compliance), and exactly what to fix if not.
+**57 checks across 5 sections** — tells you in 30 seconds whether your server is ready to be a Monad validator (incl. VDP OTel push compliance), and exactly what to fix if not.
 
 ```
 $ sudo ./monad-doctor --quick
@@ -18,7 +18,7 @@ $ sudo ./monad-doctor --quick
   ✓ host.bare-metal                running on bare metal
   ✓ cpu.cores                      16 physical cores (AMD EPYC 4585PX)
   ✓ cpu.smt                        SMT/HyperThreading disabled (per docs)
-  ✓ cpu.clock                      5.75 GHz max (≥4.5 GHz required)
+  ! cpu.clock                      4.30 GHz base — docs require 4.5 GHz+ base clock
   ✓ cpu.avx                        AVX-512 supported (faster BLS)
   ✓ ram.total                      125 GB total (106 GB available)
   ✓ disk.nvme                      4 NVMe drive(s), 5365 GB total
@@ -66,6 +66,17 @@ $ sudo ./monad-doctor --quick
 
 ✓ Verdict: READY
 ```
+
+
+### Flags
+
+| Flag | Effect |
+|---|---|
+| `--json` | machine-readable output |
+| `--quick` | skip the slow checks (fio IOPS) |
+| `--section <name>` | run one section only |
+| `--no-color` | no ANSI colours |
+| `--mode validator\|fullnode\|auto` | affects the VDP checks only. The Delegation Program applies to validators, so a full node is not FAILed for not pushing metrics to the Foundation. `auto` (default) warns rather than guessing — node.toml cannot distinguish the two. |
 
 ## Why use this
 
