@@ -1481,6 +1481,36 @@ check_mip8_timeline() {
   esac
 }
 
+check_needrestart() {
+  # unattended-upgrades and needrestart are DIFFERENT mechanisms, and checking only the first
+  # gives a host a clean bill of health while the second restarts the node underneath it.
+  # Observed 2026-08-01 on our own machine: an openssl security update (libssl3t64) had
+  # needrestart restart monad-bft, monad-rpc, sshd and fail2ban at 06:14 UTC. No reboot, no
+  # human, no warning — Automatic-Reboot=false was true the whole time and says nothing about
+  # this. On a validator that is missed proposal slots.
+  if ! dpkg -l needrestart 2>/dev/null | grep -qE '^.i  needrestart'; then
+    emit security "needrestart" INFO "needrestart not installed — library upgrades will not auto-restart services"
+    return
+  fi
+  local mode
+  mode=$(grep -hoE "^[[:space:]]*\\\$nrconf\{restart\}[[:space:]]*=[[:space:]]*'[lia]'" \
+         /etc/needrestart/needrestart.conf /etc/needrestart/conf.d/*.conf 2>/dev/null \
+         | grep -oE "'[lia]'" | tr -d "'" | tail -1)
+  # Unset means automatic under a non-interactive frontend, which is exactly how
+  # unattended-upgrades invokes it.
+  [[ -z "$mode" ]] && mode="a (default — unset)"
+  local blacklisted=0
+  grep -hqE 'monad-bft|monad-execution' /etc/needrestart/needrestart.conf /etc/needrestart/conf.d/*.conf 2>/dev/null && blacklisted=1
+  if [[ "$mode" == l* ]]; then
+    emit security "needrestart" PASS "needrestart in list-only mode — will not restart services by itself"
+  elif (( blacklisted )); then
+    emit security "needrestart" PASS "needrestart may restart services, but monad units are blacklisted"
+  else
+    emit security "needrestart" WARN "needrestart mode '${mode}' and monad units NOT blacklisted — a library upgrade will restart the node" \
+         $'Quick fix:   printf \'%s\\n\' "\\$nrconf{blacklist_rc} = [ qr(^monad-) ];" \\\n               | sudo tee /etc/needrestart/conf.d/99-monad.conf\nAlternative: echo "\\$nrconf{restart} = \'l\';" | sudo tee /etc/needrestart/conf.d/99-list-only.conf\n             (list only — you then restart on your own schedule)\nVerify:      sudo needrestart -b   # NEEDRESTART-SVC lines are what would be restarted\nWhy:         Automatic-Reboot=false does NOT cover this. needrestart restarts daemons\n             linked against an upgraded library — openssl, libc — with no reboot and no\n             prompt. On a validator that is dropped proposal slots, mid-epoch, unattended.'
+  fi
+}
+
 check_cruft_timer() {
   # monad-cruft.timer is a stock hourly cleanup unit shipped by the monad
   # package (drops old artifacts so disk doesn't fill). Docs list it among
@@ -1886,7 +1916,7 @@ main() {
   run_section hardware  check_baremetal check_cpu check_ram check_disks check_iops
   run_section os        check_os check_kernel check_kernel_pin check_ulimits check_sysctl check_ntp
   run_section network   check_public_ip check_bandwidth check_ports_free check_firewall
-  run_section security  check_ssh_hardening check_unattended_upgrades check_fail2ban \
+  run_section security  check_ssh_hardening check_unattended_upgrades check_needrestart check_fail2ban \
                         check_rpc_exposure check_iptables_udp_filter check_cve_2026_31431 \
                         check_nvme_cli
   # MONAD section: if the monad package is not installed, only run
