@@ -1499,8 +1499,14 @@ check_needrestart() {
   # Unset means automatic under a non-interactive frontend, which is exactly how
   # unattended-upgrades invokes it.
   [[ -z "$mode" ]] && mode="a (default — unset)"
+  # Смотреть на ДИРЕКТИВЫ, а не на текст файла. Первая версия грепала файл целиком, поэтому
+  # комментарий «когда-нибудь заблокируем monad-bft» засчитывался как настроенное исключение.
+  # Учитываем обе формы: `$nrconf{blacklist_rc} = [ ... ]` и `push @{$nrconf{blacklist_rc}}, ...`.
   local blacklisted=0
-  grep -hqE 'monad-bft|monad-execution' /etc/needrestart/needrestart.conf /etc/needrestart/conf.d/*.conf 2>/dev/null && blacklisted=1
+  if sed -e 's/#.*$//' /etc/needrestart/needrestart.conf /etc/needrestart/conf.d/*.conf 2>/dev/null \
+     | grep -qE 'blacklist_rc.*monad'; then
+    blacklisted=1
+  fi
   if [[ "$mode" == l* ]]; then
     emit security "needrestart" PASS "needrestart in list-only mode — will not restart services by itself"
   elif (( blacklisted )); then
