@@ -1445,20 +1445,29 @@ check_triedb_udev() {
 }
 
 check_mip8_timeline() {
-  # MIP-8 page-storage migration. The node publishes monad_triedb_migration_phase on the OTel
-  # Prometheus endpoint: 0 = legacy/slot, 1 = dual-timeline (migration running), 2 = page-encoded.
-  # Nothing in this tool knew the migration existed, so an operator mid-Phase-A — with two
-  # timelines live and roughly double the write amplification — got a report that looked
-  # identical to a settled node.
+  # MIP-8 page-storage migration. The node publishes monad_triedb_migration_phase:
+  # 0 = legacy/slot, 1 = dual-timeline (Phase A done), 2 = page-encoded (Phase C done).
+  #
+  # Severity is NOT fixed — it depends on whether a hardfork is scheduled for this network.
+  # Legacy/slot was a settled state until MF scheduled MONAD_TEN; from that moment the same
+  # phase 0 means the node will refuse to start on the target release and will fall off the
+  # chain at the fork. The deadline is read from networks.json, per network, so this stays
+  # correct on mainnet (no fork scheduled) and on testnet (scheduled) without a code change.
   if ! require_cmd curl; then
     emit monad "monad.mip8-timeline" INFO "curl not installed — cannot read migration phase"
     return
   fi
-  local payload phase
-  payload=$(curl -sf --max-time 5 http://localhost:8889/metrics 2>/dev/null) || {
-    emit monad "monad.mip8-timeline" INFO "OTel :8889 unreachable — MIP-8 phase not determined"
+  # 0.16.0 exposes metrics on 9143 by default; earlier builds used the OTel scrape port 8889.
+  local payload="" port=""
+  for port in 9143 8889; do
+    payload=$(curl -sf --max-time 5 "http://localhost:${port}/metrics" 2>/dev/null) && [[ -n "$payload" ]] && break
+    payload=""
+  done
+  if [[ -z "$payload" ]]; then
+    emit monad "monad.mip8-timeline" INFO "metrics endpoint (:9143, :8889) unreachable — MIP-8 phase NOT determined"
     return
-  }
+  fi
+  local phase
   # NOT $NF: the OTel Prometheus exposition appends a millisecond timestamp, so the last field
   # is the clock, not the value —
   #   monad_triedb_migration_phase{...} 0 1785475911990
@@ -1472,13 +1481,70 @@ check_mip8_timeline() {
     return
   fi
   phase="${phase%%.*}"
+
+  # Is a fork scheduled for THIS network? null / absent means no.
+  local network fork_ts="" now left="" deadline=""
+  network=$(detect_network)
+  if [[ -n "$network" ]]; then
+    fork_ts=$(curl -fsS -m 5 -H 'User-Agent: BeeHive/monad-tools' \
+      https://docs.monad.xyz/networks.json 2>/dev/null | tr -d ' \n' \
+      | grep -oE "\"${network}\":\{[^}]*\"mip8\":\{\"hardfork_timestamp\":[0-9]+" \
+      | grep -oE '[0-9]+$')
+  fi
+  if [[ -n "$fork_ts" ]]; then
+    now=$(date -u +%s)
+    left=$(( (fork_ts - now) / 86400 ))
+    deadline=$(date -u -d "@${fork_ts}" '+%Y-%m-%d %H:%M UTC' 2>/dev/null || printf 'timestamp %s' "$fork_ts")
+  fi
+
   case "$phase" in
-    0) emit monad "monad.mip8-timeline" PASS "legacy/slot storage (MIP-8 Phase A not started)" ;;
-    1) emit monad "monad.mip8-timeline" INFO "dual-timeline (MIP-8 Phase A done, awaiting Phase B hardfork)" \
-            $'Note:        this is the STEADY STATE after Phase A, not a migration in flight. The\n             node stays here until the Phase B hardfork, which MF has not scheduled.\nExpect:      both encodings live at once, so triedb is larger and writes heavier than\n             they will be afterwards. Watch headroom, not elapsed time.\nVerify:      curl -s localhost:8889/metrics | grep monad_triedb_migration_phase' ;;
+    0)
+      if [[ -n "$fork_ts" ]]; then
+        emit monad "monad.mip8-timeline" FAIL \
+             "legacy/slot storage, but MONAD_TEN is scheduled for ${network} at ${deadline} (~${left}d) — Phase A NOT done" \
+             $'Why:         the release that activates the fork refuses to start without a page\n             timeline, and a node still on slot encoding stops following the chain\n             at the fork. This is not a warning about the future: an upgrade attempted\n             before Phase A aborts at startup.\nQuick fix:   run Phase A (dual-db activation) BEFORE upgrading:\n             https://docs.monad.xyz/node-ops/upgrade-instructions/page-storage-mip-8-migration\nVerify:      monad-mpt --storage /dev/triedb   # expect Primary ethereum AND Secondary monad\nValidators:  migrate only when your cohort is announced.'
+      else
+        emit monad "monad.mip8-timeline" PASS "legacy/slot storage; no MONAD_TEN fork scheduled for ${network:-this network} yet"
+      fi
+      ;;
+    1)
+      emit monad "monad.mip8-timeline" PASS \
+           "dual-timeline — Phase A done${fork_ts:+, fork ${deadline} (~${left}d)}" \
+           $'Note:        this is the STEADY STATE between Phase A and the fork, not a migration\n             in flight. Both encodings are written, so triedb is larger and writes are\n             heavier than they will be after Phase C. Watch headroom, not elapsed time.\nVerify:      curl -s localhost:9143/metrics | grep monad_triedb_migration_phase'
+      ;;
     2) emit monad "monad.mip8-timeline" PASS "page-encoded storage (MIP-8 migration complete)" ;;
     *) emit monad "monad.mip8-timeline" SKIP "unrecognised migration phase value '$phase' — phase NOT verified" ;;
   esac
+}
+
+check_statesync_threshold() {
+  # statesync_threshold is how far behind the node must fall before it gives up on blocksync
+  # and statesyncs instead. The default is 600.
+  #
+  # Raising it is a known operator workaround for a period when statesync serving was broken
+  # network-wide — and it is a trap once that period ends. On 2026-08-07 this node came back
+  # from a 4-minute maintenance window ~4000 blocks behind, with the threshold left at 65000:
+  # below the threshold the node refuses to statesync, and blocksync got no headers from its
+  # group, so it sat still and fell further behind until consensus could no longer reconcile
+  # ("high qc too far ahead of block tree root"). Recovery then required a full hard reset.
+  # A stale high threshold turns a two-minute catch-up into an hour of downtime.
+  if [[ ! -r "$MONAD_NODE_TOML" ]]; then
+    emit monad "monad.statesync-threshold" INFO "node.toml not readable at $MONAD_NODE_TOML (skipped)"
+    return
+  fi
+  local val
+  val=$(awk -F= '/^[[:space:]]*statesync_threshold[[:space:]]*=/ {gsub(/[^0-9]/,"",$2); print $2; exit}' "$MONAD_NODE_TOML")
+  if [[ -z "$val" ]]; then
+    emit monad "monad.statesync-threshold" PASS "statesync_threshold not set — node uses the built-in default"
+    return
+  fi
+  if (( val > 2000 )); then
+    emit monad "monad.statesync-threshold" WARN \
+         "statesync_threshold = ${val} — far above the 600 default; automatic recovery is disabled below that gap" \
+         $'Why:         the node only statesyncs once it is MORE than this many blocks behind.\n             Under the threshold it must blocksync, and if peers do not serve the\n             range it stays stuck and keeps falling behind instead of recovering.\nQuick fix:   set statesync_threshold = 600 in node.toml, then restart monad-bft\nWhy it is here: a value raised during a network-wide statesync outage is easy to\n             leave behind. Re-check it whenever the reason for raising it has passed.'
+  else
+    emit monad "monad.statesync-threshold" PASS "statesync_threshold = ${val} (at or near the 600 default)"
+  fi
 }
 
 check_needrestart() {
@@ -1936,6 +2002,7 @@ main() {
                           check_cruft_timer check_monad_install \
                           check_github_release check_authudp_config check_authudp_peers \
                           check_mip8_timeline \
+                          check_statesync_threshold \
                           check_vdp_otel_collector check_vdp_otel_version \
                           check_vdp_secp_key_label check_vdp_mf_push
   else
