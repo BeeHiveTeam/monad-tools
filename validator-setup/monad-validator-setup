@@ -2003,8 +2003,46 @@ step_snapshot_restore() {
 # ===== Step: start services (final, opt-in) =====
 # Enable + start the three core services in the order docs prescribe.
 # Default: skip — operator should review node.toml + keys before going live.
+# Refuse to start a node whose database cannot satisfy the MIP-8 assertion.
+#
+# From v0.16.0 the node aborts at startup on a network with MONAD_TEN scheduled unless the
+# database has a page-encoded timeline. A fresh install formats a single slot timeline, so the
+# default path is only safe because the Foundation snapshot restore creates both. With
+# --no-snapshot-restore the node would come up, abort, and leave the operator staring at a
+# core dump with nothing here explaining why. Detect it before starting, and say what to do.
+#
+# Network-driven, not hardcoded: mainnet has no fork scheduled, so this stays quiet there.
+mip8_guard_blocks_start() {
+  local network="${NETWORK:-}" fork_ts="" timelines=""
+  [[ -z "$network" ]] && return 1
+  command -v curl >/dev/null || return 1
+  fork_ts=$(curl -fsS -m 5 -H 'User-Agent: BeeHive/monad-tools' \
+    https://docs.monad.xyz/networks.json 2>/dev/null | tr -d ' \n' \
+    | grep -oE "\"${network}\":\{[^}]*\"mip8\":\{\"hardfork_timestamp\":[0-9]+" \
+    | grep -oE '[0-9]+$')
+  # No fork scheduled for this network -> nothing to enforce.
+  [[ -z "$fork_ts" ]] && return 1
+  [[ -L /dev/triedb ]] || return 1
+  command -v monad-mpt >/dev/null || return 1
+  timelines=$(ulimit -n 65536 2>/dev/null; monad-mpt --storage /dev/triedb 2>/dev/null)
+  # A page timeline shows up as state-machine kind `monad`, primary or secondary.
+  printf '%s' "$timelines" | grep -q 'State machine kind: monad' && return 1
+  return 0
+}
+
 step_start_services() {
   section "Start monad services (FINAL — opt-in)"
+
+  if mip8_guard_blocks_start; then
+    err "Refusing to start: this network has a MONAD_TEN (MIP-8) hardfork scheduled, and the"
+    err "database has no page-encoded timeline. monad-bft would abort at startup."
+    info "Fix one of:"
+    info "  - re-run with snapshot restore (default): it imports into both timelines"
+    info "  - or run Phase A by hand, then start:"
+    info "    https://docs.monad.xyz/node-ops/upgrade-instructions/page-storage-mip-8-migration"
+    info "Verify:  monad-mpt --storage /dev/triedb   # expect Primary ethereum AND Secondary monad"
+    return 1
+  fi
 
   # Docs canonical order: monad-bft monad-execution monad-rpc.
   # systemd dependencies usually sort this regardless, but match docs to
