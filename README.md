@@ -69,7 +69,7 @@ For issues that `monad-validator-setup` cannot fix automatically (BIOS access, d
 
 ## Project status
 
-This is **opinionated, production-tested code** running on the BeeHive validator — a peer in the 200-validator testnet active set. PRs welcome, especially for:
+This is **opinionated, production-tested code** running on BeeHive's Monad testnet node: a registered validator, self-staked and awaiting delegation to enter the active set. PRs welcome, especially for:
 
 - Additional hardware checks (specific NVMe model warnings, RAID configurations)
 - Non-Ubuntu support (Debian, RHEL — currently Ubuntu-only)

@@ -126,9 +126,23 @@ otel_transport_sessions() { otel_gauge 'monad_wireauth_udp_state_transport_sessi
 # non-root cron, or MF moving the config path in a future release silently removed the
 # protection and the watchdog would restart an ACTIVE VALIDATOR — the exact thing this gate
 # exists to prevent. When we cannot tell, we assume validator and refuse to restart.
+#
+# `beneficiary` is a PAYOUT address, not a statement about consensus. A full-node may set one,
+# and a validator that is registered but not yet in the active set has one too — on such a node
+# the heuristic blocks a restart that is entirely safe, disabling the recovery this script exists
+# for. The chain publishes the real answer: monad_state_node_state_self_stake_bps ("Self stake in
+# basis points"), which is >0 only while the node is in the active set. Use it first and fall back
+# to the heuristic only when the metric cannot be read at all.
 GATE_BLOCK_RESTART=0
 if [ "$ALLOW_VALIDATOR_RESTART" != "1" ]; then
-  if [ -r "$NODE_TOML" ]; then
+  SELF_BPS=$(otel_gauge 'monad_state_node_state_self_stake_bps')
+  if [ -n "$SELF_BPS" ] && [ "$SELF_BPS" -gt 0 ] 2>/dev/null; then
+    log "self_stake_bps=$SELF_BPS → node IS in the active validator set. Will NOT auto-restart."
+    log "  override with ALLOW_VALIDATOR_RESTART=1 (WARNING: restart in a proposal slot drops blocks)."
+    GATE_BLOCK_RESTART=1
+  elif [ -n "$SELF_BPS" ]; then
+    log "self_stake_bps=0 → not in the active set; a restart drops no blocks. Gate open."
+  elif [ -r "$NODE_TOML" ]; then
     BEN=$(grep -E '^\s*beneficiary' "$NODE_TOML" 2>/dev/null | grep -oiE '0x[0-9a-f]+' | head -1)
     if [ -n "$BEN" ] && [ "$BEN" != "0x0000000000000000000000000000000000000000" ]; then
       log "node.toml beneficiary=$BEN (non-burn) → looks like a VALIDATOR. Will NOT auto-restart."
