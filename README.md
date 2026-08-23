@@ -2,13 +2,13 @@
 
 Operator tooling for Monad validator nodes, by [BeeHive](https://bee-hive.work). Single-file bash scripts, zero external dependencies for the diagnostic one, opinionated defaults that match what we run in production.
 
-| Tool | What | Lines |
-|---|---|---|
-| **[monad-doctor](doctor/)** | Pre-flight readiness check — hardware/OS/network/security/monad/VDP. **57 checks** in 30 seconds, JSON output, exits 0/1/2. Extended fix hints (Quick fix / Auto / Verify / Why) on every FAIL & WARN. | ~1990 |
-| **[monad-validator-setup](validator-setup/)** | **Fresh-server-to-running-validator** in one command — **25 steps**, including snapshot restore (default ON) and Foundation CVE mitigation (`algif_aead` blacklist + `unattended-upgrades` no-auto-reboot). Defaults to **full-node template** (per docs validator-installation — validators are promoted from a full node after on-chain stake); `--validator` opts into validator template. Auto-detects monad version from GitHub releases/latest, otelcol sha256-verified, UFW SSH-port auto-detect, end-to-end verified on a fresh Hetzner box. | ~3750 |
-| **[monad-watchdog](watchdog/)** | Cron recovery for the **`local timeout` deadlock** — a full-node that drops below its upstream-validator target freezes and can't self-recover. Detects it via RPC freeze/gap (statesync-aware, never restarts on a blind 0), restarts services with cooldown + escalation, and **refuses to restart an active validator** (non-burn beneficiary gate). | ~200 |
+| Tool | What |
+|---|---|
+| **[monad-doctor](doctor/)** | Pre-flight readiness check — hardware/OS/network/security/monad/VDP. **60 checks** in 30 seconds, JSON output, exits 0/1/2. Extended fix hints (Quick fix / Auto / Verify / Why) on every FAIL & WARN. |
+| **[monad-validator-setup](validator-setup/)** | **Fresh-server-to-running-validator** in one command — **25 steps**, including snapshot restore (default ON) and Foundation CVE mitigation (`algif_aead` blacklist + `unattended-upgrades` no-auto-reboot). Defaults to **full-node template** (per docs validator-installation — validators are promoted from a full node after on-chain stake); `--validator` opts into validator template. Auto-detects monad version from GitHub releases/latest, otelcol sha256-verified, UFW SSH-port auto-detect, end-to-end verified on a fresh Hetzner box. |
+| **[monad-watchdog](watchdog/)** | Cron recovery for the **`local timeout` deadlock** — a full-node that drops below its upstream-validator target freezes and can't self-recover. Detects it via RPC freeze/gap (statesync-aware, never restarts on a blind 0), restarts services with cooldown + escalation, and **refuses to restart a validator that is in the active set** (decided on `self_stake_bps`, with the node.toml beneficiary only as a fallback). |
 
-Companion repo: [BeeHiveTeam/monad-grafana](https://github.com/BeeHiveTeam/monad-grafana) — Prometheus + Grafana + node_exporter monitoring stack (4 containers, 49-panel dashboard, `--public` flag for browser access). Installs in one command.
+Companion repo: [BeeHiveTeam/monad-grafana](https://github.com/BeeHiveTeam/monad-grafana) — Prometheus + Grafana + node_exporter monitoring stack (4 containers, Grafana dashboard, `--public` flag for browser access). Installs in one command.
 
 ---
 
@@ -19,7 +19,7 @@ Companion repo: [BeeHiveTeam/monad-grafana](https://github.com/BeeHiveTeam/monad
 git clone https://github.com/BeeHiveTeam/monad-tools.git
 cd monad-tools
 
-# 2. Check the server is ready (57 checks, 30 seconds)
+# 2. Check the server is ready (30 seconds)
 sudo ./doctor/monad-doctor
 
 # 3. If READY (no FAIL): configure host end-to-end.

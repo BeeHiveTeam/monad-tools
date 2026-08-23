@@ -2,7 +2,7 @@
 
 Detects and recovers a **stuck Monad full-node**. Single bash script, runs from cron, zero dependencies beyond `curl` + `python3`-free (pure shell + `awk`).
 
-It targets one specific, nasty failure mode we hit in production (see [The problem](#the-problem)) and recovers it with a guarded `systemctl restart` — while refusing to touch a node that looks like an active validator.
+It targets one specific, nasty failure mode we hit in production (see [The problem](#the-problem)) and recovers it with a guarded `systemctl restart` — while refusing to touch a node that is in the active validator set.
 
 ```
 $ /usr/local/bin/monad-watchdog
@@ -49,10 +49,14 @@ watchdog so the recovery is automatic next time.
   acting again; if still stuck it escalates to an alert (a node that far behind
   needs a Hard Reset / snapshot restore — which this script intentionally does
   **not** do automatically).
-- **Validator safety gate:** if `node.toml` has a non-burn `beneficiary` the
-  node looks like an active validator — a restart in your proposal slot means
-  missed blocks. The script **refuses to restart** unless
-  `ALLOW_VALIDATOR_RESTART=1` is set explicitly.
+- **Validator safety gate:** a restart landing in your proposal slot means missed
+  blocks, so the script **refuses to restart** a node that is in the active
+  validator set unless `ALLOW_VALIDATOR_RESTART=1` is set explicitly. The signal
+  is `monad_state_node_state_self_stake_bps`, which is above zero only while the
+  node is in that set. The `beneficiary` field in `node.toml` is only a fallback
+  for when the metric cannot be read at all: it is a payout address, so a
+  full-node may set one and a validator that is registered but not yet in the set
+  has one too — deciding on it alone blocks restarts that are entirely safe.
 
 ## Install
 
@@ -77,7 +81,7 @@ sudo install -m 0755 watchdog/monad-watchdog /usr/local/bin/monad-watchdog
 | `GAP_ALERT` | `2000` | blocks behind network head that is clearly unhealthy |
 | `STATESYNC_STALL_MIN` | `30` | minutes of frozen synced-height while `syncing=1` before alerting a stalled statesync |
 | `RESTART_COOLDOWN` | `1800` | min seconds between restarts |
-| `ALLOW_VALIDATOR_RESTART` | `0` | set `1` to allow restarting a node with a non-burn beneficiary |
+| `ALLOW_VALIDATOR_RESTART` | `0` | set `1` to allow restarting a node the gate considers a validator |
 | `NODE_TOML` | `/home/monad/monad-bft/config/node.toml` | path used for the validator gate |
 | `ALERT_WEBHOOK` | _(empty)_ | optional Slack/Discord/Telegram webhook for alerts |
 
