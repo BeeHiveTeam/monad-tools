@@ -4,7 +4,7 @@ Operator tooling for Monad validator nodes, by [BeeHive](https://bee-hive.work).
 
 | Tool | What |
 |---|---|
-| **[monad-doctor](doctor/)** | Pre-flight readiness check — hardware/OS/network/security/monad/VDP. **60 checks** in 30 seconds, JSON output, exits 0/1/2. Extended fix hints (Quick fix / Auto / Verify / Why) on every FAIL & WARN. |
+| **[monad-doctor](doctor/)** | Pre-flight readiness check — hardware/OS/network/security/monad/VDP. **61 checks** in 30 seconds, JSON output, exits 0/1/2. Extended fix hints (Quick fix / Auto / Verify / Why) on every FAIL & WARN. |
 | **[monad-validator-setup](validator-setup/)** | **Fresh-server-to-running-validator** in one command — **25 steps**, including snapshot restore (default ON) and Foundation CVE mitigation (`algif_aead` blacklist + `unattended-upgrades` no-auto-reboot). Defaults to **full-node template** (per docs validator-installation — validators are promoted from a full node after on-chain stake); `--validator` opts into validator template. Auto-detects monad version from GitHub releases/latest, otelcol sha256-verified, UFW SSH-port auto-detect, end-to-end verified on a fresh Hetzner box. |
 | **[monad-watchdog](watchdog/)** | Cron recovery for the **`local timeout` deadlock** — a full-node that drops below its upstream-validator target freezes and can't self-recover. Detects it via RPC freeze/gap (statesync-aware, never restarts on a blind 0), restarts services with cooldown + escalation, and **refuses to restart a validator that is in the active set** (decided on `self_stake_bps`, with the node.toml beneficiary only as a fallback). |
 

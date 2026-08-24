@@ -1168,6 +1168,62 @@ check_firewall() {
 }
 
 # ===== Section: SECURITY =====
+check_metrics_exposure() {
+  # The Foundation asks operators to keep the client's metrics port off the public internet
+  # ("block 9143/tcp from outside", applies to every node type on both networks). The endpoint
+  # is unauthenticated and names the node: `secp_key`, `service_name`, peer counts and stake all
+  # come out of it, so an open port hands an observer a live map of who you are and how you are
+  # doing. Local readers are unaffected — ufw accepts loopback before any rule is consulted.
+  local port=9143
+  if ! ss -tlnH 2>/dev/null | awk '{print $4}' | grep -qE ":${port}\$"; then
+    emit security "metrics.exposure" PASS "metrics port ${port} is not listening"
+    return
+  fi
+  local bound_public=0
+  ss -tlnH 2>/dev/null | awk '{print $4}' \
+    | grep -qE "(^|[^0-9])(0\.0\.0\.0|\[::\]|\*):${port}\$" && bound_public=1
+
+  if ! require_cmd ufw || ! ufw status >/dev/null 2>&1; then
+    # Cannot read the firewall: that is "not verified", not "fine". Saying PASS here is how an
+    # exposed port gets a green tick.
+    emit security "metrics.exposure" SKIP "ufw unavailable — metrics exposure NOT verified" \
+         $'Action:      ss -tlnp | grep :9143 ; check your firewall manually'
+    return
+  fi
+  local ufw_status
+  ufw_status=$(ufw status 2>/dev/null)
+  if ! grep -qiE '^Status:[[:space:]]*active' <<<"$ufw_status"; then
+    if (( bound_public )); then
+      emit security "metrics.exposure" FAIL "ufw INACTIVE and metrics port ${port} bound to 0.0.0.0 — reachable from the internet" \
+           $'Quick fix:   sudo ufw deny 9143/tcp\n             sudo ufw enable   # after allowing your SSH port!\nVerify:      from another host: nc -z -w3 <YOUR-IP> 9143   # must fail\nWhy:         Foundation guidance; the endpoint is unauthenticated and publishes secp_key.'
+    else
+      emit security "metrics.exposure" WARN "ufw is INACTIVE — metrics port ${port} judged from its listen address only" \
+           $'Quick fix:   sudo ufw enable   # after allowing your SSH port!\nWhy:         without a firewall nothing stops a later rebind from exposing it.'
+    fi
+    return
+  fi
+  # An explicit DENY is what the Foundation asks for. A rule limited to specific source IPs is
+  # also acceptable — that is a scraper you run, not the public internet.
+  if awk -v p="$port" '$0 ~ "^"p".*DENY"' <<<"$ufw_status" | grep -q .; then
+    emit security "metrics.exposure" PASS "metrics port ${port} explicitly denied in ufw"
+  elif awk -v p="$port" '$0 ~ "^"p".*ALLOW.*Anywhere"' <<<"$ufw_status" | grep -q .; then
+    emit security "metrics.exposure" FAIL "metrics port ${port} publicly ALLOWed in ufw — Foundation asks for it to be blocked" \
+         $'Quick fix:   sudo ufw delete allow 9143/tcp ; sudo ufw deny 9143/tcp\n             # keep a scraper? allow only its address instead:\n             sudo ufw allow from <SCRAPER-IP> to any port 9143\nVerify:      sudo ufw status numbered | grep 9143\nWhy:         the endpoint is unauthenticated and publishes secp_key, peers and stake.'
+  elif awk -v p="$port" '$0 ~ "^"p".*ALLOW"' <<<"$ufw_status" | grep -q .; then
+    # Reached only when no ALLOW was to Anywhere, so every allow rule names a source. That is a
+    # scraper the operator runs, not the public internet — the same latitude check_rpc_exposure
+    # gives 8080. Saying "no rule" here would have described the state wrongly.
+    emit security "metrics.exposure" PASS "metrics port ${port} allowed only from specific sources, not Anywhere"
+  elif (( bound_public )); then
+    # Default-deny already covers it, but the Foundation asked for an explicit rule and an
+    # explicit rule survives someone widening the default policy later.
+    emit security "metrics.exposure" WARN "metrics port ${port} listens on 0.0.0.0 and has no ufw rule — covered by default-deny only" \
+         $'Quick fix:   sudo ufw deny 9143/tcp\nVerify:      from another host: nc -z -w3 <YOUR-IP> 9143   # must fail\nWhy:         Foundation asks for an explicit block; a default policy is one command from changing.'
+  else
+    emit security "metrics.exposure" PASS "metrics port ${port} bound to loopback only"
+  fi
+}
+
 check_rpc_exposure() {
   # Per docs.monad.xyz/node-ops/validator-delegation-program:
   #   "Not use a validator node to service external RPCs (Axelar, Wormhole, etc.)"
@@ -1989,7 +2045,7 @@ main() {
   run_section os        check_os check_kernel check_kernel_pin check_ulimits check_sysctl check_ntp
   run_section network   check_public_ip check_bandwidth check_ports_free check_firewall
   run_section security  check_ssh_hardening check_unattended_upgrades check_needrestart check_fail2ban \
-                        check_rpc_exposure check_iptables_udp_filter check_cve_2026_31431 \
+                        check_rpc_exposure check_metrics_exposure check_iptables_udp_filter check_cve_2026_31431 \
                         check_nvme_cli
   # MONAD section: if the monad package is not installed, only run
   # `check_monad_install` (which emits an INFO that this is a pre-flight

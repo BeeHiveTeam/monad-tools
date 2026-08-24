@@ -54,7 +54,7 @@ Zero prompts. The script:
 16. **`monad-cruft.timer`** — auto-enables hourly cleanup
 17. **otelcol install** — otelcol v0.139.0 `.deb` from GitHub releases, **sha256-verified** against pinned hash. Plus `apt-mark hold otelcol`. Skipped on `otelcol-contrib` setups (operator runs custom collector).
 18. **otelcol enable** — `systemctl enable --now otelcol` (if config present)
-19. **UFW** — auto-detected SSH port(s) + 8000/tcp+udp + 8001/udp. Prompts before `ufw enable`.
+19. **UFW** — auto-detected SSH port(s) + 8000/tcp+udp + 8001/udp, and an explicit `deny 9143/tcp` for the client's metrics endpoint, which the Foundation asks operators to keep off the public internet. Loopback is unaffected, so local readers keep working. Prompts before `ufw enable`.
 20. **iptables UDP length filter** — `iptables -I INPUT -p udp --dport 8000 -m length --length 0:1400 -j DROP` per docs. Persisted via `netfilter-persistent` OR `/etc/ufw/before.rules`. Prompts before insert.
 21. **(optional)** `--with-monitoring` → [BeeHive monad-grafana](https://github.com/BeeHiveTeam/monad-grafana) installer
 22. **Snapshot restore (default ON)** — `curl $MF_BUCKET/scripts/<network>/restore-from-snapshot.sh | bash` per docs hard-reset. Auto-skips when ledger already has ≥100 MB of data and no role transition happened. Use `--no-snapshot-restore` to skip even on fresh installs.

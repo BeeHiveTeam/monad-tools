@@ -167,6 +167,7 @@ MONAD_PKG_VERSION="${MONAD_PKG_VERSION-__auto__}"   # __auto__ = decide after ap
 UFW_SSH_PORT="${UFW_SSH_PORT:-}"
 UFW_P2P_PORT="8000"        # both TCP and UDP
 UFW_AUTHUDP_PORT="8001"    # UDP only
+UFW_METRICS_PORT="9143"    # client metrics; Foundation asks operators to block it externally
 
 # ===== Colors =====
 if [[ -t 1 ]]; then
@@ -3236,6 +3237,7 @@ step_firewall() {
       echo "  ${C_DIM}[dry-run] ufw allow ${p_dry}/tcp${C_RESET}"
     done
     echo "  ${C_DIM}[dry-run] ufw allow ${UFW_P2P_PORT} (tcp+udp), ${UFW_AUTHUDP_PORT}/udp${C_RESET}"
+    echo "  ${C_DIM}[dry-run] ufw deny ${UFW_METRICS_PORT}/tcp${C_RESET}"
     return 0
   fi
 
@@ -3249,6 +3251,12 @@ step_firewall() {
   ufw allow "${UFW_P2P_PORT}/udp" comment 'monad p2p (udp/raptorcast)' >>"$LOG_FILE" 2>&1 || true
   # 8001: Authenticated UDP only
   ufw allow "${UFW_AUTHUDP_PORT}/udp" comment 'monad authenticated udp' >>"$LOG_FILE" 2>&1 || true
+  # 9143: the client's metrics endpoint. Default-deny already covers it, but the Foundation asks
+  # for an explicit block on every node type and both networks, and an explicit rule survives a
+  # later `ufw default allow incoming`. The endpoint is unauthenticated and publishes secp_key,
+  # peer counts and stake. Loopback is unaffected: ufw accepts `-i lo` before any rule is read,
+  # so local readers (monad-doctor, watchdogs, exporters) keep working.
+  ufw deny "${UFW_METRICS_PORT}/tcp" comment 'monad metrics (MF: block from outside)' >>"$LOG_FILE" 2>&1 || true
 
   if ! ufw status | grep -q "Status: active"; then
     if confirm "Enable UFW now? (SSH allowed on: ${UFW_SSH_PORT})"; then

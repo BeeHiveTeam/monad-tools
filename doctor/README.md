@@ -2,7 +2,7 @@
 
 Pre-flight readiness check for Monad validator nodes. Single bash script, zero dependencies (except `fio` for the optional IOPS test, `ethtool` for bandwidth, `nvme-cli` for the LBA fix command), runs on any modern Ubuntu server.
 
-**60 checks across 5 sections** — tells you in 30 seconds whether your server is ready to be a Monad validator (incl. VDP OTel push compliance), and exactly what to fix if not.
+**61 checks across 5 sections** — tells you in 30 seconds whether your server is ready to be a Monad validator (incl. VDP OTel push compliance), and exactly what to fix if not.
 
 ```
 $ sudo ./monad-doctor --quick
