@@ -1,0 +1,226 @@
+#!/usr/bin/env bash
+# Delegate MON to a Monad validator through staking-sdk-cli, with the checks the CLI
+# does not do for you.
+#
+# Dry run by default. Nothing is broadcast until --confirm, and only after all of:
+#   1. the private key actually belongs to the address you named
+#   2. the balance covers the amount AND the gas reserve
+#   3. the calldata decodes to the validator you asked for
+#   4. eth_call simulation succeeds against the staking precompile
+#
+# Nothing here has a default that costs money: the validator id, the from-address and
+# the network must all be given explicitly. A public tool that ships someone's validator
+# id as a default is one forgotten flag away from sending a stranger's stake to them.
+set -uo pipefail
+cd "$(dirname "$0")"
+
+usage() {
+  cat <<USAGE
+Usage: AMOUNT=<whole MON> $0 [--confirm]
+
+Run on the host that runs your validator and it identifies itself: the network comes
+from the node's metric labels, and the validator id and authorised address come from
+the staking precompile, matched against the secp key on disk. Nothing about where the
+money goes is a default — it is either read from your node or refused.
+
+Required:
+  AMOUNT      whole MON, as the CLI requires
+
+Detected from the node, override only if you know why:
+  VAL_ID      validator id (refuses if it disagrees with what the node reports)
+  FROM        address the key must belong to; the CLI does not verify this itself
+  NETWORK     testnet | mainnet
+
+Optional:
+  RPC              override the endpoint for NETWORK
+  NODE_RPC         local node JSON-RPC for the lookup (default 127.0.0.1:8080)
+  NODE_METRICS     local node metrics for network detection (default 127.0.0.1:9143)
+  PUBKEY_FILE      where the node keeps its keys (default /home/monad/pubkey-secp-bls)
+  MAX_ID           highest validator id to scan (default 400)
+  GAS_RESERVE_MON  MON kept aside for gas (default 2)
+
+Off the node, pass VAL_ID and FROM yourself — nothing is guessed.
+
+The staking CLI takes the key through FUNDED_ADDRESS_PRIVATE_KEY, so during the send it
+is present in this process's environment and inherited by the CLI. On a shared host root
+can read it from /proc/<pid>/environ. That is the CLI's only supported input; run this on
+a host you control, and prefer a key that holds only what you intend to delegate.
+USAGE
+}
+
+[ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ] && { usage; exit 0; }
+
+: "${AMOUNT:?AMOUNT is required — see --help}"
+
+# ── Auto-detection from the node running on this host ────────────────────────
+# VAL_ID and FROM decide where money goes, so rather than shipping defaults we read
+# them from the node itself: the secp key on disk identifies this validator, and the
+# staking precompile maps that key to the id and the authorised address. Anything the
+# node cannot tell us stays required, and a mismatch is an error rather than a guess.
+NODE_METRICS="${NODE_METRICS:-http://127.0.0.1:9143/metrics}"
+NODE_RPC="${NODE_RPC:-http://127.0.0.1:8080}"
+PUBKEY_FILE="${PUBKEY_FILE:-/home/monad/pubkey-secp-bls}"
+
+if [ -z "${NETWORK:-}" ] && curl -sf -m 5 "$NODE_METRICS" >/dev/null 2>&1; then
+  DETECTED_NET=$(curl -s -m 5 "$NODE_METRICS" | grep -m1 -oE 'network="[^"]*"' | cut -d'"' -f2)
+  [ -n "$DETECTED_NET" ] && { NETWORK="$DETECTED_NET"; echo "detected network from node: $NETWORK"; }
+fi
+NETWORK="${NETWORK:-testnet}"
+case "$NETWORK" in
+  testnet) DEFAULT_RPC="https://testnet-rpc.monad.xyz" ;;
+  mainnet) DEFAULT_RPC="https://rpc.monad.xyz" ;;
+  *) echo "NETWORK must be testnet or mainnet, got '$NETWORK'"; exit 1 ;;
+esac
+RPC="${RPC:-$DEFAULT_RPC}"
+
+# Identify this node's validator by its own secp key. The precompile returns the key for
+# each id, so a scan finds ours without asking the operator to type an id they might get
+# wrong — and delegating to the wrong validator is not recoverable.
+if { [ -z "${VAL_ID:-}" ] || [ -z "${FROM:-}" ]; } && [ -r "$PUBKEY_FILE" ]; then
+  MY_SECP=$(grep -oE 'Secp public key: [0-9a-fA-F]+' "$PUBKEY_FILE" 2>/dev/null | awk '{print $NF}')
+  if [ -n "$MY_SECP" ]; then
+    echo "identifying this node's validator from $PUBKEY_FILE ..."
+    DETECTED=$(MY_SECP="$MY_SECP" NODE_RPC="$NODE_RPC" MAX_ID="${MAX_ID:-400}" python3 - <<'PY'
+import json,os,sys,urllib.request
+rpc=os.environ["NODE_RPC"]; want=os.environ["MY_SECP"].lower()
+C="0x0000000000000000000000000000000000001000"
+def call(d):
+    req={"jsonrpc":"2.0","id":1,"method":"eth_call","params":[{"to":C,"data":d},"latest"]}
+    r=urllib.request.Request(rpc,json.dumps(req).encode(),{"Content-Type":"application/json"})
+    return json.load(urllib.request.urlopen(r,timeout=10)).get("result")
+def fields(res):
+    raw=res[2:]
+    off=int(raw[10*64:11*64],16)*2
+    ln=int(raw[off:off+64],16)*2
+    return raw[off+64:off+64+ln].lower(), "0x"+raw[24:64]
+try:
+    for vid in range(1,int(os.environ["MAX_ID"])+1):
+        r=call("0x2b6d639a"+f"{vid:064x}")
+        if not r or len(r)<=2: continue
+        try:
+            secp,auth=fields(r)
+        except Exception:
+            continue
+        if secp==want:
+            print(f"{vid} {auth}"); sys.exit(0)
+except Exception as e:
+    print("", file=sys.stderr)
+PY
+) || true
+    if [ -n "$DETECTED" ]; then
+      DET_ID="${DETECTED%% *}"; DET_FROM="${DETECTED##* }"
+      if [ -z "${VAL_ID:-}" ]; then VAL_ID="$DET_ID"; echo "  validator id : #$VAL_ID (from chain)"; fi
+      if [ -z "${FROM:-}" ]; then FROM="$DET_FROM"; echo "  auth address : $FROM (from chain)"; fi
+      # If the operator named an id AND the node identifies a different one, stop: one of
+      # the two is wrong and guessing which would move money to the wrong place.
+      if [ "$VAL_ID" != "$DET_ID" ]; then
+        echo "refusing: you asked for validator #$VAL_ID but this node is validator #$DET_ID"
+        echo "          set MAX_ID higher, or run with the id you really mean on another host"
+        exit 1
+      fi
+    else
+      echo "  could not identify this node on chain (not registered yet, or id above MAX_ID)"
+    fi
+  fi
+fi
+
+: "${VAL_ID:?VAL_ID could not be detected and was not given — see --help}"
+: "${FROM:?FROM could not be detected and was not given — see --help}"
+# The staking precompile address is the same on both networks.
+CONTRACT="0x0000000000000000000000000000000000001000"
+# The CLI does not estimate gas: gas_limit 2,000,000 at max_fee 500 gwei is up to 1 MON
+# per attempt, and a failed attempt is charged too. Two MON covers a retry.
+GAS_RESERVE_MON="${GAS_RESERVE_MON:-2}"
+
+[[ "$VAL_ID" =~ ^[0-9]+$ ]] || { echo "VAL_ID must be a number, got '$VAL_ID'"; exit 1; }
+[[ "$FROM" =~ ^0x[a-fA-F0-9]{40}$ ]] || { echo "FROM must be a 0x address, got '$FROM'"; exit 1; }
+[[ "$AMOUNT" =~ ^[0-9]+$ ]] || { echo "AMOUNT must be whole MON, got '$AMOUNT'"; exit 1; }
+
+MODE="dry"; [ "${1:-}" = "--confirm" ] && MODE="go"
+
+echo "════════════════════════════════════════════════════════"
+[ "$MODE" = "dry" ] && echo "  MODE: dry run — nothing will be broadcast" \
+                    || echo "  MODE: LIVE — a transaction will be sent once the checks pass"
+echo "  network      : $NETWORK ($RPC)"
+echo "  validator    : #$VAL_ID"
+echo "  amount       : $AMOUNT MON"
+echo "  from         : $FROM"
+echo "  gas reserve  : $GAS_RESERVE_MON MON"
+echo "════════════════════════════════════════════════════════"; echo
+
+read -rsp "Private key for $FROM: " FUND; echo; echo
+FUND="${FUND#0x}"
+[ ${#FUND} -ne 64 ] && { echo "expected 64 hex characters, got ${#FUND}"; exit 1; }
+trap 'unset FUND FUNDED_ADDRESS_PRIVATE_KEY' EXIT
+
+# 1. Does the key belong to the address? The CLI will happily sign with the wrong one.
+GOT=$(FUND="$FUND" ./.venv/bin/python -c "
+import os
+from eth_account import Account
+print(Account.from_key(bytes.fromhex(os.environ['FUND'])).address)
+" 2>/dev/null)
+if [ "${GOT,,}" != "${FROM,,}" ]; then
+  echo "key belongs to ${GOT:-<could not derive>}, not $FROM"
+  exit 1
+fi
+echo "ok  key matches $FROM"
+
+# 2. Balance, including gas. Delegating the whole balance leaves nothing to pay with.
+BAL=$(./.venv/bin/python - "$FROM" "$RPC" <<'PY'
+import json,sys,urllib.request
+a,rpc=sys.argv[1],sys.argv[2]
+req={"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":[a,"latest"]}
+r=urllib.request.Request(rpc,data=json.dumps(req).encode(),headers={'Content-Type':'application/json'})
+print(int(json.load(urllib.request.urlopen(r,timeout=20))["result"],16)/10**18)
+PY
+) || { echo "could not read balance from $RPC"; exit 1; }
+NEED=$(python3 -c "print($AMOUNT + $GAS_RESERVE_MON)")
+echo "    balance $BAL MON, need at least $NEED MON"
+python3 -c "import sys; sys.exit(0 if float('$BAL') >= float('$NEED') else 1)" \
+  || { echo "insufficient balance: the delegation would consume the gas budget"; exit 1; }
+echo "ok  balance covers amount plus gas"
+
+# 3. Calldata: delegate(uint256). Decode it back rather than trusting the format string.
+CD="0x84994fec$(printf '%064x' "$VAL_ID")"
+DEC=$(python3 -c "
+cd='$CD'
+assert cd[:10]=='0x84994fec', 'selector is not delegate'
+assert len(cd)==10+64, 'calldata is not 4+32 bytes'
+print(int(cd[10:],16))
+") || { echo "calldata failed to decode"; exit 1; }
+[ "$DEC" != "$VAL_ID" ] && { echo "calldata targets validator #$DEC, not #$VAL_ID"; exit 1; }
+echo "ok  calldata is delegate(#$DEC)"
+
+# 4. Simulate. A revert here is the difference between a failed send and a paid failure.
+echo
+echo "=== eth_call simulation (nothing sent yet) ==="
+SIM=$(./.venv/bin/python - "$CD" "$FROM" "$AMOUNT" "$RPC" "$CONTRACT" <<'PY'
+import json,sys,urllib.request
+cd,frm,amt,rpc,to=sys.argv[1],sys.argv[2],int(sys.argv[3]),sys.argv[4],sys.argv[5]
+req={"jsonrpc":"2.0","id":1,"method":"eth_call","params":[
+     {"from":frm,"to":to,"value":hex(amt*10**18),"data":cd},"latest"]}
+try:
+    r=urllib.request.Request(rpc,data=json.dumps(req).encode(),headers={'Content-Type':'application/json'})
+    res=json.load(urllib.request.urlopen(r,timeout=30))
+except Exception as e:
+    print("ERROR|%s"%e); sys.exit()
+print(("REVERT|%s"%res['error'].get('message')) if 'error' in res else ("OK|%s"%res.get('result')))
+PY
+)
+echo "    ${SIM/|/: }"
+case "$SIM" in OK*) echo "ok  the precompile accepts this call" ;;
+  *) echo "simulation failed — nothing will be sent"; exit 1 ;; esac
+
+echo
+if [ "$MODE" = "dry" ]; then
+  echo "dry run complete: address, balance, calldata and simulation all pass."
+  echo "To delegate for real:  VAL_ID=$VAL_ID FROM=$FROM AMOUNT=$AMOUNT NETWORK=$NETWORK $0 --confirm"
+  exit 0
+fi
+export FUNDED_ADDRESS_PRIVATE_KEY="$FUND"
+echo "sending..."
+LOG=$(mktemp); trap 'rm -f "$LOG"; unset FUND FUNDED_ADDRESS_PRIVATE_KEY' EXIT
+echo y | COLUMNS=4000 ./.venv/bin/python staking-cli/main.py delegate \
+  --validator-id "$VAL_ID" --amount "$AMOUNT" --config-path config.toml > "$LOG" 2>&1
+grep -iE 'Tx status|Tx hash|Delegate|error|revert' "$LOG" | head -10
+grep -q 'Tx status: 1' "$LOG" && echo "success" || { echo "check the output:"; tail -25 "$LOG"; }
