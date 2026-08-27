@@ -1168,6 +1168,47 @@ check_firewall() {
 }
 
 # ===== Section: SECURITY =====
+check_validator_registration() {
+  # "Registered" and "in the active set" are different states, and the difference is the
+  # one that decides whether this node signs anything. self_stake_bps is the only metric
+  # that separates them: it stays 0 for a registered validator waiting on delegation.
+  #
+  # created_vote is a false friend here — it increments on nodes with no consensus
+  # participation at all, so a node outside the set shows millions of them and looks busy.
+  local port=9143 metrics
+  if ! require_cmd curl; then
+    emit node "validator.registration" SKIP "curl unavailable — registration state NOT checked"
+    return
+  fi
+  metrics=$(curl -s -m 5 "http://127.0.0.1:${port}/metrics" 2>/dev/null) || true
+  if [[ -z "$metrics" ]]; then
+    emit node "validator.registration" SKIP "node metrics on :${port} unreachable — registration state NOT checked"
+    return
+  fi
+
+  local bps
+  bps=$(printf '%s' "$metrics" | grep -m1 -E '^monad_state_node_state_self_stake_bps' \
+        | sed 's/{[^}]*}//' | awk '{print $2}')
+
+  if [[ -z "$bps" ]]; then
+    # Absent is not zero: a full-node never publishes this series, and so does a client
+    # too old to expose it. Either way we did not measure, so we do not claim.
+    emit node "validator.registration" SKIP \
+      "self_stake_bps not published — full-node, or a client that predates the metric" \
+      $'Note:        this is not "unregistered"; the series is simply absent here.\nCheck:       curl -s localhost:9143/metrics | grep self_stake_bps'
+    return
+  fi
+
+  if [[ "$bps" == "0" || "$bps" == "0.0" ]]; then
+    emit node "validator.registration" INFO \
+      "registered but NOT in the active set (self_stake_bps = 0) — this node signs nothing yet" \
+      $'Why:         registration alone does not admit a validator; the set is ranked by stake\n             and entry needs total delegation above the active-set threshold.\nCheck:       cast call 0x...1000 (staking precompile) or the explorer for your id.\nNote:        a restart is free while this reads 0 — no blocks are missed.'
+    return
+  fi
+
+  emit node "validator.registration" PASS "in the active set (self_stake_bps = ${bps})"
+}
+
 check_metrics_exposure() {
   # The Foundation asks operators to keep the client's metrics port off the public internet
   # ("block 9143/tcp from outside", applies to every node type on both networks). The endpoint
@@ -2059,6 +2100,7 @@ main() {
                           check_github_release check_authudp_config check_authudp_peers \
                           check_mip8_timeline \
                           check_statesync_threshold \
+                          check_validator_registration \
                           check_vdp_otel_collector check_vdp_otel_version \
                           check_vdp_secp_key_label check_vdp_mf_push
   else
