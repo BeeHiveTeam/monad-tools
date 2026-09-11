@@ -81,7 +81,54 @@ ALERT_WEBHOOK="${ALERT_WEBHOOK:-}"                      # optional Slack/Discord
 STATE_DIR="${STATE_DIR:-/var/lib/monad-watchdog}"
 STATE_FILE="$STATE_DIR/last_block"
 COOLDOWN_FILE="$STATE_DIR/last_restart"
-mkdir -p "$STATE_DIR"
+# ---- arguments -------------------------------------------------------------
+# Parsed before anything else touches the host. This script restarts services;
+# running it because someone typed --help to find out what it does is not an
+# acceptable way to learn that.
+usage() {
+  cat <<'EOF'
+monad-watchdog — detect and recover a stuck Monad FULL-NODE.
+
+Run with no arguments. Intended for cron, e.g.
+  */5 * * * * /usr/local/bin/monad-watchdog >> /var/log/monad-watchdog.log 2>&1
+
+It reads the local and network block heights over RPC and, when the local head
+is frozen, restarts the monad services. On an ACTIVE VALIDATOR a restart during
+your proposal slot costs blocks, so a non-burn beneficiary in node.toml blocks
+the restart unless ALLOW_VALIDATOR_RESTART=1 is set.
+
+Environment:
+  RPC, NET_RPC              node and network RPC endpoints
+  MIN_ADVANCE               blocks the local head must gain per run (default 50)
+  GAP_ALERT                 blocks behind the network head that is unhealthy
+  RESTART_COOLDOWN          minimum seconds between restarts (default 1800)
+  ALLOW_VALIDATOR_RESTART   1 to permit restarts on a validator (default 0)
+  STATE_DIR                 where the last-seen height is kept
+  ALERT_WEBHOOK             optional webhook for alerts
+  NODE_TOML                 path to node.toml
+
+Options:
+  -h, --help                show this and exit without touching anything
+EOF
+}
+case "${1-}" in
+  -h|--help) usage; exit 0 ;;
+  "") ;;
+  *) printf 'monad-watchdog: unknown argument %s\n\n' "$1" >&2; usage >&2; exit 2 ;;
+esac
+
+# ---- state -----------------------------------------------------------------
+# A watchdog that cannot keep state cannot see a freeze: the previous height
+# reads as 0 every run, so the delta equals the whole block number and "frozen"
+# never fires. That failure is silent and permanent, so it is fatal here rather
+# than something to carry on through.
+if ! mkdir -p "$STATE_DIR" 2>/dev/null || ! : > "$STATE_DIR/.probe" 2>/dev/null; then
+  printf 'monad-watchdog: state dir %s is not writable — refusing to run blind.\n' "$STATE_DIR" >&2
+  printf '  Without it the previous height reads as 0 and a frozen node looks healthy.\n' >&2
+  printf '  Create it, fix its permissions, or point STATE_DIR somewhere writable.\n' >&2
+  exit 3
+fi
+rm -f "$STATE_DIR/.probe"
 
 ts()  { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
 log() { echo "$(ts) $*"; }
