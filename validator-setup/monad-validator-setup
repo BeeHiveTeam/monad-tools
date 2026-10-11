@@ -33,7 +33,7 @@
 #   sudo ./monad-validator-setup                       # interactive (asks network + prompts for optionals)
 #   sudo ./monad-validator-setup --network=testnet     # skip network prompt
 #   sudo ./monad-validator-setup --network=mainnet --non-interactive
-#   sudo ./monad-validator-setup --full-node           # full-node template (default: validator)
+#   sudo ./monad-validator-setup --full-node           # full-node template (the default)
 #   sudo ./monad-validator-setup --dry-run             # show what would change
 #   sudo ./monad-validator-setup --triedb-dev=nvme1n1  # pin IO-scheduler target
 #   sudo ./monad-validator-setup --triedb-partition=nvme1n1   # DESTRUCTIVE: partition this disk for triedb
@@ -2474,6 +2474,18 @@ step_config_files() {
     fi
   fi
 
+  # Only an explicit role may change the template. NODE_TYPE defaults to "full", so a plain re-run
+  # on a validator compared the validator template with a role nobody asked for and offered to
+  # swap it — with the advice that the full-node template "fixes peer discovery". Without
+  # --full-node / --validator / --node-type, the node keeps the role its node.toml already has,
+  # and the steps after this one see that role instead of the default.
+  if [[ -f "$node_toml" && -n "$existing_type" && "$existing_type" != "$NODE_TYPE" ]] \
+     && (( NODE_TYPE_EXPLICIT == 0 )); then
+    info "Existing node.toml is a ${existing_type}-template; no role was requested, so keeping it."
+    info "  To change the role, re-run with --full-node or --validator."
+    NODE_TYPE="$existing_type"
+  fi
+
   if [[ -f "$node_toml" && -n "$existing_type" && "$existing_type" != "$NODE_TYPE" ]]; then
     warn "Existing node.toml is a ${existing_type}-template, requested ${NODE_TYPE}."
     if [[ "$existing_type" == "validator" && "$NODE_TYPE" == "full" ]]; then
@@ -2868,6 +2880,18 @@ step_chrony() {
   fi
 }
 
+# MF's approved monad version for $NETWORK, from docs.monad.xyz/networks.json; empty when the
+# network is unset or the file is unreachable. One reader for the fresh install and the re-run, so
+# the two cannot disagree about which version a network should be on.
+monad_network_target() {
+  [[ -n "$NETWORK" ]] && command -v curl >/dev/null 2>&1 || return 0
+  curl -fsS -m 5 -H 'User-Agent: BeeHive/monad-tools' \
+    https://docs.monad.xyz/networks.json 2>/dev/null \
+    | tr -d ' \n' \
+    | grep -oE "\"${NETWORK}\":\{\"monad_version\":\"[0-9]+\.[0-9]+\.[0-9]+[^\"]*\"" \
+    | grep -oE '[0-9]+\.[0-9]+\.[0-9]+[^"]*' | head -1
+}
+
 # ===== Step: monad apt repo + package =====
 step_monad_install() {
   section "Monad package"
@@ -2877,12 +2901,33 @@ step_monad_install() {
     local cur
     cur=$(dpkg-query -W -f='${Version}' monad)
     ok "monad already installed (version $cur)"
-    # Surface available upgrade so operator sees the gap on re-run.
-    local candidate=""
-    candidate=$(apt-cache policy monad 2>/dev/null | awk '/Candidate:/ {print $2; exit}')
-    if [[ -n "$candidate" && "$candidate" != "(none)" && "$candidate" != "$cur" ]]; then
-      info "Apt repo offers a newer version: $candidate"
-      info "To upgrade: apt-mark unhold monad && apt install --only-upgrade monad && apt-mark hold monad"
+    # A re-run used to return here without looking at the hold, so a package left unheld stayed
+    # unheld — and the repo carries every network's versions, so a plain `apt upgrade` then
+    # installs whatever is newest, approved for this network or not. The fresh-install path
+    # below holds; this one now does too.
+    if ! dpkg -l monad 2>/dev/null | grep -qE '^hi  monad'; then
+      # run() returns success under --dry-run without running anything, so only claim the pin
+      # when it was applied.
+      if run "holding monad package version" apt-mark hold monad && (( DRY_RUN == 0 )); then
+        ok "monad pinned at $cur (apt-mark hold)"
+      fi
+    fi
+    # Judge the gap against the network's target, not apt's candidate. The old hint was
+    # `apt install --only-upgrade monad`, which takes the candidate: 0.16.4 while testnet's
+    # target was 0.16.3.
+    local target=""
+    target=$(monad_network_target)
+    if [[ -n "$target" && "$target" != "$cur" ]]; then
+      warn "${NETWORK} target per docs.monad.xyz/networks.json is monad=${target}; installed ${cur}."
+      info "Read the upgrade page for ${target} first, then:"
+      info "  apt install --reinstall monad=${target} -y --allow-downgrades --allow-change-held-packages && apt-mark hold monad"
+    elif [[ -z "$target" ]]; then
+      local candidate=""
+      candidate=$(apt-cache policy monad 2>/dev/null | awk '/Candidate:/ {print $2; exit}')
+      if [[ -n "$candidate" && "$candidate" != "(none)" && "$candidate" != "$cur" ]]; then
+        info "Apt repo offers $candidate. The network target could not be read — check"
+        info "  https://docs.monad.xyz/networks.json before installing it; the repo serves every network."
+      fi
     fi
     return 0
   fi
@@ -2960,13 +3005,7 @@ EOF
   else
     # --- 2. per-network target from MF ---
     local net_target=""
-    if [[ -n "$NETWORK" ]] && command -v curl >/dev/null 2>&1; then
-      net_target=$(curl -fsS -m 5 -H 'User-Agent: BeeHive/monad-tools' \
-        https://docs.monad.xyz/networks.json 2>/dev/null \
-        | tr -d ' \n' \
-        | grep -oE "\"${NETWORK}\":\{\"monad_version\":\"[0-9]+\.[0-9]+\.[0-9]+[^\"]*\"" \
-        | grep -oE '[0-9]+\.[0-9]+\.[0-9]+[^"]*' | head -1)
-    fi
+    net_target=$(monad_network_target)
     if [[ -n "$net_target" ]]; then
       target_version="$net_target"
       info "Target for ${C_BOLD}${NETWORK}${C_RESET} per docs.monad.xyz/networks.json: monad=${C_BOLD}${target_version}${C_RESET}"
