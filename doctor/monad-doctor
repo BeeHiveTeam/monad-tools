@@ -1440,9 +1440,16 @@ check_unattended_upgrades() {
   fi
   if [[ -f /etc/apt/apt.conf.d/20auto-upgrades ]] \
      && grep -q '^APT::Periodic::Unattended-Upgrade "1"' /etc/apt/apt.conf.d/20auto-upgrades 2>/dev/null; then
-    # Check whether automatic reboot is disabled
-    if grep -rqE '^[[:space:]]*Unattended-Upgrade::Automatic-Reboot[[:space:]]+"?false"?' /etc/apt/apt.conf.d/ 2>/dev/null; then
-      emit security "auto-upgrades" PASS "unattended-upgrades active, Automatic-Reboot=false (safe for validator)"
+    # Ask apt for the EFFECTIVE value instead of grepping for an explicit "false". An unset key
+    # prints nothing, and unattended-upgrade reads it with a default of False
+    # (`find_b("Unattended-Upgrade::Automatic-Reboot", False)`), so unset is not a risk: the old
+    # grep warned on every stock Ubuntu install. apt-config also sees files outside
+    # apt.conf.d and the last assignment wins, which a grep cannot know.
+    local auto_reboot
+    auto_reboot=$(apt-config shell AR Unattended-Upgrade::Automatic-Reboot/b 2>/dev/null \
+                  | sed -n "s/^AR='\(.*\)'$/\1/p")
+    if [[ "${auto_reboot:-false}" == "false" ]]; then
+      emit security "auto-upgrades" PASS "unattended-upgrades active, Automatic-Reboot=${auto_reboot:-false (default, unset)} (safe for validator)"
     else
       if ! _monad_pkg_installed; then
         emit security "auto-upgrades" INFO "unattended-upgrades active with auto-reboot — monad-validator-setup → step_cve_mitigation will disable auto-reboot on install"
@@ -1785,6 +1792,28 @@ detect_network() {
   printf '%s' "$n"
 }
 
+# MF's approved version for THIS node's network, from docs.monad.xyz/networks.json. Fetched once
+# and shared: the version check and the upstream check must judge against the same number, or one
+# run reports PASS and WARN for the same package (it did: apt's candidate 0.16.4 against a testnet
+# target of 0.16.3). Empty when the network is unknown or networks.json is unreachable.
+# Call it bare, not as $(network_target): a command substitution is a subshell, and the cache and
+# NET_NAME would be set there and lost.
+NET_TARGET_DONE=0
+NET_TARGET=""
+NET_NAME=""
+network_target() {
+  if (( NET_TARGET_DONE == 0 )); then
+    NET_TARGET_DONE=1
+    NET_NAME=$(detect_network)
+    if [[ -n "$NET_NAME" ]] && command -v curl >/dev/null; then
+      NET_TARGET=$(curl -fsS -m 5 -H 'User-Agent: BeeHive/monad-tools' \
+        https://docs.monad.xyz/networks.json 2>/dev/null | tr -d ' \n' \
+        | grep -oE "\"${NET_NAME}\":\{\"monad_version\":\"[0-9]+\.[0-9]+\.[0-9]+[^\"]*\"" \
+        | grep -oE '[0-9]+\.[0-9]+\.[0-9]+[^"]*' | head -1)
+    fi
+  fi
+}
+
 check_github_release() {
   # Cross-check the installed version against MF's target for THIS network.
   # Priority: docs.monad.xyz/networks.json (per-network, machine-readable) →
@@ -1792,13 +1821,9 @@ check_github_release() {
   if ! command -v curl >/dev/null; then return; fi
   local latest="" installed="" network="" net_target="" source=""
   installed=$(dpkg-query -W -f='${Version}' monad 2>/dev/null || true)
-  network=$(detect_network)
-  if [[ -n "$network" ]]; then
-    net_target=$(curl -fsS -m 5 -H 'User-Agent: BeeHive/monad-tools' \
-      https://docs.monad.xyz/networks.json 2>/dev/null | tr -d ' \n' \
-      | grep -oE "\"${network}\":\{\"monad_version\":\"[0-9]+\.[0-9]+\.[0-9]+[^\"]*\"" \
-      | grep -oE '[0-9]+\.[0-9]+\.[0-9]+[^"]*' | head -1)
-  fi
+  network_target
+  net_target=$NET_TARGET
+  network=$NET_NAME
   if [[ -n "$net_target" ]]; then
     latest="$net_target"
     source="networks.json target for ${network}"
@@ -1821,9 +1846,22 @@ check_github_release() {
     # Distinguish "we're ahead" (e.g. on RC) vs "we're behind"
     if printf '%s\n%s\n' "$latest" "$installed" | sort -V -C 2>/dev/null; then
       emit monad "monad.upstream" INFO "installed v$installed > $source v$latest (RC, pre-release, or network not yet upgraded)"
+    elif [[ -z "$net_target" ]]; then
+      # GitHub's latest tag is network-agnostic: testnet and mainnet run different versions, so
+      # without the node's network there is no version to tell the operator to install.
+      emit monad "monad.upstream" INFO "$source is v$latest, installed v$installed — network unknown, not judged" \
+           $'Check:       https://docs.monad.xyz/networks.json → monad_version for your network\nWhy:         node.toml has neither network_name nor a known chain_id, so this run cannot\n             tell which version is approved for this node.'
     else
+      # Install exactly the target, not apt's candidate: the repo can already carry a version
+      # that is not approved for this network (0.16.4 sat there while testnet's target was 0.16.3),
+      # and `--only-upgrade monad` would take it. Same command shape as the upgrade pages.
       emit monad "monad.upstream" WARN "$source is v$latest > installed v$installed" \
-           $'Quick fix:   sudo apt-mark unhold monad\n             sudo apt update && sudo apt install --only-upgrade monad\n             sudo apt-mark hold monad   # re-hold to prevent surprise upgrades\nVerify:      dpkg-query -W -f=\'${Version}\\n\' monad\nWhy:         lagging behind stable carries CVE and consensus-bug exposure;\n             release notes often include mandatory upgrades for network compatibility.\nNote:        upgrade during a low-stakes window — monad-bft restarts mid-epoch.'
+           "Quick fix:   sudo apt update && sudo apt install --reinstall monad=${latest} -y --allow-downgrades --allow-change-held-packages
+             sudo apt-mark hold monad   # docs: keeps apt from moving past the approved version
+Verify:      dpkg-query -W -f='\${Version}\\n' monad   # expect ${latest}
+Why:         lagging behind the network's target carries consensus-bug exposure; read the
+             release's upgrade page first — some versions need extra steps.
+Note:        upgrade during a low-stakes window — monad-bft restarts mid-epoch."
     fi
   fi
 }
@@ -1836,31 +1874,50 @@ check_monad_install() {
     return
   fi
 
-  local installed available state
+  local installed available state target
   installed=$(dpkg-query -W -f='${Version}' monad 2>/dev/null || echo "?")
   state=$(dpkg -l monad 2>/dev/null | awk '/^.i  monad/ {print $1; exit}')
   # apt list output: "monad/noble 0.14.3 amd64 [upgradable from: 0.14.2]"
   # Field 2 (after split by space) is the version.
   available=$(apt list --upgradable 2>/dev/null | awk '/^monad\// {print $2}' | head -1)
+  network_target
+  target=$NET_TARGET
 
+  # The install and upgrade pages end with `apt-mark hold monad`: the apt repo carries every
+  # network's versions, so an unheld package follows the newest one, approved for this network
+  # or not. Held is the documented state, not a question.
   if [[ "$state" == "hi" ]]; then
-    emit monad "monad.installed" INFO "monad on hold — apt won't auto-upgrade (intentional?)"
+    emit monad "monad.installed" PASS "monad on hold — apt will not move it past the approved version (per docs)"
+  else
+    emit monad "monad.installed" WARN "monad is not on hold — a plain apt upgrade installs whatever the repo offers, approved for this network or not" \
+         $'Quick fix:   sudo apt-mark hold monad\nVerify:      apt-mark showhold | grep -x monad\nWhy:         the repo serves testnet and mainnet versions side by side; docs end every\n             install and upgrade with apt-mark hold monad.'
   fi
 
-  if [[ -n "$available" && "$available" != "$installed" ]]; then
-    # Distinguish stable vs pre-release "available" candidates. Apt's
-    # "Candidate" greedily picks the highest version including ~rc/~alpha/
-    # ~beta/~dev suffixes. Recommending the operator upgrade FROM a stable
-    # release TO an RC is wrong — RCs aren't blessed for production.
+  if [[ -n "$target" ]]; then
+    # The network's target decides; apt's candidate is only what the repo happens to carry.
+    # Whether installed is behind or ahead of the target is monad.upstream's verdict — this
+    # check only says whether apt's offer is something to act on.
+    if [[ "$installed" == "$target" ]]; then
+      if [[ -n "$available" && "$available" != "$installed" ]]; then
+        emit monad "monad.version" PASS "installed=$installed = ${NET_NAME} target; apt also offers $available — not approved for ${NET_NAME}, do not install it"
+      else
+        emit monad "monad.version" PASS "installed=$installed = ${NET_NAME} target"
+      fi
+    else
+      emit monad "monad.version" INFO "installed=$installed, ${NET_NAME} target=$target — see monad.upstream${available:+; apt offers $available}"
+    fi
+  elif [[ -n "$available" && "$available" != "$installed" ]]; then
+    # No network target to judge by. Report what apt offers, but do not tell the operator to
+    # install it: the newest package in the repo is not necessarily approved for their network.
     if [[ "$available" =~ ~(rc|alpha|beta|dev|pre) ]]; then
       emit monad "monad.version" INFO "installed=$installed (stable). Apt sees $available — pre-release, ignore unless deliberately tracking RCs." \
            $'Why:         apt-cache greedy candidate picks any higher version including ~rc.X.\n             Stay on stable; rotate forward only when the RC promotes to a tagged release.'
     else
-      emit monad "monad.version"   WARN "installed=$installed, available=$available" \
-           $'Quick fix:   sudo apt-mark unhold monad   # if on hold\n             sudo apt update && sudo apt install --only-upgrade monad\n             sudo apt-mark hold monad     # re-hold\nVerify:      dpkg-query -W -f=\'${Version}\\n\' monad\nWhy:         apt has a newer STABLE version pinned in your suite (noble); the gap may\n             include consensus-affecting fixes. Don\'t lag.'
+      emit monad "monad.version" WARN "installed=$installed, apt offers $available — network target unknown, check before upgrading" \
+           $'Check:       https://docs.monad.xyz/networks.json → monad_version for your network\nThen:        sudo apt install --reinstall monad=<that version> -y --allow-downgrades --allow-change-held-packages\n             sudo apt-mark hold monad\nWhy:         the repo serves every network\'s versions; its newest is not necessarily approved\n             for yours (0.16.4 was offered while testnet\'s target was 0.16.3).'
     fi
   else
-    emit monad "monad.version"   PASS "installed=$installed (latest)"
+    emit monad "monad.version"   PASS "installed=$installed (apt offers nothing newer)"
   fi
 
   # Auth UDP check — wireauth log entries (DEBUG level, may need broader scan)

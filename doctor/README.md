@@ -56,7 +56,7 @@ $ sudo ./monad-doctor --quick
 ━━ MONAD ━━
   ✓ monad.user                     monad system user exists (1001:1001)
   ✓ monad.triedb                   /dev/triedb → /dev/nvme1n1p1
-  ✓ monad.version                  installed=0.14.3 (latest)
+  ✓ monad.version                  installed=0.16.3 = testnet target
   ✓ monad.upstream                 matches GitHub latest stable (v0.14.3)
   ✓ monad.authudp                  Auth UDP active (wireauth sessions in logs)
   ✓ monad.authudp-cfg              node.toml has all Auth UDP keys in correct sections
