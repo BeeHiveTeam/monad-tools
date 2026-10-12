@@ -2012,9 +2012,7 @@ mip8_guard_blocks_start() {
   [[ -z "$network" ]] && return 1
   command -v curl >/dev/null || return 1
   fork_ts=$(curl -fsS -m 5 -H 'User-Agent: BeeHive/monad-tools' \
-    https://docs.monad.xyz/networks.json 2>/dev/null | tr -d ' \n' \
-    | grep -oE "\"${network}\":\{[^}]*\"mip8\":\{\"hardfork_timestamp\":[0-9]+" \
-    | grep -oE '[0-9]+$')
+    https://docs.monad.xyz/networks.json 2>/dev/null | networks_json_field "$network" mip8.hardfork_timestamp)
   # No fork scheduled for this network -> nothing to enforce.
   [[ -z "$fork_ts" ]] && return 1
   [[ -L /dev/triedb ]] || return 1
@@ -2874,16 +2872,54 @@ step_chrony() {
   fi
 }
 
+# One field of docs.monad.xyz/networks.json for one network, read from stdin; empty when absent.
+#   networks_json_field testnet monad_version              -> 0.16.3
+#   networks_json_field testnet mip8.hardfork_timestamp    -> 1786545000
+# Parsed as JSON when python3 is there. The grep fallback only finds a field when it sits where
+# the file has it today (monad_version first, a flat mip8 object): reordering keys made the old
+# grep-only reader return nothing, which read as "network unknown" with no error anywhere.
+networks_json_field() {
+  local net="$1" field="$2" json
+  json=$(cat)
+  if command -v python3 >/dev/null 2>&1; then
+    printf '%s' "$json" | python3 -c '
+import json, re, sys
+net, path = sys.argv[1], sys.argv[2].split(".")
+try:
+    v = json.load(sys.stdin)[net]
+    for k in path:
+        v = v[k]
+except Exception:
+    sys.exit(0)
+if isinstance(v, bool) or v is None:
+    sys.exit(0)
+s = str(v)
+ok = {"monad_version": r"[0-9]+\.[0-9]+\.[0-9]+[0-9A-Za-z.~+-]*", "hardfork_timestamp": r"[0-9]+"}[path[-1]]
+if re.fullmatch(ok, s):
+    print(s)
+' "$net" "$field"
+    return 0
+  fi
+  case "$field" in
+    monad_version)
+      printf '%s' "$json" | tr -d ' \n' \
+        | grep -oE "\"${net}\":\{\"monad_version\":\"[0-9]+\.[0-9]+\.[0-9]+[^\"]*\"" \
+        | grep -oE '[0-9]+\.[0-9]+\.[0-9]+[^"]*' | head -1 ;;
+    mip8.hardfork_timestamp)
+      printf '%s' "$json" | tr -d ' \n' \
+        | grep -oE "\"${net}\":\{[^}]*\"mip8\":\{\"hardfork_timestamp\":[0-9]+" \
+        | grep -oE '[0-9]+$' ;;
+  esac
+  return 0
+}
+
 # MF's approved monad version for $NETWORK, from docs.monad.xyz/networks.json; empty when the
 # network is unset or the file is unreachable. One reader for the fresh install and the re-run, so
 # the two cannot disagree about which version a network should be on.
 monad_network_target() {
   [[ -n "$NETWORK" ]] && command -v curl >/dev/null 2>&1 || return 0
   curl -fsS -m 5 -H 'User-Agent: BeeHive/monad-tools' \
-    https://docs.monad.xyz/networks.json 2>/dev/null \
-    | tr -d ' \n' \
-    | grep -oE "\"${NETWORK}\":\{\"monad_version\":\"[0-9]+\.[0-9]+\.[0-9]+[^\"]*\"" \
-    | grep -oE '[0-9]+\.[0-9]+\.[0-9]+[^"]*' | head -1
+    https://docs.monad.xyz/networks.json 2>/dev/null | networks_json_field "$NETWORK" monad_version
 }
 
 # ===== Step: monad apt repo + package =====
