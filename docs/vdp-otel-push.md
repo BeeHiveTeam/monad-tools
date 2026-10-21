@@ -1,5 +1,13 @@
 # VDP OTel metrics push
 
+> **Deprecated.** The Foundation now scrapes the client's own Prometheus endpoint (`:9143`) from
+> `84.32.32.227`; OTel push is deprecated, and the testnet push endpoint is decommissioned on
+> 2026-10-26 ([gmonads.com/events](https://gmonads.com/events)). What a validator needs instead:
+> `sudo ufw insert 1 allow proto tcp from 84.32.32.227 to any port 9143`, above any `deny 9143/tcp`
+> ([MF guide](https://docs.monad.xyz/node-ops/upgrade-instructions/prometheus-metrics-migration)).
+> `monad-doctor` checks this as `vdp.mf-pull`; the checks quoted below no longer exist. Kept for
+> history.
+
 In May 2026 Monad Foundation (MF) emailed all VDP validators requiring metrics push to `otel-external.monadinfra.com:443`. 15% of mainnet and 30% of testnet operators were not compliant when the email went out.
 
 This document describes how to set it up, both for the **default Monad apt setup** (plain `otelcol`) and **custom setups** (e.g. you replaced `otelcol` with `otelcol-contrib` for logs-to-Loki).

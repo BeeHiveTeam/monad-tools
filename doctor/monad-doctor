@@ -2032,56 +2032,6 @@ _monad_not_installed_notice() {
     "monad package not installed — node-specific checks (triedb, keys, OTel, VDP, Auth UDP) skipped. Hardware/OS/network/security still verified above."
 }
 
-check_vdp_otel_collector() {
-  # MF VDP (May 2026 email) requires every validator to push OTel metrics to
-  # otel-external.monadinfra.com:443. That needs an active OTel collector.
-  # Plain `otelcol` ships with Monad apt package; `otelcol-contrib` is sometimes
-  # installed separately for journald receivers (logs → Loki). Either is fine —
-  # VDP only cares the push works. Caller (main) gates this on _monad_pkg_installed.
-  local active=""
-  for svc in otelcol otelcol-contrib; do
-    if systemctl is-active --quiet "$svc" 2>/dev/null; then
-      active="$svc"
-      break
-    fi
-  done
-  if [[ -z "$active" ]]; then
-    emit monad "vdp.otel-collector" "$(_vdp_severity)" "no active OTel collector — VDP requires metrics push to MF$(_vdp_note)" \
-         $'Quick fix:   sudo systemctl enable --now otelcol   # if already installed by `monad` pkg\nIf missing:  sudo apt install -y monad   # otelcol is bundled with the monad package\nVDP setup:   sudo ./monad-validator-setup --with-vdp-otel   # downloads & runs MF script\nVerify:      systemctl is-active otelcol && curl -s localhost:8888/metrics | head\nWhy:         VDP eligibility requires push of monad_* metrics to\n             otel-external.monadinfra.com:443. No collector → no metrics → excluded.'
-    return
-  fi
-  emit monad "vdp.otel-collector" PASS "$active.service active"
-}
-
-check_vdp_otel_version() {
-  # MF VDP setup script (May 2026) targets otelcol >= 0.139.0 — earlier versions
-  # lack the resource processor attributes used by MF config.
-  local required="0.139.0"
-  local bin=""
-  for svc in otelcol otelcol-contrib; do
-    if systemctl is-active --quiet "$svc" 2>/dev/null && command -v "$svc" >/dev/null 2>&1; then
-      bin="$svc"
-      break
-    fi
-  done
-  if [[ -z "$bin" ]]; then
-    emit monad "vdp.otel-version" INFO "no active OTel collector to version-check"
-    return
-  fi
-  local ver
-  ver=$("$bin" --version 2>/dev/null | awk '{print $NF; exit}')
-  if [[ -z "$ver" ]]; then
-    emit monad "vdp.otel-version" WARN "could not determine $bin version"
-    return
-  fi
-  if dpkg --compare-versions "$ver" ge "$required" 2>/dev/null; then
-    emit monad "vdp.otel-version" PASS "$bin v$ver (>= $required required by MF setup script)"
-  else
-    emit monad "vdp.otel-version" WARN "$bin v$ver < $required — MF setup script targets $required" \
-         $'Quick fix:   sudo ./monad-validator-setup --with-vdp-otel   # MF script installs required version\nManual:      sudo apt install -y '"$bin"$'='"$required"$'-1   # if MF script unavailable\nVerify:      '"$bin"$' --version   # ≥ '"$required"$'\nWhy:         MF VDP config (resource processor + attributes) uses features only in\n             '"$bin"$' ≥ '"$required"$'; older versions silently fail to apply config.'
-  fi
-}
-
 # VDP checks apply to VALIDATORS. Full nodes are not in the Delegation Program, so a missing
 # OTel push is not a defect for them — but it IS one for a validator, and silently downgrading
 # it there would cost real VDP eligibility. Hence three outcomes, not two:
@@ -2103,68 +2053,135 @@ _vdp_note() {
   esac
 }
 
-check_vdp_secp_key_label() {
-  # MF VDP compliance check: every monad_* metric served by local Prometheus
-  # exporter on :8889 must carry a secp_key="<pubkey>" label so MF can identify
-  # the validator. This is exactly what the MF script's idempotency-check looks for.
-  if ! command -v curl >/dev/null 2>&1; then
-    emit monad "vdp.secp-key-label" INFO "curl not installed — skipping VDP label check"
-    return
-  fi
-  local metrics_url="http://localhost:8889/metrics"
-  local payload
-  payload=$(curl -sf --max-time 5 "$metrics_url" 2>/dev/null) || {
-    emit monad "vdp.secp-key-label" WARN "could not reach $metrics_url — OTel collector may not be exposing :8889" \
-         $'Investigate: ss -tln | grep 8889                          # is anything bound?\n             systemctl status otelcol otelcol-contrib        # which collector?\n             journalctl -u otelcol -n 100 --no-pager         # config errors?\nQuick fix:   sudo ./monad-validator-setup --with-vdp-otel    # apply MF config\nWhy:         MF VDP setup binds Prometheus receiver on :8889 — required for resource\n             attribute injection. Missing binding = no metrics flow.'
-    return
-  }
-  local secp
-  secp=$(printf '%s\n' "$payload" | grep -oE 'secp_key="[0-9a-f]{2,}"' | head -1 | sed 's/secp_key="\([0-9a-f]*\)"/\1/')
-  if [[ -z "$secp" ]]; then
-    emit monad "vdp.secp-key-label" "$(_vdp_severity)" "metrics on :8889 lack 'secp_key' label — NOT VDP-compliant$(_vdp_note)" \
-         "Run MF setup (testnet first): curl -fsSL -o /tmp/x.sh bucket.monadinfra.com/tmp/otel-validator-setup.sh && verify sha256 then sudo bash /tmp/x.sh"
-    return
-  fi
-  local len=${#secp}
-  if [[ $len -ge 64 ]]; then
-    emit monad "vdp.secp-key-label" PASS "metrics tagged with secp_key=${secp:0:8}…${secp: -4} (VDP-compliant)"
-  else
-    emit monad "vdp.secp-key-label" WARN "secp_key label present but unusually short ($len chars)"
-  fi
+MF_SCRAPER_IP=${MF_SCRAPER_IP:-84.32.32.227}   # docs.monad.xyz/node-ops/upgrade-instructions/prometheus-metrics-migration
+
+# Does ufw let one source reach one tcp port? Prints the deciding rule's verdict and the rule:
+#   "allow <rule>", "deny <rule>", or "default <policy>" when no rule matches.
+# ufw evaluates user rules in the listed order and the first match wins, so a DENY above the
+# scraper's ALLOW blocks it however specific the ALLOW is. IPv6 rules cannot match an IPv4 source.
+_ufw_verdict_for() {
+  local src="$1" port="$2"
+  ufw status verbose 2>/dev/null | awk -v src="$src" -v port="$port" '
+    function ip2n(ip,   a) { split(ip, a, "."); return ((a[1]*256 + a[2])*256 + a[3])*256 + a[4] }
+    function from_matches(f,   c, bits, span) {
+      if (f == "Anywhere") return 1
+      if (f == src) return 1
+      if (f ~ /^[0-9.]+\/[0-9]+$/) {
+        split(f, c, "/"); bits = c[2] + 0; span = 2 ^ (32 - bits)
+        return int(ip2n(src) / span) == int(ip2n(c[1]) / span)
+      }
+      return 0
+    }
+    function spec_has_port(spec,   i, n, parts, r) {
+      n = split(spec, parts, ",")
+      for (i = 1; i <= n; i++) {
+        if (parts[i] == port) return 1
+        if (parts[i] ~ /:/) { split(parts[i], r, ":"); if (port + 0 >= r[1] + 0 && port + 0 <= r[2] + 0) return 1 }
+      }
+      return 0
+    }
+    /^Default:/ { if (match($0, /[a-z]+ \(incoming\)/)) policy = substr($0, RSTART, RLENGTH - 11) }
+    /^--/ { body = 1; next }
+    !body || NF == 0 || /\(v6\)/ { next }
+    {
+      line = $0; sub(/[[:space:]]+#.*/, "", line)
+      n = split(line, f, /[[:space:]]+/)
+      act = 0
+      for (i = 1; i <= n; i++) if (f[i] ~ /^(ALLOW|DENY|REJECT|LIMIT)$/) { act = i; break }
+      if (!act) next
+      j = act + 1
+      if (f[j] == "OUT" || f[j] == "FWD") next
+      if (f[j] == "IN") j++
+      if (!from_matches(f[j])) next
+      # "To": an optional address, then an optional port spec. No port spec means every port.
+      ok = 1; seen = 0
+      for (i = 1; i < act; i++) {
+        t = f[i]
+        if (t ~ /\/udp$/) { ok = 0; break }
+        sub(/\/tcp$/, "", t)
+        if (t ~ /^[0-9,:]+$/) { seen = 1; if (!spec_has_port(t)) ok = 0 }
+      }
+      if (!ok) next
+      verdict = (f[act] == "ALLOW" || f[act] == "LIMIT") ? "allow" : "deny"
+      print verdict " " line; found = 1; exit
+    }
+    END { if (!found) print "default " (policy == "" ? "unknown" : policy) }'
 }
 
-check_vdp_mf_push() {
-  # MF push uses OTLP gRPC over TLS to otel-external.monadinfra.com:443 (Cloudflare-fronted).
-  # We confirm a live push by counting ESTABLISHED TLS connections from the
-  # otelcol process to :443 destinations.
-  if ! command -v ss >/dev/null 2>&1; then
-    emit monad "vdp.mf-push" INFO "ss not available — skipping connection check"
+check_vdp_mf_pull() {
+  # The Foundation collects validator metrics by scraping the client's own Prometheus endpoint
+  # (:9143, on by default since 0.16.0) from a single address; OTel push is deprecated and the
+  # testnet push endpoint is decommissioned on 2026-10-26 (gmonads.com/events). Two things must hold: the endpoint
+  # answers, and the firewall lets MF's address through while keeping everyone else out.
+  local port=9143 sev note
+  sev=$(_vdp_severity); note=$(_vdp_note)
+  local listen
+  listen=$(ss -tlnH 2>/dev/null | awk '{print $4}' | grep -E ":${port}\$" | head -1)
+  if [[ -z "$listen" ]]; then
+    emit monad "vdp.mf-pull" "$sev" "metrics endpoint :${port} is not listening — MF cannot scrape this node${note}" \
+         $'Investigate: grep -n -A5 "\\[metrics\\]" /home/monad/monad-bft/config/node.toml   # disabled or moved?\n             ss -tlnp | grep monad-node\nWhy:         MF counts a validator from what it scrapes on :9143; nothing listening = nothing counted.'
     return
   fi
-  local otel_pids=""
+  if [[ "$listen" =~ ^(127\.|\[::1\]) ]]; then
+    emit monad "vdp.mf-pull" "$sev" "metrics endpoint bound to loopback ($listen) — MF cannot reach it${note}" \
+         $'Why:         MF scrapes from '"$MF_SCRAPER_IP"$'; the endpoint has to listen on a public address and be\n             filtered by the firewall instead.'
+    return
+  fi
+  if require_cmd curl && ! curl -sf --max-time 5 "http://127.0.0.1:${port}/metrics" 2>/dev/null | grep -qm1 '^monad_'; then
+    emit monad "vdp.mf-pull" WARN "metrics endpoint :${port} listens but serves no monad_* metrics" \
+         $'Verify:      curl -s localhost:9143/metrics | grep -c ^monad_'
+    return
+  fi
+  if ! require_cmd ufw || ! ufw status >/dev/null 2>&1; then
+    emit monad "vdp.mf-pull" SKIP "ufw unavailable — whether MF ($MF_SCRAPER_IP) reaches :${port} NOT verified" \
+         $'Action:      allow tcp/'"$port"$' from '"$MF_SCRAPER_IP"$' in your firewall, deny it from everyone else'
+    return
+  fi
+  if ! ufw status 2>/dev/null | grep -qiE '^Status:[[:space:]]*active'; then
+    # No ufw filtering: MF gets through unless another firewall stops it, which this cannot see.
+    emit monad "vdp.mf-pull" SKIP "ufw inactive — reachability of :${port} from MF decided by other firewalls, NOT verified (exposure: see metrics.exposure)"
+    return
+  fi
+  local verdict rule
+  verdict=$(_ufw_verdict_for "$MF_SCRAPER_IP" "$port")
+  rule=$(tr -s ' ' <<<"${verdict#* }")
+  case "$verdict" in
+    allow\ *)
+      emit monad "vdp.mf-pull" PASS "MF scraper $MF_SCRAPER_IP allowed to :${port} (first matching ufw rule: ${rule})" ;;
+    default\ allow*)
+      emit monad "vdp.mf-pull" PASS "MF scraper reaches :${port} by ufw default policy (allow incoming)" ;;
+    *)
+      local why
+      case "$verdict" in
+        deny\ *)  why="blocked by ufw rule: ${rule}" ;;
+        *)        why="no ufw rule for it, default incoming policy is ${rule}" ;;
+      esac
+      emit monad "vdp.mf-pull" "$sev" "MF scraper $MF_SCRAPER_IP cannot reach :${port} — ${why}${note}" \
+           $'Quick fix:   sudo ufw insert 1 allow proto tcp from '"$MF_SCRAPER_IP"$' to any port 9143 comment "Monad Foundation monitoring"\n             # keep "deny 9143/tcp" for everyone else; the allow must sit ABOVE it\nVerify:      sudo ufw status numbered | grep 9143   # MF allow listed first\nWhy:         MF counts validators from what it scrapes; a blocked scrape looks like a node\n             that reports nothing. ufw applies the first matching rule.' ;;
+  esac
+}
+
+check_vdp_otel_push() {
+  # OTel push to otel-external.monadinfra.com is deprecated in favour of the pull above; on
+  # testnet the endpoint is decommissioned on 2026-10-26. A collector kept for your own dashboards is fine — only a push
+  # to MF is dead weight that fills the collector log with export failures.
+  # Only the config a running collector loaded counts: /etc/otelcol* also holds backups and the
+  # config of a collector that is installed but stopped.
+  local svc pid cfg="" c
   for svc in otelcol otelcol-contrib; do
-    if systemctl is-active --quiet "$svc" 2>/dev/null; then
-      local pid
-      pid=$(systemctl show "$svc" --property=MainPID --value 2>/dev/null)
-      [[ -n "$pid" && "$pid" != "0" ]] && otel_pids="$otel_pids $pid"
-    fi
+    systemctl is-active --quiet "$svc" 2>/dev/null || continue
+    pid=$(systemctl show "$svc" --property=MainPID --value 2>/dev/null)
+    [[ -n "$pid" && "$pid" != 0 && -r /proc/$pid/cmdline ]] || continue
+    while IFS= read -r c; do
+      [[ -f "$c" ]] && grep -qsE '^[^#]*otel-external\.monadinfra\.com' "$c" && { cfg="$svc: $c"; break 2; }
+    done < <(tr '\0' '\n' < /proc/$pid/cmdline | sed -nE 's/^--config=//p; /^--config$/{n;p}' | sed 's/^file://')
   done
-  if [[ -z "$otel_pids" ]]; then
-    emit monad "vdp.mf-push" INFO "no active otelcol process — already covered by vdp.otel-collector"
+  if [[ -z "$cfg" ]]; then
+    emit monad "vdp.otel-push" INFO "no running OTel collector pushes to MF — not needed, MF scrapes :9143"
     return
   fi
-  local conns=0
-  for pid in $otel_pids; do
-    local c
-    c=$(ss -tnp 2>/dev/null | awk -v pid="pid=$pid," '$0 ~ pid && $5 ~ /:443$/' | wc -l)
-    conns=$((conns + c))
-  done
-  if (( conns >= 1 )); then
-    emit monad "vdp.mf-push" PASS "OTel collector has $conns active TLS connection(s) to :443 — push to MF appears active"
-  else
-    emit monad "vdp.mf-push" WARN "no ESTABLISHED :443 connections from otelcol — push to MF may not be configured" \
-         $'Investigate: journalctl -u otelcol -u otelcol-contrib -n 200 --no-pager | grep -iE "monadinfra|export|tls"\n             grep -r monadinfra /etc/otelcol* 2>/dev/null   # is the MF exporter defined?\nQuick fix:   sudo ./monad-validator-setup --with-vdp-otel   # MF script writes exporter config\nVerify:      ss -tnp | grep "pid=$(systemctl show otelcol --property=MainPID --value)" | grep :443\nWhy:         no outbound :443 from otelcol = metrics not reaching otel-external.monadinfra.com.\n             Without this push, MF cannot count your validator for VDP.'
-  fi
+  emit monad "vdp.otel-push" INFO "${cfg} still pushes to otel-external.monadinfra.com — deprecated (testnet decommission: 2026-10-26, MF events calendar)" \
+       $'Optional:    remove that exporter from the metrics pipeline, then: otelcol validate --config=<file> && systemctl restart <collector>\nWhy:         MF now scrapes :9143 (vdp.mf-pull); the push only produces export errors.'
 }
 
 run_section() {
@@ -2195,8 +2212,7 @@ main() {
                           check_mip8_timeline \
                           check_statesync_threshold \
                           check_validator_registration \
-                          check_vdp_otel_collector check_vdp_otel_version \
-                          check_vdp_secp_key_label check_vdp_mf_push
+                          check_vdp_mf_pull check_vdp_otel_push
   else
     run_section monad     check_monad_install _monad_not_installed_notice
   fi

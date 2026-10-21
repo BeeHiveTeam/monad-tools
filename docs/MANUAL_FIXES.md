@@ -240,5 +240,4 @@ If you see this in doctor output you do NOT need to come here — re-run
 | `monad.cruft-timer` | `step_cruft_timer` |
 | `monad.triedb-udev` | `step_triedb_symlink` |
 | `disk.sched.*` (mq-deadline) | `step_io_scheduler` (udev-persisted) |
-| `vdp.otel-collector` (enable) | `step_otelcol_enable` |
-| `vdp.mf-push`, `vdp.secp-key-label`, `vdp.otel-version` | `step_vdp_otel_push` (auto-enabled on testnet, soft-fails on verify) |
+| `vdp.mf-pull` | none yet — `sudo ufw insert 1 allow proto tcp from 84.32.32.227 to any port 9143` (above the `deny 9143/tcp` that `step_firewall` adds) |
