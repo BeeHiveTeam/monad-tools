@@ -1243,18 +1243,17 @@ check_metrics_exposure() {
     fi
     return
   fi
-  # An explicit DENY is what the Foundation asks for. A rule limited to specific source IPs is
-  # also acceptable — that is a scraper you run, not the public internet.
-  if awk -v p="$port" '$0 ~ "^"p".*DENY"' <<<"$ufw_status" | grep -q .; then
-    emit security "metrics.exposure" PASS "metrics port ${port} explicitly denied in ufw"
-  elif awk -v p="$port" '$0 ~ "^"p".*ALLOW.*Anywhere"' <<<"$ufw_status" | grep -q .; then
-    emit security "metrics.exposure" FAIL "metrics port ${port} publicly ALLOWed in ufw — Foundation asks for it to be blocked" \
-         $'Quick fix:   sudo ufw delete allow 9143/tcp ; sudo ufw deny 9143/tcp\n             # keep a scraper? allow only its address instead:\n             sudo ufw allow from <SCRAPER-IP> to any port 9143\nVerify:      sudo ufw status numbered | grep 9143\nWhy:         the endpoint is unauthenticated and publishes secp_key, peers and stake.'
-  elif awk -v p="$port" '$0 ~ "^"p".*ALLOW"' <<<"$ufw_status" | grep -q .; then
-    # Reached only when no ALLOW was to Anywhere, so every allow rule names a source. That is a
-    # scraper the operator runs, not the public internet — the same latitude check_rpc_exposure
-    # gives 8080. Saying "no rule" here would have described the state wrongly.
-    emit security "metrics.exposure" PASS "metrics port ${port} allowed only from specific sources, not Anywhere"
+  # What ufw decides for an address that is nobody's scraper (TEST-NET-2): the first matching rule,
+  # in order, with port ranges. Looking for any DENY line passed "9143 ALLOW Anywhere" sitting
+  # above "9143 DENY Anywhere", and missed ranges such as 9000:9200 (audit N3).
+  local verdict rule
+  verdict=$(_ufw_verdict_for 198.51.100.7 "$port")
+  rule=$(tr -s ' ' <<<"${verdict#* }")
+  if [[ "$verdict" == allow\ * || ( "$verdict" == "default allow"* && bound_public -eq 1 ) ]]; then
+    emit security "metrics.exposure" FAIL "metrics port ${port} reachable from the internet — ufw lets anyone through (${rule})" \
+         $'Quick fix:   sudo ufw deny 9143/tcp   # and remove or narrow the rule above, which wins first\n             # keep a scraper? allow only its address, ABOVE the deny:\n             sudo ufw insert 1 allow from <SCRAPER-IP> to any port 9143\nVerify:      sudo ufw status numbered | grep 9143\nWhy:         the endpoint is unauthenticated and publishes secp_key, peers and stake.'
+  elif [[ "$verdict" == deny\ * ]]; then
+    emit security "metrics.exposure" PASS "metrics port ${port} closed to the internet by ufw rule: ${rule}"
   elif (( bound_public )); then
     # Default-deny already covers it, but the Foundation asked for an explicit rule and an
     # explicit rule survives someone widening the default policy later.
@@ -2094,12 +2093,15 @@ _ufw_verdict_for() {
       if (f[j] == "IN") j++
       if (!from_matches(f[j])) next
       # "To": an optional address, then an optional port spec. No port spec means every port.
+      # An application profile ("OpenSSH", "Nginx Full") names its own ports, never this one: read
+      # as "every port", an OpenSSH allow passed for MF scraping 9143 (audit N2).
       ok = 1; seen = 0
       for (i = 1; i < act; i++) {
         t = f[i]
         if (t ~ /\/udp$/) { ok = 0; break }
         sub(/\/tcp$/, "", t)
         if (t ~ /^[0-9,:]+$/) { seen = 1; if (!spec_has_port(t)) ok = 0 }
+        else if (t != "Anywhere" && t !~ /^[0-9.]+(\/[0-9]+)?$/ && t !~ /:/) { ok = 0; break }
       }
       if (!ok) next
       verdict = (f[act] == "ALLOW" || f[act] == "LIMIT") ? "allow" : "deny"
