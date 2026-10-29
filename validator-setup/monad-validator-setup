@@ -302,10 +302,10 @@ FLAGS (all optional)
   --snapshot-restore                Force docs hard-reset snapshot (DEFAULT ON).
   --no-snapshot-restore             Skip snapshot restore (sync from genesis instead).
   --with-monitoring                 Install BeeHive monad-grafana stack.
-  --with-vdp-otel                   Run MF VDP OTel push setup (VDP enrollment).
-                                    AUTO-ENABLED for --network=testnet (VDP eligibility
-                                    needs 4-week metrics history from testnet).
-  --no-vdp-otel                     Opt out of VDP push setup (override testnet default).
+  --with-vdp-otel                   Run MF's old OTel push setup. Off by default: the
+                                    Foundation's push endpoint is off since 26.10.2026,
+                                    it scrapes :9143 instead.
+  --no-vdp-otel                     Do not run the push setup (the default).
   --start-services                  systemctl enable+start monad-* at end.
   --skip-preflight                  Skip monad-doctor pre-check.
   --non-interactive                 No prompts; missing flags use safe defaults.
@@ -504,27 +504,15 @@ resolve_pkg_version() {
     info "Monad version: ${C_BOLD}auto${C_RESET} — will use apt repo candidate at install time"
   fi
 
-  # Auto-enable VDP OTel push for testnet — VDP eligibility requires 4-week
-  # uptime + metrics flow to MF. Testnet is where that history accumulates,
-  # so every testnet validator should be pushing from day one. Mainnet stays
-  # opt-in (operator may have a custom collector or no VDP plans).
-  # --no-vdp-otel lets the operator opt out explicitly.
-  if (( WITH_VDP_OTEL_EXPLICIT == 0 )) && [[ "$NETWORK" == "testnet" ]]; then
-    WITH_VDP_OTEL=1
-    info "Testnet default: ${C_BOLD}--with-vdp-otel${C_RESET} enabled (VDP delegation track)"
-    info "  Opt out with: --no-vdp-otel"
-  fi
-
-  # Mainnet operators who want VDP must opt in explicitly. If they didn't,
-  # warn loudly — VDP enrollment requires MF metrics access, and discovering
-  # this post-install means re-running setup later. Not a hard fail because
-  # some mainnet validators legitimately don't participate in VDP.
-  if (( WITH_VDP_OTEL_EXPLICIT == 0 )) && [[ "$NETWORK" == "mainnet" ]]; then
-    warn "Mainnet install without --with-vdp-otel."
-    warn "  If you intend to participate in VDP, MF requires metrics push to"
-    warn "  otel-external.monadinfra.com:443 with your secp_key label. Re-run"
-    warn "  this script with --with-vdp-otel after the node syncs to enable it."
-    warn "  Pass --no-vdp-otel to silence this warning if you don't want VDP."
+  # The Foundation no longer takes pushed metrics: its OTel endpoint was turned off on 26.10.2026
+  # and it scrapes the client's own :9143 instead. So the push setup is never switched on by
+  # default (it configured an exporter to a dead endpoint, failing about once a second); on a
+  # testnet validator the Foundation's collector has to be let through to :9143 instead.
+  # On every testnet node: the role may still come from node.toml later on (re-runs), not from here.
+  if [[ "$NETWORK" == "testnet" ]] && (( WITH_VDP_OTEL == 0 )); then
+    info "VDP metrics (testnet validators): the Foundation scrapes :9143. Let its collector through, above the deny rule:"
+    info "  sudo ufw insert 1 allow from 84.32.32.227 to any port 9143 proto tcp comment 'Monad Foundation monitoring'"
+    info "  https://docs.monad.xyz/node-ops/upgrade-instructions/prometheus-metrics-migration"
   fi
 }
 
@@ -3585,7 +3573,7 @@ $(if [[ "$NETWORK" == "testnet" ]]; then echo "     Or:   testnet staking dApp (
        - no external RPC, no LST/LRT building
      Then: apply via form at docs.monad.xyz/node-ops/validator-delegation-program
      Tiers grant 25M–90M MON delegation.
-$(if [[ "$NETWORK" == "mainnet" && "$WITH_VDP_OTEL" == "0" ]]; then echo "     ${C_YELLOW}⚠ --with-vdp-otel was NOT passed for this mainnet install. If you intend to"; echo "       participate in VDP, re-run with --with-vdp-otel after node syncs.${C_RESET}"; fi)
+
 
   ${C_BOLD}5) Apply config changes without restart${C_RESET} (when editing node.toml later):
        sudo -u monad monad-debug-node \\

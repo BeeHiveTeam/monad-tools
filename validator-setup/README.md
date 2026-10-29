@@ -32,7 +32,7 @@ Zero prompts. The script:
 - writes the full-node template with `beneficiary=0x000…000` (burn address)
 - applies the Foundation snapshot (testnet < 5 min)
 - starts `monad-bft` + `monad-execution` + `monad-rpc`
-- pushes metrics to MF VDP endpoint (`--with-vdp-otel` is auto-enabled for testnet)
+- leaves metrics to the Foundation's scrape of `:9143` (the old OTel push, `--with-vdp-otel`, is off by default since the push endpoint was turned off on 26.10.2026)
 
 ### Step list
 
@@ -59,7 +59,7 @@ Zero prompts. The script:
 21. **(optional)** `--with-monitoring` → [BeeHive monad-grafana](https://github.com/BeeHiveTeam/monad-grafana) installer
 22. **Snapshot restore (default ON)** — `curl $MF_BUCKET/scripts/<network>/restore-from-snapshot.sh | bash` per docs hard-reset. Auto-skips when ledger already has ≥100 MB of data and no role transition happened. Use `--no-snapshot-restore` to skip even on fresh installs.
 23. **🔧 OPTIONAL — Start services** — `systemctl enable --now monad-bft monad-execution monad-rpc`. Prompts with explicit warnings: "node.toml correct? keys placed? triedb formatted?". Or `--start-services`.
-24. **VDP OTel push** — runs MF setup script (`bucket.monadinfra.com/tmp/otel-validator-setup.sh`, sha256-verified). Auto-enabled for `--network=testnet` (VDP eligibility track starts on testnet). Runs **after** start-services so the MF script's `secp_key` verify against `:8889/metrics` has data to read. Soft-fail: if MF script verify fails, the install is not marked failed — config still applied, operator re-runs after node syncs.
+24. **VDP OTel push** — runs MF setup script (`bucket.monadinfra.com/tmp/otel-validator-setup.sh`, sha256-verified). Off by default: the Foundation turned its push endpoint off on 26.10.2026 and scrapes `:9143` instead (on a testnet validator, allow `84.32.32.227` to that port). Runs **after** start-services so the MF script's `secp_key` verify against `:8889/metrics` has data to read. Soft-fail: if MF script verify fails, the install is not marked failed — config still applied, operator re-runs after node syncs.
 25. **JSON post-install report** at `/var/lib/monad-validator-setup/report-<ts>.json`
 
 🔧 = the two truly opt-in steps. Step 4 is destructive, step 23 is the "go live" gate. Everything else either runs automatically or is harmless on re-run.
@@ -92,7 +92,7 @@ sudo ./monad-validator-setup --network=testnet --dry-run
 # Non-interactive (CI / automation) — --network is REQUIRED
 sudo ./monad-validator-setup --network=testnet --non-interactive
 
-# With Grafana monitoring stack (4 containers, 49-panel dashboard)
+# With Grafana monitoring stack (4 containers, the BeeHive dashboard)
 sudo ./monad-validator-setup --network=testnet --with-monitoring
 
 # Pin a specific NVMe as triedb device (overrides /dev/triedb autodetect)
@@ -128,8 +128,8 @@ sudo ./monad-validator-setup --network=testnet --no-snapshot-restore
 --snapshot-restore                  Force docs hard-reset snapshot (DEFAULT ON).
 --no-snapshot-restore               Skip snapshot restore (sync from genesis).
 --with-monitoring                   Install BeeHive monad-grafana stack.
---with-vdp-otel                     Run MF VDP OTel push setup. AUTO-ENABLED for testnet.
---no-vdp-otel                       Opt out of VDP push setup (override testnet default).
+--with-vdp-otel                     Run MF's old OTel push setup (off by default; push endpoint off).
+--no-vdp-otel                       Do not run the push setup (the default).
 --start-services                    systemctl enable+start monad-* at end.
 --skip-preflight                    Skip monad-doctor pre-check.
 --non-interactive                   No prompts; missing flags use safe defaults.

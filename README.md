@@ -25,7 +25,7 @@ sudo ./doctor/monad-doctor
 # 3. If READY (no FAIL): configure host end-to-end.
 #    Default = full-node template (per docs validator-installation flow).
 #    Snapshot restore is ON by default (--no-snapshot-restore to skip).
-#    --with-vdp-otel is auto-enabled for testnet (VDP eligibility starts there).
+#    VDP metrics: the Foundation scrapes :9143 (no push; --with-vdp-otel is off by default).
 sudo ./validator-setup/monad-validator-setup --network=testnet \
   --triedb-partition=nvme1n1 --allow-triedb-wipe --start-services
 
