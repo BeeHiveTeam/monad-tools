@@ -167,6 +167,7 @@ MONAD_PKG_VERSION="${MONAD_PKG_VERSION-__auto__}"   # __auto__ = decide after ap
 UFW_SSH_PORT="${UFW_SSH_PORT:-}"
 UFW_P2P_PORT="8000"        # both TCP and UDP
 UFW_AUTHUDP_PORT="8001"    # UDP only
+UFW_DIRECTUDP_PORT="8002"  # UDP, split-address templates (testnet since 10.2026)
 UFW_METRICS_PORT="9143"    # client metrics; Foundation asks operators to block it externally
 
 # ===== Colors =====
@@ -1532,7 +1533,18 @@ step_sign_name_record() {
     if command -v curl >/dev/null 2>&1; then
       _live_ip=$(curl -4 -fsS --max-time 5 https://api.ipify.org 2>/dev/null || true)
     fi
-    if [[ -n "$_live_ip" && -n "$_cur_addr" && "${_cur_addr%%:*}" != "$_live_ip" ]]; then
+    if node_toml_split "$node_toml" && [[ "$_cur_addr" == *:* ]]; then
+      # Written by an installer from before the split templates: "IP:8000" in a split-address
+      # node.toml, signed without the direct UDP port. monad-node refuses it whatever the IP.
+      warn "node.toml self_address is '${_cur_addr}' but this template takes the IP alone (self_tcp_port beside it)."
+      warn "  monad-node refuses that form; the record must be signed again with the direct UDP port."
+      if confirm "Re-sign the name record in the split form (bumps self_record_seq_num)?"; then
+        RESIGN_NAME_RECORD=1
+      else
+        warn "Left as-is. monad-node will not start with this node.toml."
+        return 0
+      fi
+    elif [[ -n "$_live_ip" && -n "$_cur_addr" && "${_cur_addr%%:*}" != "$_live_ip" ]]; then
       warn "node.toml self_address is ${_cur_addr%%:*} but this host answers as ${_live_ip}."
       warn "  The existing signature covers the OLD address — peers cannot discover this node."
       if confirm "Re-sign the name record for ${_live_ip} (bumps self_record_seq_num)?"; then
@@ -1576,9 +1588,17 @@ step_sign_name_record() {
   # --udp-port (see docs.monad.xyz/node-ops/upgrade-instructions/v0.15.2). Older
   # pinned versions (MONAD_PKG_VERSION=0.14.x) still expect --address, so ask the
   # installed binary what it accepts instead of hardcoding either form.
-  local snr_help="" snr_addr_args=""
+  local snr_help="" snr_addr_args="" split=0
   snr_help=$(monad-sign-name-record --help 2>&1 || true)
-  if grep -qE '(^|[[:space:]])--ip([[:space:]]|<|$)' <<<"$snr_help"; then
+  # The Foundation's testnet templates moved to a split address (Oct 2026): self_address is the
+  # IP alone, with self_tcp_port and self_direct_udp_auth_port beside it, and the record is signed
+  # with --direct-udp-port and no --udp-port (docs: full-node-installation). monad-node refuses
+  # "IP:8000" there ("split bootstrap peer address must not include a port"), and a record signed
+  # without the direct UDP port does not match. The template itself says which form it is.
+  if node_toml_split "$node_toml"; then split=1; fi
+  if (( split )); then
+    snr_addr_args="--ip PUBIP --tcp-port 8000 --authenticated-udp-port 8001 --direct-udp-port ${UFW_DIRECTUDP_PORT}"
+  elif grep -qE '(^|[[:space:]])--ip([[:space:]]|<|$)' <<<"$snr_help"; then
     snr_addr_args="--ip PUBIP --tcp-port 8000 --udp-port 8000 --authenticated-udp-port 8001"
   else
     snr_addr_args="--address PUBIP:8000 --authenticated-udp-port 8001"
@@ -1665,9 +1685,9 @@ step_sign_name_record() {
   # mode flag — quoting integers as strings is also a parse error per docs
   # (witnessed: monad-bft TOML parser rejected `self_auth_port = "8001"`).
   backup_file "$node_toml"
-  python3 - "$node_toml" "$pubip" "$sig" "$seq_num" <<'PYEOF'
+  python3 - "$node_toml" "$pubip" "$sig" "$seq_num" "$split" "$UFW_DIRECTUDP_PORT" <<'PYEOF'
 import sys, re
-path, pubip, sig, seq_num = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+path, pubip, sig, seq_num, split, direct = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5] == "1", sys.argv[6]
 with open(path) as f:
     text = f.read()
 
@@ -1705,7 +1725,13 @@ def set_in_section(text, section, key, value, as_int=False):
     return new
 
 # Strings → quoted; ports/seq → bare integers per docs
-text = set_in_section(text, 'peer_discovery', 'self_address',         f'{pubip}:8000')
+if split:
+    # The split form: the IP alone, each port its own key (as the template has them).
+    text = set_in_section(text, 'peer_discovery', 'self_address',              pubip)
+    text = set_in_section(text, 'peer_discovery', 'self_tcp_port',             '8000', as_int=True)
+    text = set_in_section(text, 'peer_discovery', 'self_direct_udp_auth_port', direct, as_int=True)
+else:
+    text = set_in_section(text, 'peer_discovery', 'self_address',         f'{pubip}:8000')
 text = set_in_section(text, 'peer_discovery', 'self_auth_port',       '8001', as_int=True)
 # The number the record was signed with, decided by the caller before signing. Writing any
 # other value here breaks the signature and monad-node refuses to start.
@@ -2081,6 +2107,9 @@ step_start_services() {
     if [[ -z "$self_sig" || "$self_sig" =~ [\<\>] ]]; then
       blockers+=("node.toml self_name_record_sig placeholder: '$self_sig' (run --sign-name-record or edit node.toml)")
     fi
+    if node_toml_split /home/monad/monad-bft/config/node.toml && [[ "$self_addr" == *:* ]]; then
+      blockers+=("node.toml self_address '$self_addr' has a port, but this split-address template takes the IP alone (monad-node refuses it; re-run --sign-name-record)")
+    fi
     # Catch the specific double-quote injection bug we hit: when
     # monad-sign-name-record output gets misparsed, the sig ends up as
     # the literal TOML LINE ('self_name_record_sig = "hex..."') wrapped in
@@ -2367,6 +2396,15 @@ ENV{ID_PART_ENTRY_UUID}==\"${partuuid}\", MODE=\"0666\", SYMLINK+=\"triedb\"
   echo "$content" >"$rule"
   ok "Wrote $rule (PARTUUID=$partuuid)"
   run "reloading udev" udevadm control --reload-rules
+}
+
+# node.toml in the split-address form (self_tcp_port in [peer_discovery]): the Foundation's
+# testnet templates since Oct 2026. The legacy form keeps "IP:port" in self_address.
+node_toml_split() {
+  [[ -f "$1" ]] && awk '/^\[peer_discovery\]/ {in_pd=1; next}
+                        /^\[/ {in_pd=0}
+                        in_pd && /^[[:space:]]*self_tcp_port[[:space:]]*=/ {found=1}
+                        END {exit !found}' "$1"
 }
 
 # ===== Step: download config files (.env + node.toml) =====
@@ -3293,7 +3331,7 @@ step_firewall() {
     for p_dry in $UFW_SSH_PORT; do
       echo "  ${C_DIM}[dry-run] ufw allow ${p_dry}/tcp${C_RESET}"
     done
-    echo "  ${C_DIM}[dry-run] ufw allow ${UFW_P2P_PORT} (tcp+udp), ${UFW_AUTHUDP_PORT}/udp${C_RESET}"
+    echo "  ${C_DIM}[dry-run] ufw allow ${UFW_P2P_PORT} (tcp+udp), ${UFW_AUTHUDP_PORT}/udp, ${UFW_DIRECTUDP_PORT}/udp on testnet${C_RESET}"
     echo "  ${C_DIM}[dry-run] ufw deny ${UFW_METRICS_PORT}/tcp${C_RESET}"
     return 0
   fi
@@ -3308,6 +3346,10 @@ step_firewall() {
   ufw allow "${UFW_P2P_PORT}/udp" comment 'monad p2p (udp/raptorcast)' >>"$LOG_FILE" 2>&1 || true
   # 8001: Authenticated UDP only
   ufw allow "${UFW_AUTHUDP_PORT}/udp" comment 'monad authenticated udp' >>"$LOG_FILE" 2>&1 || true
+  # 8002: direct UDP, for the split-address templates (testnet since Oct 2026; docs open it there).
+  if node_toml_split /home/monad/monad-bft/config/node.toml || [[ "$NETWORK" == "testnet" ]]; then
+    ufw allow "${UFW_DIRECTUDP_PORT}/udp" comment 'monad direct udp' >>"$LOG_FILE" 2>&1 || true
+  fi
   # 9143: the client's metrics endpoint. Default-deny already covers it, but the Foundation asks
   # for an explicit block on every node type and both networks, and an explicit rule survives a
   # later `ufw default allow incoming`. The endpoint is unauthenticated and publishes secp_key,
