@@ -2929,8 +2929,10 @@ if re.fullmatch(ok, s):
   case "$field" in
     monad_version)
       printf '%s' "$json" | tr -d ' \n' \
-        | grep -oE "\"${net}\":\{\"monad_version\":\"[0-9]+\.[0-9]+\.[0-9]+[^\"]*\"" \
-        | grep -oE '[0-9]+\.[0-9]+\.[0-9]+[^"]*' | head -1 ;;
+        | grep -oE "\"${net}\":\{\"monad_version\":\"[0-9]+\.[0-9]+\.[0-9]+[0-9A-Za-z.~+-]*\"" \
+        | grep -oE '[0-9]+\.[0-9]+\.[0-9]+[0-9A-Za-z.~+-]*' | head -1 ;;
+      # The same characters as the python reader allows: the value is printed in a "Quick fix"
+      # an operator pastes into a root shell, and [^"]* let anything through (audit N7).
     mip8.hardfork_timestamp)
       printf '%s' "$json" | tr -d ' \n' \
         | grep -oE "\"${net}\":\{[^}]*\"mip8\":\{\"hardfork_timestamp\":[0-9]+" \
@@ -2973,10 +2975,15 @@ step_monad_install() {
     # target was 0.16.3.
     local target=""
     target=$(monad_network_target)
-    if [[ -n "$target" && "$target" != "$cur" ]]; then
+    if [[ -n "$target" && "$target" != "$cur" ]] && dpkg --compare-versions "$cur" gt "$target"; then
+      # Ahead of the network's target: a downgrade is not a routine step (the database may not go
+      # back), so no command for it here (audit N6).
+      warn "${NETWORK} target per docs.monad.xyz/networks.json is monad=${target}; installed ${cur} is AHEAD of it."
+      info "Do not downgrade unless the Foundation says so for this version; check its announcements."
+    elif [[ -n "$target" && "$target" != "$cur" ]]; then
       warn "${NETWORK} target per docs.monad.xyz/networks.json is monad=${target}; installed ${cur}."
       info "Read the upgrade page for ${target} first, then:"
-      info "  apt install --reinstall monad=${target} -y --allow-downgrades --allow-change-held-packages && apt-mark hold monad"
+      info "  apt install --reinstall monad=${target} -y --allow-change-held-packages && apt-mark hold monad"
     elif [[ -z "$target" ]]; then
       local candidate=""
       candidate=$(apt-cache policy monad 2>/dev/null | awk '/Candidate:/ {print $2; exit}')
