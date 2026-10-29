@@ -1,0 +1,15 @@
+name: ci
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  shell:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scripts parse and pass shellcheck (errors)
+        run: |
+          files=$(git ls-files | while read -r f; do head -1 "$f" | grep -qE '^#!.*(bash|sh)' && echo "$f"; done)
+          echo "$files"
+          for f in $files; do bash -n "$f"; done
+          docker run --rm -v "$PWD:/m:ro" -w /m koalaman/shellcheck:stable -S error $files
